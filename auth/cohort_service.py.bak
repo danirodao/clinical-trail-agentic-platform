@@ -1,0 +1,317 @@
+"""
+Cohort Service — CRUD for cohorts with ceiling enforcement.
+Cohorts are owned by organizations (created by managers).
+All trial_ids in a cohort must be within the org's access ceiling.
+"""
+
+import logging
+from typing import Optional
+from uuid import UUID
+
+import asyncpg
+
+from auth.middleware import UserContext
+from auth.openfga_client import OpenFGAClient, get_openfga_client
+
+logger = logging.getLogger(__name__)
+
+
+class CeilingViolationError(Exception):
+    def __init__(self, violations: list[str]):
+        self.violations = violations
+        super().__init__(f"Ceiling violations: {violations}")
+
+
+class CohortService:
+    """Manages cohorts within the org's access ceiling."""
+
+    def __init__(
+        self,
+        db_pool: asyncpg.Pool,
+        fga_client: Optional[OpenFGAClient] = None,
+    ):
+        self.db = db_pool
+        self.fga = fga_client or get_openfga_client()
+
+    async def _verify_ceiling(self, org_id: str, trial_ids: list[str]) -> tuple[bool, list[str]]:
+        """Verify all trial_ids are within the org's access ceiling."""
+        violations = []
+        for trial_id in trial_ids:
+            result = await self.fga.check(
+                user=f"organization:{org_id}",
+                relation="granted_org",
+                object=f"clinical_trial:{trial_id}",
+            )
+            if not result.allowed:
+                violations.append(
+                    f"Organization {org_id} does not have access to trial {trial_id}"
+                )
+        return len(violations) == 0, violations
+
+    async def preview_cohort(
+        self,
+        user: UserContext,
+        filter_criteria: dict,
+    ) -> dict:
+        """
+        Preview a cohort without saving it.
+        Returns patient count, demographics, and ceiling validation.
+        """
+        trial_ids = filter_criteria.get("trial_ids", [])
+
+        # Ceiling check
+        within_ceiling, violations = await self._verify_ceiling(
+            user.organization_id, trial_ids
+        )
+
+        if not trial_ids:
+            return {
+                "patient_count": 0,
+                "trial_count": 0,
+                "trials": [],
+                "demographics": {"sex": {}, "age_distribution": {}},
+                "within_ceiling": True,
+                "ceiling_violations": [],
+            }
+
+        # Build dynamic WHERE clause from filter_criteria
+        conditions = ["pte.trial_id = ANY($1::uuid[])"]
+        params: list = [trial_ids]
+        param_idx = 2
+
+        if filter_criteria.get("age_min") is not None:
+            conditions.append(f"p.age >= ${param_idx}")
+            params.append(filter_criteria["age_min"])
+            param_idx += 1
+
+        if filter_criteria.get("age_max") is not None:
+            conditions.append(f"p.age <= ${param_idx}")
+            params.append(filter_criteria["age_max"])
+            param_idx += 1
+
+        if filter_criteria.get("sex"):
+            conditions.append(f"p.sex = ANY(${param_idx}::text[])")
+            params.append(filter_criteria["sex"])
+            param_idx += 1
+
+        where_clause = " AND ".join(conditions)
+
+        # Count patients
+        patient_count = await self.db.fetchval(
+            f"""
+            SELECT COUNT(DISTINCT p.patient_id)
+            FROM patient p
+            JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+            WHERE {where_clause}
+            """,
+            *params,
+        )
+
+        # Demographics
+        sex_dist = await self.db.fetch(
+            f"""
+            SELECT p.sex, COUNT(DISTINCT p.patient_id) as cnt
+            FROM patient p
+            JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+            WHERE {where_clause}
+            GROUP BY p.sex
+            """,
+            *params,
+        )
+
+        # Per-trial breakdown
+        trial_breakdown = await self.db.fetch(
+            f"""
+            SELECT pte.trial_id, ct.title, COUNT(DISTINCT p.patient_id) as patient_count
+            FROM patient p
+            JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+            JOIN clinical_trial ct ON pte.trial_id = ct.trial_id
+            WHERE {where_clause}
+            GROUP BY pte.trial_id, ct.title
+            """,
+            *params,
+        )
+
+        return {
+            "patient_count": patient_count or 0,
+            "trial_count": len(trial_breakdown),
+            "trials": [
+                {
+                    "trial_id": str(r["trial_id"]),
+                    "title": r["title"],
+                    "patient_count": r["patient_count"],
+                }
+                for r in trial_breakdown
+            ],
+            "demographics": {
+                "sex": {r["sex"]: r["cnt"] for r in sex_dist},
+                "age_distribution": {},
+            },
+            "within_ceiling": within_ceiling,
+            "ceiling_violations": violations,
+        }
+
+    async def create_cohort(
+        self,
+        user: UserContext,
+        name: str,
+        description: str,
+        filter_criteria: dict,
+        is_dynamic: bool = True,
+    ) -> dict:
+        """
+        Create a cohort. Enforces ceiling — all trial_ids must be accessible.
+        """
+        if user.role != "manager":
+            raise PermissionError("Only managers can create cohorts")
+
+        trial_ids = filter_criteria.get("trial_ids", [])
+        if not trial_ids:
+            raise ValueError("At least one trial must be selected")
+
+        # Ceiling enforcement
+        within_ceiling, violations = await self._verify_ceiling(
+            user.organization_id, trial_ids
+        )
+        if not within_ceiling:
+            raise CeilingViolationError(violations)
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                # Create cohort
+                cohort = await conn.fetchrow(
+                    """
+                    INSERT INTO cohort
+                    (name, filter_criteria, created_by, organization_id, is_dynamic)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING cohort_id
+                    """,
+                    name, filter_criteria, user.user_id,
+                    user.organization_id, is_dynamic,
+                )
+                cohort_id = cohort["cohort_id"]
+
+                # Link trials
+                for trial_id in trial_ids:
+                    await conn.execute(
+                        """
+                        INSERT INTO cohort_trial (cohort_id, trial_id)
+                        VALUES ($1, $2)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        cohort_id, UUID(trial_id),
+                    )
+
+                # If static, snapshot current patients
+                if not is_dynamic:
+                    conditions = ["pte.trial_id = ANY($1::uuid[])"]
+                    params: list = [trial_ids]
+                    param_idx = 2
+
+                    if filter_criteria.get("age_min") is not None:
+                        conditions.append(f"p.age >= ${param_idx}")
+                        params.append(filter_criteria["age_min"])
+                        param_idx += 1
+                    if filter_criteria.get("age_max") is not None:
+                        conditions.append(f"p.age <= ${param_idx}")
+                        params.append(filter_criteria["age_max"])
+                        param_idx += 1
+                    if filter_criteria.get("sex"):
+                        conditions.append(f"p.sex = ANY(${param_idx}::text[])")
+                        params.append(filter_criteria["sex"])
+                        param_idx += 1
+
+                    where_clause = " AND ".join(conditions)
+
+                    await conn.execute(
+                        f"""
+                        INSERT INTO cohort_patient (cohort_id, patient_id)
+                        SELECT $1, DISTINCT p.patient_id
+                        FROM patient p
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        WHERE {where_clause}
+                        """,
+                        cohort_id, *params,
+                    )
+
+                # Write OpenFGA tuples
+                await self.fga.write_tuples([
+                    {
+                        "user": f"user:{user.user_id}",
+                        "relation": "creator",
+                        "object": f"cohort:{cohort_id}",
+                    },
+                    {
+                        "user": f"organization:{user.organization_id}",
+                        "relation": "owning_org",
+                        "object": f"cohort:{cohort_id}",
+                    },
+                ])
+
+                for trial_id in trial_ids:
+                    await self.fga.write_tuples([{
+                        "user": f"clinical_trial:{trial_id}",
+                        "relation": "includes_trial",
+                        "object": f"cohort:{cohort_id}",
+                    }])
+
+        return {"cohort_id": str(cohort_id), "status": "created"}
+
+    async def list_org_cohorts(self, user: UserContext) -> list[dict]:
+        """List all cohorts for the user's organization."""
+        rows = await self.db.fetch(
+            """
+            SELECT c.cohort_id, c.name, c.filter_criteria, c.is_dynamic,
+                   c.created_at,
+                   (SELECT COUNT(*) FROM cohort_trial ct WHERE ct.cohort_id = c.cohort_id) as trial_count,
+                   COALESCE(
+                       json_agg(json_build_object(
+                           'researcher_id', ra.researcher_id,
+                           'access_level', ra.access_level,
+                           'expires_at', ra.expires_at,
+                           'is_active', ra.is_active
+                       )) FILTER (WHERE ra.assignment_id IS NOT NULL),
+                       '[]'
+                   ) as assignments
+            FROM cohort c
+            LEFT JOIN researcher_assignment ra
+                ON ra.cohort_id = c.cohort_id
+            WHERE c.organization_id = $1
+            GROUP BY c.cohort_id
+            ORDER BY c.created_at DESC
+            """,
+            user.organization_id,
+        )
+
+        results = []
+        for r in rows:
+            trial_ids_rows = await self.db.fetch(
+                "SELECT trial_id FROM cohort_trial WHERE cohort_id = $1",
+                r["cohort_id"],
+            )
+            # For dynamic cohorts, compute patient count live
+            trial_ids = [str(row["trial_id"]) for row in trial_ids_rows]
+            patient_count = 0
+            if trial_ids:
+                patient_count = await self.db.fetchval(
+                    """
+                    SELECT COUNT(DISTINCT p.patient_id)
+                    FROM patient p
+                    JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                    WHERE pte.trial_id = ANY($1::uuid[])
+                    """,
+                    trial_ids,
+                ) or 0
+
+            results.append({
+                "cohort_id": str(r["cohort_id"]),
+                "name": r["name"],
+                "filter_criteria": r["filter_criteria"],
+                "trial_ids": trial_ids,
+                "patient_count": patient_count,
+                "is_dynamic": r["is_dynamic"],
+                "created_at": r["created_at"].isoformat(),
+                "assignments": r["assignments"],
+            })
+
+        return results

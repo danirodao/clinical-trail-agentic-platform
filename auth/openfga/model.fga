@@ -1,0 +1,67 @@
+model
+  schema 1.1
+
+# ═══════════════════════════════════════════════════════════════
+# TYPES
+# ═══════════════════════════════════════════════════════════════
+
+type user
+
+type organization
+  relations
+    define member: [user]
+    define manager: [user] and member
+    define domain_owner: [user]
+
+type clinical_trial
+  relations
+    # Direct ownership — domain owner who published this trial
+    define owner: [user]
+
+    # Organization-level ceiling — set when domain owner approves org access request
+    define granted_org: [organization]
+
+    # Researcher-level direct assignment — manager assigns specific researchers
+    define assigned_researcher: [user]
+
+    # Computed permissions
+    define can_view_aggregate: member from granted_org
+    define can_view_individual: assigned_researcher or owner
+
+type patient
+  relations
+    # Patient is enrolled in a trial — set during data ingestion
+    define enrolled_in_trial: [clinical_trial]
+
+    # Computed: can view this patient's individual data if you can view
+    # individual data for the trial they're enrolled in
+    define can_view_individual: can_view_individual from enrolled_in_trial
+
+type cohort
+  relations
+    # Who created/owns the cohort
+    define creator: [user]
+
+    # Which organization this cohort belongs to
+    define owning_org: [organization]
+
+    # Which researchers are assigned to this cohort
+    define assigned_researcher: [user]
+
+    # Which trials are included in this cohort
+    define includes_trial: [clinical_trial]
+
+    # Computed: can access the cohort if assigned or creator
+    define can_access: assigned_researcher or creator
+
+type data_asset
+  relations
+    # Domain owner of this asset
+    define owner: [user]
+
+    # Organization granted access
+    define granted_org: [organization]
+
+    # Computed permissions
+    define can_manage: owner
+    define can_view: owner or member from granted_org

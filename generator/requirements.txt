@@ -1,0 +1,7 @@
+# generator/requirements.txt
+reportlab>=4.1
+Faker>=24.0
+minio>=7.2
+confluent-kafka>=2.4
+pydantic>=2.7
+pydantic-settings>=2.2

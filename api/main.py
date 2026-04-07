@@ -1,0 +1,110 @@
+"""
+FastAPI API Gateway for the Clinical Trial Research Platform.
+All endpoints require JWT authentication via Keycloak.
+"""
+
+import os
+import logging
+from contextlib import asynccontextmanager
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import asyncpg
+from fastapi import FastAPI, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from api.database import init_db_pool, close_db_pool, get_db_pool
+
+from api.routers import domain_owner, manager, researcher, marketplace
+from api.collection_consumer import CollectionRefreshConsumer
+from auth.openfga_client import get_openfga_client
+
+
+collection_consumer: CollectionRefreshConsumer = None
+
+logger = logging.getLogger(__name__)
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle manager."""
+    global collection_consumer
+    pool = await init_db_pool()
+    db_url= f"postgresql://{os.environ.get('POSTGRES_USER', 'ctuser')}:{os.environ.get('POSTGRES_PASSWORD', 'ctpassword')}@{os.environ.get('POSTGRES_HOST', 'postgres')}:{os.environ.get('POSTGRES_PORT', 5432)}/{os.environ.get('POSTGRES_DB', 'clinical_trials')}"
+    app.state.checkpointer_url =db_url
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    async with AsyncPostgresSaver.from_conn_string(app.state.checkpointer_url) as saver:
+        await saver.setup()  # Creates tables if they don't exist
+    
+     
+    collection_consumer = CollectionRefreshConsumer(
+        db_pool_factory=lambda: pool,
+        fga_client_factory=get_openfga_client,
+    )
+    collection_consumer.start()
+    yield
+    if collection_consumer:
+        collection_consumer.stop()
+    await close_db_pool()
+
+
+app = FastAPI(
+    title="Clinical Trial Research Platform API",
+    version="1.0.0",
+    description="Authorization-aware clinical trial data access with Agentic RAG",
+    lifespan=lifespan,
+)
+
+# ─── Middleware ────────────────────────────────────────────────
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3001"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded. Please try again later."},
+    )
+
+
+# ─── Dependency: DB Pool ──────────────────────────────────────
+
+# Database dependency is now in api.database
+
+
+# ─── Routers ──────────────────────────────────────────────────
+
+app.include_router(domain_owner.router, prefix="/api/v1", tags=["Domain Owner"])
+app.include_router(manager.router, prefix="/api/v1", tags=["Manager"])
+app.include_router(researcher.router, prefix="/api/v1", tags=["Researcher"])
+app.include_router(marketplace.router, prefix="/api/v1", tags=["Marketplace"])
+
+# ─── Health Check ─────────────────────────────────────────────
+
+@app.get("/health", tags=["Health"])
+async def health_check(db_pool=Depends(get_db_pool)):
+    checks = {"api": "ok", "collection_consumer": "ok" if collection_consumer and collection_consumer._running else "stopped"}
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    return {"status": "healthy" if all_ok else "degraded", "checks": checks}

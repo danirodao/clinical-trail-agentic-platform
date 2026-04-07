@@ -1,0 +1,309 @@
+{
+    "realm": "clinical-trials",
+    "enabled": true,
+    "sslRequired": "none",
+    "registrationAllowed": false,
+    "loginWithEmailAllowed": true,
+    "duplicateEmailsAllowed": false,
+    "resetPasswordAllowed": true,
+    "editUsernameAllowed": false,
+    "bruteForceProtected": true,
+    "accessTokenLifespan": 3600,
+    "ssoSessionIdleTimeout": 1800,
+    "ssoSessionMaxLifespan": 36000,
+    "roles": {
+        "realm": [
+            {
+                "name": "domain_owner",
+                "description": "Owns clinical trial data, approves/rejects access requests",
+                "composite": false
+            },
+            {
+                "name": "manager",
+                "description": "Manages organization access, creates cohorts, assigns researchers",
+                "composite": false
+            },
+            {
+                "name": "researcher",
+                "description": "Queries clinical trial data with authorization-aware retrieval",
+                "composite": false
+            }
+        ]
+    },
+    "clientScopes": [
+        {
+            "name": "clinical-platform-claims",
+            "description": "Custom claims for the clinical trial platform",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false"
+            },
+            "protocolMappers": [
+                {
+                    "name": "organization-id-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-attribute-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "userinfo.token.claim": "true",
+                        "user.attribute": "organization_id",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "organization_id",
+                        "jsonType.label": "String",
+                        "multivalued": "false"
+                    }
+                },
+                {
+                    "name": "organization-name-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-attribute-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "userinfo.token.claim": "true",
+                        "user.attribute": "organization_name",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "organization_name",
+                        "jsonType.label": "String",
+                        "multivalued": "false"
+                    }
+                },
+                {
+                    "name": "realm-roles-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-realm-role-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "multivalued": "true",
+                        "userinfo.token.claim": "true",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "realm_roles",
+                        "jsonType.label": "String"
+                    }
+                }
+            ]
+        }
+    ],
+    "defaultDefaultClientScopes": [
+        "clinical-platform-claims"
+    ],
+    "clients": [
+        {
+            "clientId": "research-platform-api",
+            "name": "Research Platform API",
+            "enabled": true,
+            "publicClient": false,
+            "secret": "research-platform-secret",
+            "directAccessGrantsEnabled": true,
+            "serviceAccountsEnabled": true,
+            "authorizationServicesEnabled": false,
+            "redirectUris": [
+                "http://localhost:8000/*",
+                "http://localhost:3001/*"
+            ],
+            "webOrigins": [
+                "http://localhost:8000",
+                "http://localhost:3001"
+            ],
+            "protocol": "openid-connect",
+            "standardFlowEnabled": true,
+            "implicitFlowEnabled": false,
+            "fullScopeAllowed": true,
+            "defaultClientScopes": [
+                "clinical-platform-claims"
+            ]
+        },
+        {
+            "clientId": "research-platform-frontend",
+            "name": "Research Platform Frontend",
+            "enabled": true,
+            "publicClient": true,
+            "directAccessGrantsEnabled": false,
+            "redirectUris": [
+                "http://localhost:3001/*"
+            ],
+            "webOrigins": [
+                "http://localhost:3001"
+            ],
+            "protocol": "openid-connect",
+            "standardFlowEnabled": true,
+            "fullScopeAllowed": true,
+            "defaultClientScopes": [
+                "clinical-platform-claims"
+            ]
+        }
+    ],
+    "users": [
+        {
+            "username": "data-admin",
+            "enabled": true,
+            "email": "admin@clinical-platform.org",
+            "firstName": "Data",
+            "lastName": "Admin",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "admin123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "domain_owner"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-platform"
+                ],
+                "organization_name": [
+                    "Clinical Trial Platform"
+                ]
+            }
+        },
+        {
+            "username": "pharma-manager",
+            "enabled": true,
+            "email": "manager@pharma-corp.com",
+            "firstName": "Sarah",
+            "lastName": "Chen",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "manager123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "manager"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-pharma-corp"
+                ],
+                "organization_name": [
+                    "PharmaCorp Research"
+                ]
+            }
+        },
+        {
+            "username": "researcher-jane",
+            "enabled": true,
+            "email": "jane@pharma-corp.com",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "researcher123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "researcher"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-pharma-corp"
+                ],
+                "organization_name": [
+                    "PharmaCorp Research"
+                ]
+            }
+        },
+        {
+            "username": "researcher-dani",
+            "enabled": true,
+            "email": "dani@pharma-corp.com",
+            "firstName": "Dani",
+            "lastName": "R",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "researcher123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "researcher"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-pharma-corp"
+                ],
+                "organization_name": [
+                    "PharmaCorp Research"
+                ]
+            }
+        },
+        {
+            "username": "biotech-manager",
+            "enabled": true,
+            "email": "manager@biotech-inc.com",
+            "firstName": "Maria",
+            "lastName": "Chen",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "manager123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "manager"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-biotech-inc"
+                ],
+                "organization_name": [
+                    "BioTech Inc"
+                ]
+            }
+        },
+        {
+            "username": "researcher-bob",
+            "enabled": true,
+            "email": "bob@biotech-inc.com",
+            "firstName": "Bob",
+            "lastName": "Smith",
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "researcher123",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": [
+                "researcher"
+            ],
+            "attributes": {
+                "organization_id": [
+                    "org-biotech-inc"
+                ],
+                "organization_name": [
+                    "BioTech Inc"
+                ]
+            }
+        }
+    ],
+    "scopeMappings": [
+        {
+            "client": "research-platform-api",
+            "roles": [
+                "domain_owner",
+                "manager",
+                "researcher"
+            ]
+        },
+        {
+            "client": "research-platform-frontend",
+            "roles": [
+                "domain_owner",
+                "manager",
+                "researcher"
+            ]
+        }
+    ]
+}

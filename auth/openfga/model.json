@@ -1,0 +1,290 @@
+{
+    "schema_version": "1.1",
+    "type_definitions": [
+        {
+            "type": "user"
+        },
+        {
+            "type": "organization",
+            "relations": {
+                "member": {
+                    "this": {}
+                },
+                "manager": {
+                    "intersection": {
+                        "child": [
+                            {
+                                "this": {}
+                            },
+                            {
+                                "computedUserset": {
+                                    "relation": "member"
+                                }
+                            }
+                        ]
+                    }
+                },
+                "domain_owner": {
+                    "this": {}
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "member": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "manager": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "domain_owner": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "type": "clinical_trial",
+            "relations": {
+                "owner": {
+                    "this": {}
+                },
+                "granted_org": {
+                    "this": {}
+                },
+                "assigned_researcher": {
+                    "this": {}
+                },
+                "can_view_aggregate": {
+                    "tupleToUserset": {
+                        "tupleset": {
+                            "relation": "granted_org"
+                        },
+                        "computedUserset": {
+                            "relation": "member"
+                        }
+                    }
+                },
+                "can_view_individual": {
+                    "union": {
+                        "child": [
+                            {
+                                "computedUserset": {
+                                    "relation": "assigned_researcher"
+                                }
+                            },
+                            {
+                                "computedUserset": {
+                                    "relation": "owner"
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "owner": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "granted_org": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "organization"
+                            }
+                        ]
+                    },
+                    "assigned_researcher": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "can_view_aggregate": {
+                        "directly_related_user_types": []
+                    },
+                    "can_view_individual": {
+                        "directly_related_user_types": []
+                    }
+                }
+            }
+        },
+        {
+            "type": "patient",
+            "relations": {
+                "enrolled_in_trial": {
+                    "this": {}
+                },
+                "can_view_individual": {
+                    "tupleToUserset": {
+                        "tupleset": {
+                            "relation": "enrolled_in_trial"
+                        },
+                        "computedUserset": {
+                            "relation": "can_view_individual"
+                        }
+                    }
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "enrolled_in_trial": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "clinical_trial"
+                            }
+                        ]
+                    },
+                    "can_view_individual": {
+                        "directly_related_user_types": []
+                    }
+                }
+            }
+        },
+        {
+            "type": "cohort",
+            "relations": {
+                "creator": {
+                    "this": {}
+                },
+                "owning_org": {
+                    "this": {}
+                },
+                "assigned_researcher": {
+                    "this": {}
+                },
+                "includes_trial": {
+                    "this": {}
+                },
+                "can_access": {
+                    "union": {
+                        "child": [
+                            {
+                                "computedUserset": {
+                                    "relation": "assigned_researcher"
+                                }
+                            },
+                            {
+                                "computedUserset": {
+                                    "relation": "creator"
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "creator": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "owning_org": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "organization"
+                            }
+                        ]
+                    },
+                    "assigned_researcher": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "includes_trial": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "clinical_trial"
+                            }
+                        ]
+                    },
+                    "can_access": {
+                        "directly_related_user_types": []
+                    }
+                }
+            }
+        },
+        {
+            "type": "data_asset",
+            "relations": {
+                "owner": {
+                    "this": {}
+                },
+                "granted_org": {
+                    "this": {}
+                },
+                "can_manage": {
+                    "computedUserset": {
+                        "relation": "owner"
+                    }
+                },
+                "can_view": {
+                    "union": {
+                        "child": [
+                            {
+                                "computedUserset": {
+                                    "relation": "owner"
+                                }
+                            },
+                            {
+                                "tupleToUserset": {
+                                    "tupleset": {
+                                        "relation": "granted_org"
+                                    },
+                                    "computedUserset": {
+                                        "relation": "member"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "owner": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "user"
+                            }
+                        ]
+                    },
+                    "granted_org": {
+                        "directly_related_user_types": [
+                            {
+                                "type": "organization"
+                            }
+                        ]
+                    },
+                    "can_manage": {
+                        "directly_related_user_types": []
+                    },
+                    "can_view": {
+                        "directly_related_user_types": []
+                    }
+                }
+            }
+        }
+    ]
+}

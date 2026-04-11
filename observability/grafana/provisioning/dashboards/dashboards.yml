@@ -1,0 +1,14 @@
+# Tell Grafana to scan this directory for dashboard JSON files on startup.
+
+apiVersion: 1
+
+providers:
+  - name: "Clinical Trial Agent"
+    orgId: 1
+    folder: "Clinical Trials"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

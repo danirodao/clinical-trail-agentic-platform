@@ -12,13 +12,13 @@ from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 from jose import jwt, JWTError
 import httpx
 import json
-
+from observability import metrics_response, instrument_tool
 from db import postgres, qdrant_client, neo4j_client
 
 logging.basicConfig(
@@ -27,6 +27,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("mcp_server")
+async def handle_metrics(request: Request) -> Response:
+    body, content_type = metrics_response()
+    return Response(content=body, media_type=content_type)
 
 # Initialize FastMCP
 mcp = FastMCP(
@@ -60,6 +63,7 @@ def register_all_tools():
             logger.error(f"❌ Failed to import tools.{module_name}: {e}")
         except Exception as e:
             logger.error(f"❌ Error registering tools from {module_name}: {e}", exc_info=True)
+
 
 
 # Register tools at startup
@@ -167,6 +171,7 @@ _starlette_app = Starlette(
     routes=[
         Route("/health", endpoint=health_check, methods=["GET"]),
         Route("/healthz", endpoint=health_check, methods=["GET"]),
+        Route("/metrics", endpoint=handle_metrics, methods=["GET"]),
         Mount("/", app=mcp_sse_app),
     ],
     lifespan=lifespan,

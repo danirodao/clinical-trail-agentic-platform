@@ -22,3 +22,6 @@ python-dotenv>=1.0.0,<2.0.0
 
 # Auth
 python-jose[cryptography]>=3.3.0
+
+prometheus-client>=0.21.0
+structlog>=24.4.0

@@ -16,15 +16,22 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from api.database import init_db_pool, close_db_pool, get_db_pool
-
+from api.metrics import metrics_router, instrument_app
 from api.routers import domain_owner, manager, researcher, marketplace
 from api.collection_consumer import CollectionRefreshConsumer
 from auth.openfga_client import get_openfga_client
+from api.metrics import metrics_router, instrument_app
+from api.logging_config import configure_logging, get_logger
+configure_logging()  # structlog configured before anything else logs
+
+from api.agent.observability import setup_observability
+
+setup_observability()
 
 
 collection_consumer: CollectionRefreshConsumer = None
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -59,7 +66,7 @@ app = FastAPI(
     description="Authorization-aware clinical trial data access with Agentic RAG",
     lifespan=lifespan,
 )
-
+instrument_app(app)
 # ─── Middleware ────────────────────────────────────────────────
 
 app.add_middleware(
@@ -87,7 +94,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 
 # ─── Routers ──────────────────────────────────────────────────
-
+app.include_router(metrics_router)      
 app.include_router(domain_owner.router, prefix="/api/v1", tags=["Domain Owner"])
 app.include_router(manager.router, prefix="/api/v1", tags=["Manager"])
 app.include_router(researcher.router, prefix="/api/v1", tags=["Researcher"])

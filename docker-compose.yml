@@ -487,6 +487,76 @@ services:
     # Uncomment for debugging:
     ports:
       - "8001:8001"
+  # ── Arize Phoenix — LLM Trace Viewer ────────────────────────────────────────
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: clinical-trial-phoenix
+    ports:
+      - "6006:6006" # Phoenix UI
+      - "4317:4317" # OTLP gRPC (optional)
+    environment:
+      - PHOENIX_WORKING_DIR=/phoenix
+    volumes:
+      - phoenix_data:/phoenix
+    networks:
+      - clinical-net
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:6006/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Prometheus — Metrics Store ───────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: clinical-trial-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    networks:
+      - clinical-net
+    restart: unless-stopped
+    depends_on:
+      - api
+      - mcp-server
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Grafana — Dashboards ─────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: clinical-trial-grafana
+    ports:
+      - "3010:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/agent-dashboard.json
+    networks:
+      - clinical-net
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:3010/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 # Add to existing volumes section:
 volumes:
   zookeeper-data:
@@ -495,6 +565,9 @@ volumes:
   qdrant-data:
   neo4jdata:
   minio-data:
+  phoenix_data:
+  prometheus_data:
+  grafana_data:
 
 
 networks:

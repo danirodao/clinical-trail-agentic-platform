@@ -1,0 +1,31 @@
+# Prometheus scrape configuration for the Clinical Trial Research Platform
+# Scrapes both the FastAPI API gateway and the MCP server every 15 seconds.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: "clinical-trial-research-platform"
+    environment: "development"
+
+scrape_configs:
+  # ── FastAPI API Gateway ──────────────────────────────────────────────────
+  - job_name: "clinical-trial-api"
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: "/metrics"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # ── MCP Server ───────────────────────────────────────────────────────────
+  - job_name: "clinical-trial-mcp"
+    static_configs:
+      - targets: ["mcp-server:8001"]
+    metrics_path: "/metrics"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # ── Prometheus self-monitoring ───────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

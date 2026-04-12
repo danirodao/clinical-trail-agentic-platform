@@ -20,6 +20,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row
 from db import postgres, neo4j_client
+from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_outcome_measures
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_outcome_measures")
     async def get_outcome_measures(
         trial_id: str = "",
         nct_id: str = "",

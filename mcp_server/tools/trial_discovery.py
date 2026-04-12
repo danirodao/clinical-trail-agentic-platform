@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row
 from db import postgres, qdrant_client
+from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ def register_tools(mcp: FastMCP) -> None:
     # search_trials
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("search_trials")
     async def search_trials(
         query: str = "",
         phase: str = "",
@@ -217,6 +219,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_trial_details
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_trial_details")
     async def get_trial_details(
         trial_id: str = "",
         nct_id: str = "",
@@ -362,6 +365,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_eligibility_criteria
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_eligibility_criteria")
     async def get_eligibility_criteria(
         trial_id: str = "",
         nct_id: str = "",

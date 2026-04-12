@@ -223,6 +223,9 @@ class AgentService:
                     final_state: dict | None = None
                     tool_start_times: dict[str, float] = {}
 
+                    # ── Configure recursion limit to accommodate reasoning depth ──
+                    config["recursion_limit"] = 50
+
                     async for event in graph.astream_events(
                         initial_state,
                         config=config,

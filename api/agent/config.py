@@ -21,8 +21,8 @@ class AgentConfig:
     max_tokens: int = 2048
 
     # ── ReAct Loop Guards ─────────────────────────────────────────────────────
-    max_iterations: int = 10                   # Hard stop on tool-call loops
-    simple_query_max_iterations: int = 5       # Cheaper path limit
+    max_iterations: int = 15                   # Hard stop on tool-call loops
+    simple_query_max_iterations: int = 15      # Match complex limit to prevent premature cutoff
 
     # ── Complexity Classification ─────────────────────────────────────────────
     # Queries containing these keywords are routed to GPT-4o

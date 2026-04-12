@@ -1,458 +1,187 @@
 {
-    "__inputs": [],
-    "__requires": [
-        {
-            "type": "grafana",
-            "id": "grafana",
-            "name": "Grafana",
-            "version": "10.4.0"
-        },
-        {
-            "type": "datasource",
-            "id": "prometheus",
-            "name": "Prometheus",
-            "version": "1.0.0"
-        }
-    ],
-    "annotations": {
-        "list": []
+  "annotations": { "list": [] },
+  "description": "Clinical Trial Agent — Performance, Tooling, and Data Mesh Governance",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Vital Signs: Throughput & Latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
     },
-    "description": "Clinical Trial Agent — LLM query performance, tool usage, access control",
-    "editable": true,
-    "fiscalYearStartMonth": 0,
-    "graphTooltip": 1,
-    "id": null,
-    "links": [],
-    "panels": [
-        {
-            "id": 1,
-            "type": "stat",
-            "title": "Queries / min",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 0,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "graphMode": "area",
-                "reduceOptions": {
-                    "calcs": [
-                        "lastNotNull"
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "rate(agent_query_total[1m]) * 60",
-                    "legendFormat": "queries/min"
-                }
-            ]
-        },
-        {
-            "id": 2,
-            "type": "stat",
-            "title": "p50 Latency",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 4,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "unit": "s",
-                "reduceOptions": {
-                    "calcs": [
-                        "lastNotNull"
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.50, sum(rate(agent_query_duration_seconds_bucket[5m])) by (le))",
-                    "legendFormat": "p50"
-                }
-            ]
-        },
-        {
-            "id": 3,
-            "type": "stat",
-            "title": "p90 Latency",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 8,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "unit": "s",
-                "thresholds": {
-                    "steps": [
-                        {
-                            "color": "green",
-                            "value": null
-                        },
-                        {
-                            "color": "yellow",
-                            "value": 5
-                        },
-                        {
-                            "color": "red",
-                            "value": 8
-                        }
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.90, sum(rate(agent_query_duration_seconds_bucket[5m])) by (le))",
-                    "legendFormat": "p90"
-                }
-            ]
-        },
-        {
-            "id": 4,
-            "type": "stat",
-            "title": "Error Rate",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 12,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "unit": "percentunit",
-                "thresholds": {
-                    "steps": [
-                        {
-                            "color": "green",
-                            "value": null
-                        },
-                        {
-                            "color": "yellow",
-                            "value": 0.01
-                        },
-                        {
-                            "color": "red",
-                            "value": 0.05
-                        }
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "rate(agent_query_total{status='error'}[5m]) / rate(agent_query_total[5m])",
-                    "legendFormat": "error rate"
-                }
-            ]
-        },
-        {
-            "id": 5,
-            "type": "stat",
-            "title": "Active Queries",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 16,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "graphMode": "none",
-                "reduceOptions": {
-                    "calcs": [
-                        "lastNotNull"
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "agent_active_queries",
-                    "legendFormat": "active"
-                }
-            ]
-        },
-        {
-            "id": 6,
-            "type": "stat",
-            "title": "Access Denied (1h)",
-            "gridPos": {
-                "h": 4,
-                "w": 4,
-                "x": 20,
-                "y": 0
-            },
-            "options": {
-                "colorMode": "background",
-                "thresholds": {
-                    "steps": [
-                        {
-                            "color": "green",
-                            "value": null
-                        },
-                        {
-                            "color": "red",
-                            "value": 1
-                        }
-                    ]
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "increase(agent_access_denied_total[1h])",
-                    "legendFormat": "denied"
-                }
-            ]
-        },
-        {
-            "id": 7,
-            "type": "timeseries",
-            "title": "Query Duration Percentiles",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 4
-            },
-            "options": {
-                "tooltip": {
-                    "mode": "multi"
-                }
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "unit": "s"
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.50, sum(rate(agent_query_duration_seconds_bucket[5m])) by (le))",
-                    "legendFormat": "p50"
-                },
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.90, sum(rate(agent_query_duration_seconds_bucket[5m])) by (le))",
-                    "legendFormat": "p90"
-                },
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.99, sum(rate(agent_query_duration_seconds_bucket[5m])) by (le))",
-                    "legendFormat": "p99"
-                }
-            ]
-        },
-        {
-            "id": 8,
-            "type": "timeseries",
-            "title": "Query Rate by Status",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 4
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_query_total[5m])) by (status)",
-                    "legendFormat": "{{status}}"
-                }
-            ]
-        },
-        {
-            "id": 9,
-            "type": "barchart",
-            "title": "Tool Call Frequency (last 1h)",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 12
-            },
-            "options": {
-                "orientation": "horizontal",
-                "xTickLabelRotation": 0
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sort_desc(sum(increase(agent_tool_call_total[1h])) by (tool_name))",
-                    "legendFormat": "{{tool_name}}",
-                    "instant": true
-                }
-            ]
-        },
-        {
-            "id": 10,
-            "type": "timeseries",
-            "title": "Tool Call Latency (p90 per tool)",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 12
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "unit": "s"
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.90, sum(rate(agent_tool_call_duration_seconds_bucket[5m])) by (le, tool_name))",
-                    "legendFormat": "{{tool_name}}"
-                }
-            ]
-        },
-        {
-            "id": 11,
-            "type": "timeseries",
-            "title": "LLM Token Usage (total/min)",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 20
-            },
-            "options": {
-                "tooltip": {
-                    "mode": "multi"
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_llm_token_total{token_type='prompt'}[1m])) by (model) * 60",
-                    "legendFormat": "prompt — {{model}}"
-                },
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_llm_token_total{token_type='completion'}[1m])) by (model) * 60",
-                    "legendFormat": "completion — {{model}}"
-                }
-            ]
-        },
-        {
-            "id": 12,
-            "type": "timeseries",
-            "title": "Model Distribution",
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 20
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_query_total{status='success'}[5m])) by (model)",
-                    "legendFormat": "{{model}}"
-                }
-            ]
-        },
-        {
-            "id": 13,
-            "type": "timeseries",
-            "title": "Access Denied Events by Reason",
-            "gridPos": {
-                "h": 6,
-                "w": 12,
-                "x": 0,
-                "y": 28
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_access_denied_total[5m])) by (reason)",
-                    "legendFormat": "{{reason}}"
-                }
-            ]
-        },
-        {
-            "id": 14,
-            "type": "timeseries",
-            "title": "Ceiling Principle Applied",
-            "gridPos": {
-                "h": 6,
-                "w": 12,
-                "x": 12,
-                "y": 28
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "rate(agent_ceiling_applied_total[5m])",
-                    "legendFormat": "ceiling applied/s"
-                }
-            ]
-        },
-        {
-            "id": 15,
-            "type": "histogram",
-            "title": "ReAct Iteration Distribution",
-            "gridPos": {
-                "h": 6,
-                "w": 12,
-                "x": 0,
-                "y": 34
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "sum(rate(agent_iteration_count_bucket[5m])) by (le, model)",
-                    "legendFormat": "{{model}} — ≤{{le}} iterations"
-                }
-            ]
-        },
-        {
-            "id": 16,
-            "type": "timeseries",
-            "title": "MCP Server Tool Duration (p90)",
-            "gridPos": {
-                "h": 6,
-                "w": 12,
-                "x": 12,
-                "y": 34
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "unit": "s"
-                }
-            },
-            "targets": [
-                {
-                    "datasource": "Prometheus",
-                    "expr": "histogram_quantile(0.90, sum(rate(mcp_tool_call_duration_seconds_bucket[5m])) by (le, tool_name))",
-                    "legendFormat": "{{tool_name}}"
-                }
-            ]
-        }
-    ],
-    "refresh": "30s",
-    "schemaVersion": 39,
-    "tags": [
-        "clinical-trials",
-        "agent",
-        "llm"
-    ],
-    "time": {
-        "from": "now-1h",
-        "to": "now"
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Throughput",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "rate(agent_query_total[$__rate_interval]) * 60", "legendFormat": "queries/min" }],
+      "fieldConfig": { "defaults": { "unit": "reqpm" } }
     },
-    "timepicker": {},
-    "title": "Clinical Trial Agent — Performance Dashboard",
-    "uid": "clinical-trial-agent-v1",
-    "version": 1
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Avg Latency",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["mean"] } },
+      "targets": [{ "expr": "sum(rate(agent_query_duration_seconds_sum[$__rate_interval])) / sum(rate(agent_query_duration_seconds_count[$__rate_interval]))", "legendFormat": "avg" }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "p90 Tail Latency",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "options": { "colorMode": "background", "thresholds": { "steps": [{ "color": "#73BF69", "value": null }, { "color": "#FADE2A", "value": 5 }, { "color": "#F44336", "value": 10 }] } },
+      "targets": [{ "expr": "histogram_quantile(0.90, sum(rate(agent_query_duration_seconds_bucket[$__rate_interval])) by (le))", "legendFormat": "p90" }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 20,
+      "type": "gauge",
+      "title": "Active Queries",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 20 }] } },
+      "targets": [{ "expr": "agent_active_queries", "legendFormat": "active" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Error Rate",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "options": { "colorMode": "background", "thresholds": { "steps": [{ "color": "#73BF69", "value": null }, { "color": "#FADE2A", "value": 0.05 }, { "color": "#F44336", "value": 0.1 }] } },
+      "targets": [{ "expr": "sum(rate(agent_query_total{status='error'}[$__rate_interval])) / sum(rate(agent_query_total[$__rate_interval]))", "legendFormat": "errors" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Data Mesh Connectivity",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "options": { "colorMode": "background", "thresholds": { "steps": [{ "color": "red", "value": 0 }, { "color": "green", "value": 1 }] } },
+      "targets": [{ "expr": "up{job='clinical-trial-mcp-server'}", "legendFormat": "MCP Server" }],
+      "fieldConfig": { "defaults": { "mappings": [{ "options": { "0": { "text": "OFFLINE" }, "1": { "text": "ONLINE" } }, "type": "value" }] } }
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Intelligence & Reasoning Profiles",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "LLM Latency Profile (p50/p90)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(agent_query_duration_seconds_bucket[$__rate_interval])) by (le, model))", "legendFormat": "p50 {{model}}" },
+        { "expr": "histogram_quantile(0.90, sum(rate(agent_query_duration_seconds_bucket[$__rate_interval])) by (le, model))", "legendFormat": "p90 {{model}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Reasoning Cycles (Avg Iterations)",
+      "gridPos": { "h": 8, "w": 8, "x": 12, "y": 6 },
+      "targets": [{ "expr": "sum(rate(agent_iteration_count_sum[$__rate_interval])) by (model) / sum(rate(agent_iteration_count_count[$__rate_interval])) by (model)", "legendFormat": "{{model}}" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Reasoning Limits Reached",
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 6 },
+      "options": { "colorMode": "background", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] } },
+      "targets": [{ "expr": "sum(increase(agent_max_iterations_reached_total[1h]))", "legendFormat": "limit reached" }]
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Tooling & Data Mesh Deep-Dive",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "MCP Tool Latency (p90)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "targets": [{ "expr": "histogram_quantile(0.90, sum(rate(mcp_tool_call_duration_seconds_bucket[$__rate_interval])) by (le, tool_name))", "legendFormat": "{{tool_name}}" }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Infrastructure Latency (DB Breakdown)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "targets": [{ "expr": "histogram_quantile(0.90, sum(rate(mcp_db_query_duration_seconds_bucket[$__rate_interval])) by (le, db))", "legendFormat": "{{db}}" }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 22,
+      "type": "piechart",
+      "title": "Tool Call Status",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "targets": [{ "expr": "sum(rate(mcp_tool_call_total[$__rate_interval])) by (status)", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Token Velocity (Tokens/min)",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 23 },
+      "targets": [
+        { "expr": "(sum(rate(agent_llm_token_total{token_type='prompt'}[$__rate_interval])) by (model) or on() vector(0)) * 60", "legendFormat": "Prompt" },
+        { "expr": "(sum(rate(agent_llm_token_total{token_type='completion'}[$__rate_interval])) by (model) or on() vector(0)) * 60", "legendFormat": "Completion" }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Avg Tokens per Query",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 23 },
+      "targets": [{ "expr": "sum(rate(agent_llm_token_total{token_type='total'}[$__rate_interval])) / sum(rate(agent_query_total{status='success'}[$__rate_interval]))", "legendFormat": "tokens/query" }]
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Tool Intensity",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 27 },
+      "targets": [{ "expr": "sum(rate(agent_tool_call_total[$__rate_interval])) / sum(rate(agent_query_total[$__rate_interval]))", "legendFormat": "tools/query" }]
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Data Governance & Access Control",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "collapsed": false
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Access Denied Breakdown",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 32 },
+      "targets": [{ "expr": "(sum(rate(agent_access_denied_total[$__rate_interval])) by (reason) or on() vector(0))", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Privacy Ceiling Impact",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 32 },
+      "targets": [{ "expr": "rate(agent_ceiling_applied_total[$__rate_interval])", "legendFormat": "enforced/s" }]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["clinical-trials", "mcp", "governance", "premium"],
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "Clinical Trial Agent — Premium Observability",
+  "uid": "clinical-trial-premium-v1",
+  "version": 3
 }

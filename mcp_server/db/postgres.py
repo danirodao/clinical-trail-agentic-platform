@@ -15,9 +15,6 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
-_pool: asyncpg.Pool | None = None
-
-
 async def init_pool() -> None:
     """Initialize the asyncpg connection pool."""
     global _pool

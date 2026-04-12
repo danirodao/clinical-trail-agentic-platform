@@ -78,6 +78,7 @@ AGENT_ACTIVE_QUERIES = ACTIVE_QUERIES
 ITERATION_COUNT = Histogram(
     "agent_iteration_count",
     "Number of ReAct iterations per query",
+    ["model"],
     buckets=[1, 2, 3, 4, 5, 7, 10, 15],
 )
 # Alias used by agent_node.py
@@ -124,6 +125,14 @@ AGENT_CEILING_APPLIED_TOTAL = Counter(
     "Times the aggregate ceiling was applied in multi-trial queries",
 )
 
+# ── Reasoning Saturatuation ──────────────────────────────────────────────────
+
+AGENT_MAX_ITERATIONS_REACHED_TOTAL = Counter(
+    "agent_max_iterations_reached_total",
+    "Queries that hit the maximum reasoning step limit",
+    ["model"],
+)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenTelemetry + Phoenix Tracing Setup
@@ -144,6 +153,7 @@ def setup_observability(
     """
     Initialize OpenTelemetry with Phoenix as the OTLP backend.
     Auto-instruments LangChain so every LLM call and tool call gets a span.
+    Also initializes Prometheus metrics to ensure visibility.
 
     Called once at AgentService.__init__().
     Calling multiple times is safe — subsequent calls are no-ops.
@@ -196,6 +206,30 @@ def setup_observability(
 
     _tracing_initialized = True
     logger.info("OpenTelemetry tracing initialized → %s", endpoint)
+
+    # ── Initialize Metrics ───────────────────────────────────────────────────
+    # We prime common counters with 0 so they appear in Grafana on startup
+    try:
+        # LLM Tokens (standard types)
+        for t_type in ["prompt", "completion", "total"]:
+            for model in ["gpt-4o", "gpt-4o-mini"]:
+                AGENT_LLM_TOKEN_TOTAL.labels(model=model, token_type=t_type).inc(0)
+        
+        # Access Denials (standard reasons)
+        for reason in ["no_access", "unauthorized_trial_scope"]:
+            AGENT_ACCESS_DENIED_TOTAL.labels(reason=reason).inc(0)
+            
+        # Global counts
+        AGENT_QUERY_TOTAL.labels(model="any", status="success", complexity="simple").inc(0)
+        AGENT_CEILING_APPLIED_TOTAL.inc(0)
+        
+        # Reasoning Saturation (New Premium Metric)
+        for model in ["gpt-4o", "gpt-4o-mini"]:
+            AGENT_MAX_ITERATIONS_REACHED_TOTAL.labels(model=model).inc(0)
+            
+    except Exception as e:
+        logger.warning("Failed to pre-initialize some metrics: %s", e)
+
     return provider
 
 

@@ -29,6 +29,13 @@ async def init_db_pool():
             decoder=json.loads,
             schema="pg_catalog"
         )
+        await conn.set_type_codec(
+            "uuid",
+            encoder=str,
+            decoder=str,
+            schema="pg_catalog",
+            format="text",
+        )
 
     db_pool = await asyncpg.create_pool(
         host=os.environ.get("POSTGRES_HOST", "postgres"),
@@ -38,6 +45,9 @@ async def init_db_pool():
         password=os.environ.get("POSTGRES_PASSWORD", "ctpassword"),
         min_size=5,
         max_size=20,
+        command_timeout=30.0,
+        max_inactive_connection_lifetime=300.0,
+        statement_cache_size=100,
         init=init_connection,
     )
     logger.info("Database pool initialized")

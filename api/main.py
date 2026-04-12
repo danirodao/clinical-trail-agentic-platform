@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-
+from api.middleware.rate_limiter import RateLimitMiddleware
+from api.middleware.audit_logger import AuditLogMiddleware
 from api.database import init_db_pool, close_db_pool, get_db_pool
 from api.metrics import metrics_router, instrument_app
 from api.routers import domain_owner, manager, researcher, marketplace
@@ -76,6 +77,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuditLogMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 app.state.limiter = limiter
 
@@ -115,3 +118,13 @@ async def health_check(db_pool=Depends(get_db_pool)):
 
     all_ok = all(v == "ok" for v in checks.values())
     return {"status": "healthy" if all_ok else "degraded", "checks": checks}
+
+@app.get("/health/agent")
+async def agent_health():
+    from api.agent.error_handler import mcp_circuit_breaker, openai_circuit_breaker
+    from api.agent.embedding_cache import embedding_cache
+    return {
+        "mcp_circuit":    mcp_circuit_breaker._state,
+        "openai_circuit": openai_circuit_breaker._state,
+        "embedding_cache": embedding_cache.stats,
+    }

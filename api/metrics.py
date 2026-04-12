@@ -137,16 +137,21 @@ class PrometheusMiddleware:
     @staticmethod
     def _resolve_path(scope: Scope) -> str:
         """
-        Return the raw URL path from the ASGI scope.
-
-        Note: we use the raw path rather than the route template here because
-        we don't have access to the FastAPI router at the ASGI level. This
-        means path parameters (e.g. /trial/some-uuid) will create separate
-        label values. If high cardinality becomes a problem, add a route
-        template resolver that walks app.routes via scope["app"].
+        Return the route template path (e.g. /api/v1/trial/{trial_id})
+        rather than the actual path to avoid high-cardinality labels.
         """
+        app = scope.get("app")
+        if not app:
+            return scope.get("path", "/")
+
+        # Walk defined routes to find a match for the current scope
+        for route in getattr(app, "routes", []):
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(route, "path", scope.get("path", "/"))
+
+        # Fallback to raw path if no route matched
         path: str = scope.get("path", "/")
-        # Strip query string just in case (path should never have it, but be safe)
         return path.split("?")[0]
 
 

@@ -21,6 +21,7 @@ from opentelemetry import trace
 from ..observability import (
     AGENT_ITERATION_COUNT,
     AGENT_LLM_TOKEN_TOTAL,
+    AGENT_MAX_ITERATIONS_REACHED_TOTAL,
     get_tracer,
 )
 from ..config import agent_config
@@ -46,6 +47,7 @@ async def agent_node(state: AgentState, tools: list) -> dict:
     # ── Iteration guard ───────────────────────────────────────────────────
     if iteration >= max_iter:
         logger.warning(f"Max iterations ({max_iter}) reached — forcing synthesizer")
+        AGENT_MAX_ITERATIONS_REACHED_TOTAL.labels(model=model_name).inc()
         return {
             "messages": [
                 AIMessage(
@@ -80,6 +82,7 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             temperature=agent_config.temperature,
             max_tokens=agent_config.max_tokens,
             streaming=True,  # Required for token-level streaming in astream_events
+            max_retries=6,   # Exponential backoff for rate limit (429) resistance
         )
         llm_with_tools = llm.bind_tools(tools)
 
@@ -98,6 +101,29 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             messages = [SystemMessage(content=system_prompt)] + messages
             logger.debug("agent_node: System prompt injected into messages.")
 
+        # ── Context Pruning (Janitor) ─────────────────────────────────────────
+        # If reasoning is deep, trim old ToolMessages to save tokens.
+        from langchain_core.messages import ToolMessage
+        if iteration > 5:
+            pruned_messages = []
+            tools_to_keep = 4
+            tools_seen = 0
+            for m in reversed(messages):
+                if isinstance(m, ToolMessage):
+                    if tools_seen >= tools_to_keep:
+                        if isinstance(m.content, str) and len(m.content) > 200:
+                            m_copy = ToolMessage(
+                                content="[Tool output pruned to save tokens. See newer messages.]",
+                                name=m.name,
+                                tool_call_id=m.tool_call_id,
+                            )
+                            pruned_messages.insert(0, m_copy)
+                            tools_seen += 1
+                            continue
+                    tools_seen += 1
+                pruned_messages.insert(0, m)
+            messages = pruned_messages
+
         # ── LLM invocation ────────────────────────────────────────────────
         response: AIMessage = await llm_with_tools.ainvoke(messages)
 
@@ -108,12 +134,19 @@ async def agent_node(state: AgentState, tools: list) -> dict:
 
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
-            # LangChain >= 0.2 UsageMetadata object
-            prompt_tokens = getattr(usage, "input_tokens", 0) or 0
-            completion_tokens = getattr(usage, "output_tokens", 0) or 0
-            total_tokens = getattr(usage, "total_tokens", 0) or (
-                prompt_tokens + completion_tokens
-            )
+            # LangChain >= 0.2 UsageMetadata (often a dict or dict-like)
+            if isinstance(usage, dict):
+                prompt_tokens = usage.get("input_tokens", 0) or 0
+                completion_tokens = usage.get("output_tokens", 0) or 0
+                total_tokens = usage.get("total_tokens", 0) or (
+                    prompt_tokens + completion_tokens
+                )
+            else:
+                prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+                completion_tokens = getattr(usage, "output_tokens", 0) or 0
+                total_tokens = getattr(usage, "total_tokens", 0) or (
+                    prompt_tokens + completion_tokens
+                )
         else:
             # Fallback: older LangChain versions store usage in response_metadata
             resp_meta = getattr(response, "response_metadata", {}) or {}
@@ -157,7 +190,7 @@ async def agent_node(state: AgentState, tools: list) -> dict:
         # We record on the LAST iteration (when LLM has no more tool calls)
         # so the histogram reflects total iterations per query
         if not has_tool_calls:
-            AGENT_ITERATION_COUNT.observe(iteration + 1)
+            AGENT_ITERATION_COUNT.labels(model=model_name).observe(iteration + 1)
 
     return {
         "messages": [response],

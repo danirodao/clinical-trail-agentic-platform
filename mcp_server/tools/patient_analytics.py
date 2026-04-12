@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row
 from db import postgres
+from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ def register_tools(mcp: FastMCP) -> None:
     # count_patients
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("count_patients")
     async def count_patients(
         trial_ids: list[str] | str | None = None,
         group_by: str = "",
@@ -303,9 +305,10 @@ def register_tools(mcp: FastMCP) -> None:
     # get_patient_demographics
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_patient_demographics")
     async def get_patient_demographics(
-        trial_ids: list[str],
-        access_context: str,
+        trial_ids: list[str] | str | None = None,
+        access_context: str = "",
         include_individual_records: bool = False,
     ) -> str:
         """
@@ -450,8 +453,9 @@ def register_tools(mcp: FastMCP) -> None:
     # get_patient_disposition
     # -----------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_patient_disposition")
     async def get_patient_disposition(
-        trial_ids: list[str],
+        trial_ids: list[str] | str | None = None,
         access_context: str = "",
     ) -> str:
         """

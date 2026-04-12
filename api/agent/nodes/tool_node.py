@@ -106,21 +106,24 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
                 # NOTE: Sequential — do NOT use asyncio.gather() here
                 raw_result = await tool.ainvoke(tool_args)
 
+                # ── Distill result to save tokens before sending to LLM ────────
+                distilled_result = _distill_result(raw_result, tool_name)
+
                 # ── Normalise result to string for ToolMessage ─────────────
-                if isinstance(raw_result, dict):
-                    result_content = json.dumps(raw_result, default=str)
+                if isinstance(distilled_result, dict):
+                    result_content = json.dumps(distilled_result, default=str)
 
-                    if raw_result.get("status") == "empty":
-                        status = "empty"
+                    if isinstance(raw_result, dict):
+                        if raw_result.get("status") == "empty":
+                            status = "empty"
+                        if raw_result.get("ceiling_applied"):
+                            AGENT_CEILING_APPLIED_TOTAL.inc()
+                            span.set_attribute("tool.ceiling_applied", True)
 
-                    if raw_result.get("ceiling_applied"):
-                        AGENT_CEILING_APPLIED_TOTAL.inc()
-                        span.set_attribute("tool.ceiling_applied", True)
-
-                elif isinstance(raw_result, str):
-                    result_content = raw_result
+                elif isinstance(distilled_result, str):
+                    result_content = distilled_result
                 else:
-                    result_content = json.dumps(raw_result, default=str)
+                    result_content = json.dumps(distilled_result, default=str)
 
                 duration_ms = timer.elapsed_ms()
                 result_summary = _summarize_result(raw_result, tool_name)
@@ -270,3 +273,29 @@ def _sanitize_args(args: dict) -> dict:
     by the LLM), but this is defense-in-depth.
     """
     return {k: v for k, v in args.items() if k != "access_context"}
+
+
+def _distill_result(result: Any, tool_name: str) -> Any:
+    """
+    Remove verbose, LLM-irrelevant metadata from tool results to save tokens.
+    Keeps only the core clinical or descriptive data.
+    """
+    if not isinstance(result, dict):
+        return result
+    
+    distilled = dict(result)
+    
+    # Strip common bulky metadata fields
+    for key in ["relevance_score", "internal_id", "created_at", "updated_at", "schema_version", "metadata"]:
+        distilled.pop(key, None)
+        
+    # Trim large lists (optional safety net, though tools should limit themselves)
+    for k, v in list(distilled.items()):
+        if isinstance(v, list) and len(v) > 50:
+            distilled[k] = v[:50]
+            distilled[f"{k}_truncated"] = f"List truncated. Showing 50 of {len(v)} items."
+            
+    # Remove nulls/empties to save further tokens
+    distilled = {k: v for k, v in distilled.items() if v is not None and v != ""}
+    
+    return distilled

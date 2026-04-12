@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row
 from db import postgres
+from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_adverse_events
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_adverse_events")
     async def get_adverse_events(
         trial_ids: list[str],
         access_context: str,
@@ -208,6 +210,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_lab_results
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_lab_results")
     async def get_lab_results(
         trial_ids: list[str],
         access_context: str,
@@ -304,6 +307,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_vital_signs
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_vital_signs")
     async def get_vital_signs(
         trial_ids: list[str],
         access_context: str,
@@ -389,6 +393,7 @@ def register_tools(mcp: FastMCP) -> None:
     # get_concomitant_medications
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("get_concomitant_medications")
     async def get_concomitant_medications(
         trial_ids: list[str],
         access_context: str,
@@ -469,6 +474,7 @@ def register_tools(mcp: FastMCP) -> None:
     # compare_treatment_arms
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("compare_treatment_arms")
     async def compare_treatment_arms(
         trial_id: str,
         access_context: str,

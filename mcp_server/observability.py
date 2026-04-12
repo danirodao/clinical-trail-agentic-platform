@@ -8,6 +8,7 @@ that Prometheus scrapes independently of the API container.
 
 from __future__ import annotations
 
+import inspect
 import time
 import functools
 import logging
@@ -88,11 +89,19 @@ def instrument_tool(tool_name: str):
                 MCP_TOOL_CALL_TOTAL.labels(tool_name=tool_name, status=status).inc()
                 MCP_TOOL_CALL_DURATION.labels(tool_name=tool_name).observe(duration)
                 logger.info(
-                    "mcp_tool_executed",
-                    tool=tool_name,
-                    status=status,
-                    duration_ms=round(duration * 1000, 1),
+                    "mcp_tool_executed: %s (status=%s, duration=%sms)",
+                    tool_name,
+                    status,
+                    round(duration * 1000, 1),
+                    extra={
+                        "tool": tool_name,
+                        "status": status,
+                        "duration_ms": round(duration * 1000, 1),
+                    },
                 )
+        
+        # CRITICAL: Preserve the original signature for FastMCP inspection
+        wrapper.__signature__ = inspect.signature(fn)
         return wrapper
     return decorator
 

@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response
 from db import postgres, neo4j_client, qdrant_client
+from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
 
@@ -181,14 +182,7 @@ def register_tools(mcp: FastMCP) -> None:
     # find_drug_condition_relationships
     # ------------------------------------------------------------------
     @mcp.tool()
-    async def find_drug_condition_relationships(
-        drug_name: str = "",
-        condition_name: str = "",
-        ae_term: str = "",
-        limit: str = "50",
-        access_context: str = "",
-    ) -> str:
-    @mcp.tool()
+    @instrument_tool("find_drug_condition_relationships")
     async def find_drug_condition_relationships(
         drug_name: str = "",
         condition_name: str = "",
@@ -496,6 +490,7 @@ def register_tools(mcp: FastMCP) -> None:
     # search_documents
     # ------------------------------------------------------------------
     @mcp.tool()
+    @instrument_tool("search_documents")
     async def search_documents(
         query: str,
         section: str = "",

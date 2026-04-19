@@ -3,7 +3,6 @@ Agent node — invokes the LLM with bound tools.
 
 Phase 5 fixes applied:
   - Fixed `total_tokens` reference in the else-branch where `usage` is None
-    (was referencing `usage.get(...)` on a None object → AttributeError)
   - Added AGENT_ITERATION_COUNT histogram recording
   - Added OTel span wrapping the LLM call with token count attributes
   - Guard against `tools` being empty with a clear error log
@@ -14,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from opentelemetry import trace
 
@@ -75,14 +74,12 @@ async def agent_node(state: AgentState, tools: list) -> dict:
         span.set_attribute("llm.message_count", len(state["messages"]))
 
         # ── Build fresh model with tools bound ────────────────────────────
-        # CRITICAL: Do NOT cache this. Tools are closures over a live MCP
-        # session. A cached LLM would hold a reference to a dead session.
         llm = ChatOpenAI(
             model=model_name,
             temperature=agent_config.temperature,
             max_tokens=agent_config.max_tokens,
-            streaming=True,  # Required for token-level streaming in astream_events
-            max_retries=6,   # Exponential backoff for rate limit (429) resistance
+            streaming=True,
+            max_retries=6,
         )
         llm_with_tools = llm.bind_tools(tools)
 
@@ -101,28 +98,13 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             messages = [SystemMessage(content=system_prompt)] + messages
             logger.debug("agent_node: System prompt injected into messages.")
 
-        # ── Context Pruning (Janitor) ─────────────────────────────────────────
-        # If reasoning is deep, trim old ToolMessages to save tokens.
-        from langchain_core.messages import ToolMessage
-        if iteration > 5:
-            pruned_messages = []
-            tools_to_keep = 4
-            tools_seen = 0
-            for m in reversed(messages):
-                if isinstance(m, ToolMessage):
-                    if tools_seen >= tools_to_keep:
-                        if isinstance(m.content, str) and len(m.content) > 200:
-                            m_copy = ToolMessage(
-                                content="[Tool output pruned to save tokens. See newer messages.]",
-                                name=m.name,
-                                tool_call_id=m.tool_call_id,
-                            )
-                            pruned_messages.insert(0, m_copy)
-                            tools_seen += 1
-                            continue
-                    tools_seen += 1
-                pruned_messages.insert(0, m)
-            messages = pruned_messages
+        # ── Token Optimizer: Sliding Window & Tool Pruning ────────────────────
+        messages = _prune_context(
+            messages,
+            max_turns=agent_config.max_history_turns,
+            max_tool_chars=agent_config.max_tool_output_chars,
+            current_iteration=iteration,
+        )
 
         # ── LLM invocation ────────────────────────────────────────────────
         response: AIMessage = await llm_with_tools.ainvoke(messages)
@@ -134,7 +116,6 @@ async def agent_node(state: AgentState, tools: list) -> dict:
 
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
-            # LangChain >= 0.2 UsageMetadata (often a dict or dict-like)
             if isinstance(usage, dict):
                 prompt_tokens = usage.get("input_tokens", 0) or 0
                 completion_tokens = usage.get("output_tokens", 0) or 0
@@ -148,12 +129,10 @@ async def agent_node(state: AgentState, tools: list) -> dict:
                     prompt_tokens + completion_tokens
                 )
         else:
-            # Fallback: older LangChain versions store usage in response_metadata
             resp_meta = getattr(response, "response_metadata", {}) or {}
             token_usage = resp_meta.get("token_usage", {}) or {}
             prompt_tokens = token_usage.get("prompt_tokens", 0)
             completion_tokens = token_usage.get("completion_tokens", 0)
-            # NOTE: total_tokens is computed here, NOT from `usage` (which is None)
             total_tokens = token_usage.get(
                 "total_tokens", prompt_tokens + completion_tokens
             )
@@ -187,8 +166,6 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             )
 
         # ── Record iteration for histogram ────────────────────────────────
-        # We record on the LAST iteration (when LLM has no more tool calls)
-        # so the histogram reflects total iterations per query
         if not has_tool_calls:
             AGENT_ITERATION_COUNT.labels(model=model_name).observe(iteration + 1)
 
@@ -200,3 +177,77 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             state.get("total_completion_tokens", 0) + completion_tokens
         ),
     }
+
+
+def _prune_context(
+    messages: list,
+    max_turns: int,
+    max_tool_chars: int,
+    current_iteration: int,
+) -> list:
+    """
+    Sliding window for history + aggressive pruning of old tool outputs.
+
+    1. Keeps SystemMessage at index 0.
+    2. Groups remaining messages into Turns (starting with HumanMessage).
+    3. Keeps only the last `max_turns` turns.
+    4. For turns *before* the current turn, truncates ToolMessage content.
+    """
+    if not messages:
+        return []
+
+    sys_msg = None
+    other_messages = messages
+    if isinstance(messages[0], SystemMessage):
+        sys_msg = messages[0]
+        other_messages = messages[1:]
+
+    # ── Group into turns ──────────────────────────────────────────────────
+    turns: list[list] = []
+    current_turn_msgs: list = []
+
+    for m in other_messages:
+        if isinstance(m, HumanMessage) and current_turn_msgs:
+            turns.append(current_turn_msgs)
+            current_turn_msgs = []
+        current_turn_msgs.append(m)
+    if current_turn_msgs:
+        turns.append(current_turn_msgs)
+
+    # ── Apply window ──────────────────────────────────────────────────────
+    if len(turns) > max_turns:
+        logger.debug(f"History window exceeded ({len(turns)} > {max_turns}) — dropping oldest turns")
+        turns = turns[-max_turns:]
+
+    # ── Prune ToolMessages in non-current questions ───────────────────────
+    # We only keep full tool output for the VERY LAST turn (the active question)
+    # AND only for the current reasoning steps in that turn.
+    pruned_turns: list[list] = []
+    for i, turn_msgs in enumerate(turns):
+        is_current_turn = (i == len(turns) - 1)
+        pruned_turn = []
+        for m in turn_msgs:
+            if isinstance(m, ToolMessage) and not is_current_turn:
+                # This was a tool call from a PREVIOUS question in the chat.
+                # We only need a summary of it, not the raw JSON.
+                if isinstance(m.content, str) and len(m.content) > max_tool_chars:
+                    m = ToolMessage(
+                        content=m.content[:max_tool_chars] + "... [Rest of historical output pruned]",
+                        name=m.name,
+                        tool_call_id=m.tool_call_id,
+                    )
+            pruned_turn.append(m)
+        pruned_turns.append(pruned_turn)
+
+    # ── Reassemble ────────────────────────────────────────────────────────
+    result = [sys_msg] if sys_msg else []
+    for turn_msgs in pruned_turns:
+        result.extend(turn_msgs)
+
+    logger.debug(
+        "context_pruned original_count=%s final_count=%s turns_kept=%s",
+        len(messages),
+        len(result),
+        len(turns),
+    )
+    return result

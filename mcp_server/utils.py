@@ -7,10 +7,69 @@ import uuid
 import datetime
 import decimal
 import logging
-from typing import Any
+from typing import Any, Optional
 
 
 logger = logging.getLogger(__name__)
+
+
+def _append_demographic_filters(
+    extra: list[str],
+    params: list[Any],
+    idx: int,
+    sex: Optional[str] = None,
+    age_min: Optional[int | str] = None,
+    age_max: Optional[int | str] = None,
+    ethnicity: Optional[str] = None,
+    country: Optional[str] = None,
+    arm_assigned: Optional[str] = None,
+    disposition_status: Optional[str] = None,
+    patient_alias: str = "p",
+) -> int:
+    """Helper to append demographic filters to the SQL query params."""
+    if sex and sex.strip():
+        # Handle "M", "F", "Male", "Female"
+        s = sex.strip().upper()
+        if s.startswith("M"):
+            s = "M"
+        elif s.startswith("F"):
+            s = "F"
+        extra.append(f"{patient_alias}.sex = ${idx}")
+        params.append(s)
+        idx += 1
+    
+    # Handle both string (from API) and int types
+    for val, op in [(age_min, ">="), (age_max, "<=")]:
+        if val is not None and str(val).strip():
+            try:
+                extra.append(f"{patient_alias}.age {op} ${idx}")
+                params.append(int(str(val).strip()))
+                idx += 1
+            except (ValueError, TypeError):
+                pass
+
+    if ethnicity and ethnicity.strip():
+        extra.append(f"LOWER({patient_alias}.ethnicity) LIKE LOWER(${idx})")
+        params.append(f"%{ethnicity.strip()}%")
+        idx += 1
+    
+    if country and country.strip():
+        extra.append(f"LOWER({patient_alias}.country) LIKE LOWER(${idx})")
+        params.append(f"%{country.strip()}%")
+        idx += 1
+    
+    if arm_assigned and arm_assigned.strip():
+        extra.append(f"LOWER({patient_alias}.arm_assigned) LIKE LOWER(${idx})")
+        params.append(f"%{arm_assigned.strip()}%")
+        idx += 1
+    
+    if disposition_status and disposition_status.strip():
+        extra.append(f"LOWER({patient_alias}.disposition_status) LIKE LOWER(${idx})")
+        params.append(f"%{disposition_status.strip()}%")
+        idx += 1
+        
+    return idx
+
 
 
 class SafeJSONEncoder(json.JSONEncoder):

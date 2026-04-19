@@ -19,7 +19,8 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response, serialize_row
+from utils import success_response, error_response, serialize_row, _append_demographic_filters
+
 from db import postgres
 from observability import instrument_tool
 
@@ -168,35 +169,18 @@ def register_tools(mcp: FastMCP) -> None:
             # 4. Additional user-supplied filters
             extra_conditions: list[str] = []
 
-            if sex.strip():
-                extra_conditions.append(f"p.sex = ${idx}")
-                params.append(sex.strip().upper())
+            idx = _append_demographic_filters(
+                extra_conditions, params, idx,
+                sex=sex, ethnicity=ethnicity, country=country,
+                age_min=age_min, age_max=age_max,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+
+            if condition.strip():
+                extra_conditions.append(f"LOWER(p.medical_conditions) LIKE LOWER(${idx})")
+                params.append(f"%{condition.strip()}%")
                 idx += 1
 
-            if ethnicity.strip():
-                extra_conditions.append(f"LOWER(p.ethnicity) LIKE LOWER(${idx})")
-                params.append(f"%{ethnicity.strip()}%")
-                idx += 1
-
-            if country.strip():
-                extra_conditions.append(f"LOWER(p.country) LIKE LOWER(${idx})")
-                params.append(f"%{country.strip()}%")
-                idx += 1
-
-            if age_min.strip():
-                extra_conditions.append(f"p.age >= ${idx}")
-                params.append(int(age_min.strip()))
-                idx += 1
-
-            if age_max.strip():
-                extra_conditions.append(f"p.age <= ${idx}")
-                params.append(int(age_max.strip()))
-                idx += 1
-
-            if arm_assigned.strip():
-                extra_conditions.append(f"LOWER(p.arm_assigned) LIKE LOWER(${idx})")
-                params.append(f"%{arm_assigned.strip()}%")
-                idx += 1
 
             if disposition_status.strip():
                 extra_conditions.append(
@@ -308,9 +292,17 @@ def register_tools(mcp: FastMCP) -> None:
     @instrument_tool("get_patient_demographics")
     async def get_patient_demographics(
         trial_ids: list[str] | str | None = None,
+        sex: str = "",
+        ethnicity: str = "",
+        country: str = "",
+        age_min: str = "",
+        age_max: str = "",
+        arm_assigned: str = "",
+        disposition_status: str = "",
         access_context: str = "",
         include_individual_records: bool = False,
     ) -> str:
+
         """
         Get demographic breakdown for patients in authorized trials.
 
@@ -350,6 +342,20 @@ def register_tools(mcp: FastMCP) -> None:
             )
             params.extend(auth_params)
 
+            # 4. Additional user-supplied filters
+            extra: list[str] = []
+            idx = _append_demographic_filters(
+                extra, params, idx,
+                sex=sex, ethnicity=ethnicity, country=country,
+                age_min=age_min, age_max=age_max,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+            
+            all_conds = [f"({auth_where})"] + extra
+            where = " AND ".join(all_conds)
+
+
+
             # 4. Age statistics
             age_sql = f"""
                 SELECT
@@ -359,7 +365,7 @@ def register_tools(mcp: FastMCP) -> None:
                     MAX(p.age) AS max_age
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
             """
 
             age_group_sql = f"""
@@ -375,7 +381,7 @@ def register_tools(mcp: FastMCP) -> None:
                     COUNT(DISTINCT p.patient_id) AS count
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY age_bucket
                 ORDER BY age_bucket
             """
@@ -384,7 +390,7 @@ def register_tools(mcp: FastMCP) -> None:
                 SELECT p.sex, COUNT(DISTINCT p.patient_id) AS count
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY p.sex ORDER BY count DESC
             """
 
@@ -392,7 +398,7 @@ def register_tools(mcp: FastMCP) -> None:
                 SELECT p.ethnicity, COUNT(DISTINCT p.patient_id) AS count
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY p.ethnicity ORDER BY count DESC
             """
 
@@ -400,7 +406,7 @@ def register_tools(mcp: FastMCP) -> None:
                 SELECT p.race, COUNT(DISTINCT p.patient_id) AS count
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY p.race ORDER BY count DESC
             """
 
@@ -420,10 +426,11 @@ def register_tools(mcp: FastMCP) -> None:
                         p.disposition_status, pte.trial_id
                     FROM patient p
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                    WHERE {auth_where}
+                    WHERE {where}
                     ORDER BY p.subject_id
                     LIMIT 100
                 """
+
                 rec_rows = await postgres.fetch(rec_sql, *params)
                 individual_records = [serialize_row(r) for r in rec_rows]
 
@@ -456,8 +463,16 @@ def register_tools(mcp: FastMCP) -> None:
     @instrument_tool("get_patient_disposition")
     async def get_patient_disposition(
         trial_ids: list[str] | str | None = None,
+        sex: str = "",
+        ethnicity: str = "",
+        country: str = "",
+        age_min: str = "",
+        age_max: str = "",
+        arm_assigned: str = "",
+        disposition_status: str = "",
         access_context: str = "",
     ) -> str:
+
         """
         Get patient disposition data: enrollment, completion, and withdrawal
         statistics across one or more trials.
@@ -496,13 +511,27 @@ def register_tools(mcp: FastMCP) -> None:
             )
             params.extend(auth_params)
 
+            # 4. Additional user-supplied filters
+            extra: list[str] = []
+            idx = _append_demographic_filters(
+                extra, params, idx,
+                sex=sex, ethnicity=ethnicity, country=country,
+                age_min=age_min, age_max=age_max,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+            
+            all_conds = [f"({auth_where})"] + extra
+            where = " AND ".join(all_conds)
+
+
+
             # 4. Overall disposition counts
             overall_sql = f"""
                 SELECT p.disposition_status,
                        COUNT(DISTINCT p.patient_id) AS count
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY p.disposition_status
                 ORDER BY count DESC
             """
@@ -515,7 +544,7 @@ def register_tools(mcp: FastMCP) -> None:
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                 JOIN clinical_trial ct ON pte.trial_id = ct.trial_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY ct.nct_id, ct.title, p.disposition_status
                 ORDER BY ct.nct_id, count DESC
             """
@@ -529,10 +558,11 @@ def register_tools(mcp: FastMCP) -> None:
                 FROM patient p
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                 JOIN clinical_trial ct ON pte.trial_id = ct.trial_id
-                WHERE {auth_where}
+                WHERE {where}
                 GROUP BY ct.nct_id, p.arm_assigned, p.disposition_status
                 ORDER BY ct.nct_id, p.arm_assigned, count DESC
             """
+
 
             overall_rows = await postgres.fetch(overall_sql, *params)
             by_trial_rows = await postgres.fetch(by_trial_sql, *params)

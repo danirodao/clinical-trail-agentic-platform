@@ -23,6 +23,8 @@ class AgentConfig:
     # ── ReAct Loop Guards ─────────────────────────────────────────────────────
     max_iterations: int = 15                   # Hard stop on tool-call loops
     simple_query_max_iterations: int = 15      # Match complex limit to prevent premature cutoff
+    max_history_turns: int = 5                 # Multi-turn conversation sliding window
+    max_tool_output_chars: int = 1000          # Limit for older tool results in history
 
     # ── Complexity Classification ─────────────────────────────────────────────
     # Queries containing these keywords are routed to GPT-4o
@@ -53,6 +55,11 @@ class AgentConfig:
     # ── Rate Limiting (enforced at API layer, referenced here for docs) ────────
     per_user_rpm: int = 20
     per_org_rpm: int = 100
+
+    # ── Evaluation Flywheel ───────────────────────────────────────────────────
+    prod_sampling_rate: float = field(
+        default_factory=lambda: float(os.getenv("PROD_SAMPLING_RATE", "0.10"))
+    )
 
 
 # Singleton — imported by all agent modules

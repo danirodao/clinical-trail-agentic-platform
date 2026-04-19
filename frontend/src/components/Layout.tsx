@@ -3,7 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { UserProfile } from '../keycloak';
 import keycloak from '../keycloak';
 import {
-    Shield, Database, ShoppingBag, Users, FlaskConical,
+    Shield, Database, ShoppingBag, FlaskConical,
     LogOut, Home
 } from 'lucide-react';
 
@@ -18,6 +18,7 @@ const roleConfig = {
         color: 'bg-purple-100 text-purple-800',
         nav: [
             { path: '/owner', label: 'Dashboard', icon: Home },
+            { path: '/owner/evaluation', label: 'Evaluation', icon: Shield },
         ],
     },
     manager: {
@@ -27,6 +28,7 @@ const roleConfig = {
             { path: '/manager', label: 'Dashboard', icon: Home },
             { path: '/marketplace', label: 'Marketplace', icon: ShoppingBag },
             { path: '/cohorts/new', label: 'Build Cohort', icon: FlaskConical },
+            { path: '/manager/evaluation', label: 'Evaluation', icon: Shield },
         ],
     },
     researcher: {

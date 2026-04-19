@@ -133,6 +133,107 @@ export const managerApi = {
         request<FilterOptionsResponse>('/cohorts/filter-options'),
 };
 
+// ─── Evaluation API ──────────────────────────────────────────
+
+export const evaluationApi = {
+    getLatestStatus: () =>
+        request<EvalStatusResponse>('/eval/status'),
+
+    getDatasetMetadata: () =>
+        request<DatasetMetadata>('/eval/golden-dataset'),
+
+    runEvaluation: (
+        dataset: string = 'golden_dataset.json',
+        layer?: string,
+        pushToArgilla: boolean = true,
+        options?: EvalRunOptions
+    ) =>
+        request<EvalStartResponse>('/eval/run', {
+            method: 'POST',
+            body: JSON.stringify({
+                dataset,
+                layer,
+                push_failures_to_argilla: pushToArgilla,
+                dataset_source: options?.dataset_source ?? 'merged',
+                max_cases: options?.max_cases,
+                argilla_sample_pct: options?.argilla_sample_pct ?? 100,
+            }),
+        }),
+
+    buildDataset: (params: { sample_pct: number; max_traces: number; push_to_argilla: boolean }) =>
+        request<DatasetBuildResponse>('/eval/build-dataset', {
+            method: 'POST',
+            body: JSON.stringify(params),
+        }),
+
+    importReviewed: () =>
+        request<FlywheelSyncResponse>('/eval/import-reviewed', { method: 'POST' }),
+};
+
+export interface EvalStatusResponse {
+    status: string;
+    latest_run?: string;
+    dataset_version?: string;
+    pass_rate?: number;
+    total_cases?: number;
+    failed_cases?: number;
+    duration_s?: number;
+    aggregate_scores?: Record<string, number>;
+    run_count?: number;
+    message?: string;
+}
+
+export interface DatasetMetadata {
+    version: string;
+    total_cases: number;
+    agent_cases: number;
+    mcp_cases: number;
+    thresholds: Record<string, number>;
+}
+
+export interface EvalRunResponse {
+    run_id: string;
+    dataset_version: string;
+    layer: string;
+    pass_rate: number;
+    total_cases: number;
+    passed_cases: number;
+    failed_cases: number;
+    duration_s: number;
+    aggregate_scores: Record<string, number>;
+    failed_case_ids: string[];
+}
+
+export interface EvalRunOptions {
+    dataset_source?: 'static' | 'merged' | 'argilla';
+    max_cases?: number;
+    argilla_sample_pct?: number;
+}
+
+export interface EvalStartResponse {
+    status: string;
+    message: string;
+    run_id: string;
+    dataset: string;
+}
+
+export interface DatasetBuildResponse {
+    status: string;
+    version: string;
+    total_cases: number;
+    extracted_from_phoenix: number;
+    output_path: string;
+}
+
+export interface FlywheelSyncResponse {
+    status: string;
+    message: string;
+    new_version: string;
+    total_cases: number;
+    backup_saved_to: string;
+    root_updated: boolean;
+}
+
 export interface FilterOptionsResponse {
     conditions: string[];
     country: string[];
@@ -421,6 +522,13 @@ export interface AccessRequestCreate {
     justification: string;
     scope?: Record<string, unknown>;
     requested_duration_days?: number;
+}
+
+export interface CohortAssignment {
+    researcher_id: string;
+    assigned_at: string;
+    expires_at: string;
+    access_level: string;
 }
 
 export interface Cohort {

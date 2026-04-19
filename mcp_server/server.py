@@ -4,8 +4,12 @@ Clinical Trial MCP Server — FastMCP with explicit tool registration.
 
 import logging
 import os
+import sys
 import warnings
 from contextlib import asynccontextmanager
+
+# Ensure the mcp_server root is in the path so tools can import utils.py
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import uvicorn
 from fastmcp import FastMCP

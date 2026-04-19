@@ -421,6 +421,12 @@ services:
       - DATABASE_URL=postgresql://ctuser:ctpassword@postgres:5432/clinical_trials
       - ENABLE_TRACING=false # set true if Phoenix is running
       - PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces
+      # Evaluation Framework
+      - ARGILLA_API_URL=http://argilla:6900
+      - ARGILLA_API_KEY=argilla.apikey
+      - ENABLE_EVAL_SCHEDULER=${ENABLE_EVAL_SCHEDULER:-true}
+      - EVAL_MODEL=${EVAL_MODEL:-gpt-4o-mini}
+      - PROD_SAMPLING_RATE=${PROD_SAMPLING_RATE:-10.0}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -557,6 +563,71 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # ─── Evaluation Infrastructure ────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.12.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - clinical-net
+
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - clinical-net
+
+  argilla:
+    image: argilla/argilla-server:latest
+    container_name: argilla
+    ports:
+      - "6900:6900"
+    environment:
+      - ARGILLA_ELASTICSEARCH=http://elasticsearch:9200
+      - ARGILLA_REDIS_URL=redis://redis:6379/0
+      - ARGILLA_AUTH_SECRET_KEY=${ARGILLA_SECRET:-argilla-secret}
+      - ARGILLA_HOME_PATH=/var/lib/argilla
+      - ARGILLA_ADMIN_USERNAME=argilla
+      - ARGILLA_ADMIN_PASSWORD=12345678
+      - USERNAME=argilla
+      - PASSWORD=12345678
+      - API_KEY=argilla.apikey
+    volumes:
+      - argilla_data:/var/lib/argilla
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:6900/api/_status || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - clinical-net
+
 # Add to existing volumes section:
 volumes:
   zookeeper-data:
@@ -568,6 +639,8 @@ volumes:
   phoenix_data:
   prometheus_data:
   grafana_data:
+  es_data:
+  argilla_data:
 
 
 networks:

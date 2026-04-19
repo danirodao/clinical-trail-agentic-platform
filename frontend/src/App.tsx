@@ -8,6 +8,8 @@ import ResearcherDashboard from './pages/ResearcherDashboard';
 import Marketplace from './pages/Marketplace';
 import CohortBuilder from './pages/CohortBuilder';
 
+import EvaluationDashboard from './pages/EvaluationDashboard';
+
 export default function App() {
     const [initialized, setInitialized] = useState(false);
     const [user, setUser] = useState<UserProfile | null>(null);
@@ -76,7 +78,10 @@ export default function App() {
                     path="/owner/*"
                     element={
                         user.role === 'domain_owner'
-                            ? <DomainOwnerDashboard user={user} />
+                            ? <Routes>
+                                <Route path="/" element={<DomainOwnerDashboard user={user} />} />
+                                <Route path="/evaluation" element={<EvaluationDashboard user={user} />} />
+                            </Routes>
                             : <Navigate to="/" replace />
                     }
                 />
@@ -86,7 +91,10 @@ export default function App() {
                     path="/manager/*"
                     element={
                         user.role === 'manager'
-                            ? <ManagerDashboard user={user} />
+                            ? <Routes>
+                                <Route path="/" element={<ManagerDashboard user={user} />} />
+                                <Route path="/evaluation" element={<EvaluationDashboard user={user} />} />
+                            </Routes>
                             : <Navigate to="/" replace />
                     }
                 />

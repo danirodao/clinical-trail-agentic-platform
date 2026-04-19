@@ -14,7 +14,8 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response, serialize_row
+from utils import success_response, error_response, serialize_row, _append_demographic_filters
+
 from db import postgres
 from observability import instrument_tool
 
@@ -54,6 +55,7 @@ async def _resolve_nct_ids(ids: list[str]) -> list[str]:
 
 def register_tools(mcp: FastMCP) -> None:
 
+
     # ------------------------------------------------------------------
     # get_adverse_events
     # ------------------------------------------------------------------
@@ -66,8 +68,16 @@ def register_tools(mcp: FastMCP) -> None:
         serious_only: bool = False,
         event_term: Optional[str] = None,
         group_by: Optional[str] = None,
+        sex: Optional[str] = None,
+        age_min: Optional[int] = None,
+        age_max: Optional[int] = None,
+        ethnicity: Optional[str] = None,
+        country: Optional[str] = None,
+        arm_assigned: Optional[str] = None,
+        disposition_status: Optional[str] = None,
         limit: int = 100,
     ) -> str:
+
         """Get adverse event data from clinical trials."""
         try:
             ctx = AccessContext.from_json(access_context)
@@ -101,6 +111,14 @@ def register_tools(mcp: FastMCP) -> None:
                 extra.append(f"LOWER(ae.ae_term) LIKE LOWER(${idx})")
                 params.append(f"%{event_term.strip()}%")
                 idx += 1
+
+            idx = _append_demographic_filters(
+                extra, params, idx, 
+                sex=sex, age_min=age_min, age_max=age_max,
+                ethnicity=ethnicity, country=country,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+
 
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
@@ -216,8 +234,16 @@ def register_tools(mcp: FastMCP) -> None:
         access_context: str,
         test_name: Optional[str] = None,
         loinc_code: Optional[str] = None,
+        sex: Optional[str] = None,
+        age_min: Optional[int] = None,
+        age_max: Optional[int] = None,
+        ethnicity: Optional[str] = None,
+        country: Optional[str] = None,
+        arm_assigned: Optional[str] = None,
+        disposition_status: Optional[str] = None,
         summary_only: bool = True,
     ) -> str:
+
         """Get laboratory test results from clinical trials."""
         try:
             ctx = AccessContext.from_json(access_context)
@@ -249,6 +275,14 @@ def register_tools(mcp: FastMCP) -> None:
                 extra.append(f"lr.loinc_code = ${idx}")
                 params.append(loinc_code.strip())
                 idx += 1
+
+            idx = _append_demographic_filters(
+                extra, params, idx, 
+                sex=sex, age_min=age_min, age_max=age_max,
+                ethnicity=ethnicity, country=country,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+
 
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
@@ -312,8 +346,16 @@ def register_tools(mcp: FastMCP) -> None:
         trial_ids: list[str],
         access_context: str,
         vital_type: Optional[str] = None,
+        sex: Optional[str] = None,
+        age_min: Optional[int] = None,
+        age_max: Optional[int] = None,
+        ethnicity: Optional[str] = None,
+        country: Optional[str] = None,
+        arm_assigned: Optional[str] = None,
+        disposition_status: Optional[str] = None,
         summary_only: bool = True,
     ) -> str:
+
         """Get vital sign measurements from clinical trials."""
         try:
             ctx = AccessContext.from_json(access_context)
@@ -339,6 +381,14 @@ def register_tools(mcp: FastMCP) -> None:
                 extra.append(f"LOWER(vs.test_name) LIKE LOWER(${idx})")
                 params.append(f"%{vital_type.strip()}%")
                 idx += 1
+
+            idx = _append_demographic_filters(
+                extra, params, idx, 
+                sex=sex, age_min=age_min, age_max=age_max,
+                ethnicity=ethnicity, country=country,
+                arm_assigned=arm_assigned, disposition_status=disposition_status
+            )
+
 
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
@@ -398,9 +448,36 @@ def register_tools(mcp: FastMCP) -> None:
         trial_ids: list[str],
         access_context: str,
         medication_name: Optional[str] = None,
+        sex: Optional[str] = None,
+        age_min: Optional[int] = None,
+        age_max: Optional[int] = None,
+        ethnicity: Optional[str] = None,
+        country: Optional[str] = None,
+        arm_assigned: Optional[str] = None,
+        disposition_status: Optional[str] = None,
         limit: int = 20,
     ) -> str:
-        """Get concomitant medications taken by patients in clinical trials."""
+
+        """
+    Returns medications that ENROLLED PATIENTS were taking during the trial,
+    as recorded in their individual medical histories.
+
+    USE THIS TOOL WHEN the question is about:
+      ✅ "What medications are my patients taking?"
+      ✅ "What are the concomitant medications for patients in this trial?"
+      ✅ "Which patients are on metformin alongside the study drug?"
+      ✅ "List the medications of patients in the diabetes trial"
+      ✅ "What drugs were patients taking before enrollment?"
+      ✅ "Are any patients on blood thinners?"
+
+    DO NOT USE THIS TOOL WHEN the question is about:
+      ❌ The trial's investigational drug design (use get_trial_interventions)
+      ❌ What drug is being tested (use get_trial_interventions)
+      ❌ Treatment arm composition (use get_trial_interventions)
+
+    Data source: patient_medication table (individual patient records).
+    Respects access_level: aggregate returns counts only, individual returns records.
+    """
         try:
             ctx = AccessContext.from_json(access_context)
             requested = await _resolve_nct_ids(_parse_trial_ids(trial_ids))
@@ -424,6 +501,15 @@ def register_tools(mcp: FastMCP) -> None:
                 extra.append(f"LOWER(pm.medication_name) LIKE LOWER(${idx})")
                 params.append(f"%{medication_name.strip()}%")
                 idx += 1
+
+            idx = _append_demographic_filters(
+                extra, params, idx, 
+                sex=sex, age_min=age_min, age_max=age_max,
+                ethnicity=ethnicity, country=country,
+                arm_assigned=arm_assigned, disposition_status=disposition_status,
+                patient_alias="p"
+            )
+
 
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)

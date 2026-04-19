@@ -56,6 +56,7 @@ class QueryResponse(BaseModel):
     filters_applied: list[str] = Field(default_factory=list)
     metadata: QueryMetadata
     error: Optional[str] = None
+    raw_context: list[str] = Field(default_factory=list, exclude=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

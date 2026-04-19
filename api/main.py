@@ -18,7 +18,7 @@ from api.middleware.rate_limiter import RateLimitMiddleware
 from api.middleware.audit_logger import AuditLogMiddleware
 from api.database import init_db_pool, close_db_pool, get_db_pool
 from api.metrics import metrics_router, instrument_app
-from api.routers import domain_owner, manager, researcher, marketplace
+from api.routers import domain_owner, manager, researcher, marketplace, eval_router
 from api.collection_consumer import CollectionRefreshConsumer
 from auth.openfga_client import get_openfga_client
 from api.metrics import metrics_router, instrument_app
@@ -55,7 +55,38 @@ async def lifespan(app: FastAPI):
         fga_client_factory=get_openfga_client,
     )
     collection_consumer.start()
+
+    # ── Nightly Evaluation Scheduler ──────────────────────────────────────
+    eval_scheduler = None
+    if os.getenv("ENABLE_EVAL_SCHEDULER", "true").lower() == "true":
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from apscheduler.triggers.cron import CronTrigger
+            from api.routers.eval_router import scheduled_evaluation
+
+            eval_scheduler = AsyncIOScheduler()
+            eval_scheduler.add_job(
+                scheduled_evaluation,
+                CronTrigger(hour=2, minute=0),  # 2:00 AM UTC
+                id="nightly_eval",
+                name="Nightly Semantic Layer Evaluation",
+                replace_existing=True,
+            )
+            eval_scheduler.start()
+            log.info("Evaluation scheduler started (nightly at 02:00 UTC)")
+        except ImportError:
+            log.warning(
+                "apscheduler not installed — nightly evaluation disabled. "
+                "Install with: pip install apscheduler"
+            )
+        except Exception as exc:
+            log.warning("Failed to start eval scheduler: %s", exc)
+
     yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────
+    if eval_scheduler:
+        eval_scheduler.shutdown(wait=False)
     if collection_consumer:
         collection_consumer.stop()
     await close_db_pool()
@@ -102,6 +133,7 @@ app.include_router(domain_owner.router, prefix="/api/v1", tags=["Domain Owner"])
 app.include_router(manager.router, prefix="/api/v1", tags=["Manager"])
 app.include_router(researcher.router, prefix="/api/v1", tags=["Researcher"])
 app.include_router(marketplace.router, prefix="/api/v1", tags=["Marketplace"])
+app.include_router(eval_router.router, prefix="/api/v1", tags=["Evaluation"])
 
 # ─── Health Check ─────────────────────────────────────────────
 

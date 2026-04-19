@@ -269,25 +269,21 @@ def register_tools(mcp: FastMCP) -> None:
         access_context: str = "",
     ) -> str:
         """
-        Get intervention details for a trial: arms, drugs, and dosing.
-        Also queries the knowledge graph for drug-condition relationships.
+         Returns the PROTOCOL-LEVEL drug design for a trial: which investigational
+    drugs are assigned to which treatment arms, including dosage and route.
 
-        Use this when a researcher asks about what drugs are being tested,
-        treatment details, dosing regimens, or what conditions a drug treats.
+    USE THIS TOOL WHEN the question is about:
+      ✅ "What drugs are being tested in this trial?"
+      ✅ "What is the treatment arm design?"
+      ✅ "What dose of Nivolumab is used in the experimental arm?"
+      ✅ "What is the drug mechanism being studied?"
 
-        This tool returns trial METADATA only — no patient records.
-        It is available to both individual and aggregate access levels.
+    DO NOT USE THIS TOOL WHEN the question is about:
+      ❌ Patient medications (use get_concomitant_medications)
+      ❌ What a specific patient is taking (use get_concomitant_medications)
+      ❌ Medication history of enrolled subjects (use get_concomitant_medications)
 
-        Args:
-            trial_id: UUID of the trial.
-            nct_id: NCT identifier.
-            drug_name: Optional filter by drug name (partial match).
-                       If provided without trial_id/nct_id, searches all
-                       authorized trials for this drug.
-            access_context: JSON authorization context (injected by system).
-
-        Returns:
-            JSON with arms, interventions, and knowledge graph relationships.
+    Data source: trial_arm + intervention tables (protocol design, NOT patient records).
         """
         try:
             ctx = AccessContext.from_json(access_context)

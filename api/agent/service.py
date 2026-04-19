@@ -31,6 +31,7 @@ import logging
 import os
 import time
 import uuid
+import asyncio
 from asyncio import CancelledError
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -143,6 +144,13 @@ class AgentService:
                 )
 
             response = QueryResponse(**response_dict)
+            
+            # Fetch full context for evaluators (ToolMessages generated during the run)
+            messages = final_state.get("messages", [])
+            response.raw_context = [
+                m.content for m in messages
+                if getattr(m, "type", "") == "tool"
+            ]
 
             # Capture labels for the finally block
             model_used = response.metadata.model_used
@@ -401,43 +409,53 @@ class AgentService:
         """
         Open an authenticated SSE connection to the MCP server.
         Yields a ready-to-use ClientSession.
-        Wraps anyio ExceptionGroup errors to surface the root cause clearly.
+        Includes a retry loop to handle transient container startup delays.
         """
         url = agent_config.mcp_server_url
         token = await get_mcp_access_token()
         headers = {"Authorization": f"Bearer {token}"}
 
-        try:
-            async with sse_client(url=url, headers=headers) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    logger.debug(f"MCP session initialized → {url}")
-                    yield session
+        max_retries = 3
+        retry_delay = 1.0
+        last_exc = None
 
-        except BaseException as exc:
-            # anyio wraps errors in ExceptionGroup — unwrap to the root cause
-            root = exc
-            if hasattr(exc, "exceptions") and exc.exceptions:
-                root = exc.exceptions[0]
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with sse_client(url=url, headers=headers) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        logger.debug(f"MCP session initialized → {url} (attempt {attempt})")
+                        yield session
+                        return # Success
 
-            msg = str(root)
-            if "401" in msg:
-                detail = (
-                    "MCP authentication failed — "
-                    "check MCP_BEARER_TOKEN matches the server"
+            except (BaseException, Exception) as exc:
+                last_exc = exc
+                # Unwrap ExceptionGroup if present
+                root = exc
+                if hasattr(exc, "exceptions") and exc.exceptions:
+                    root = exc.exceptions[0]
+                
+                msg = str(root)
+                logger.warning(
+                    f"MCP connection attempt {attempt}/{max_retries} failed: {msg}"
                 )
-            elif "404" in msg:
-                detail = (
-                    f"MCP endpoint not found — "
-                    f"check MCP_SERVER_URL includes /sse path ({url})"
-                )
-            elif "Connection refused" in msg or "ConnectError" in msg:
-                detail = "MCP server is not reachable — check it is running"
-            else:
-                detail = f"MCP connection error: {msg[:120]}"
+                
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay * attempt)
+                else:
+                    # Final attempt failed
+                    if "401" in msg:
+                        detail = "MCP auth failed — check MCP_BEARER_TOKEN"
+                    elif "404" in msg:
+                        detail = f"MCP endpoint not found — check {url}"
+                    elif "Connection refused" in msg or "ConnectError" in msg:
+                        detail = "MCP server unreachable — check container state"
+                    else:
+                        detail = f"MCP connection error: {msg[:120]}"
 
-            logger.error(f"MCP connection failed: {type(root).__name__}: {root}")
-            raise RuntimeError(detail) from root
+                    logger.error(f"MCP final connection failure: {type(root).__name__}: {root}")
+                    raise RuntimeError(detail) from root
+
 
     def _error_response(self, message: str, start_time: float) -> QueryResponse:
         """Build a QueryResponse for hard failure paths."""
@@ -480,6 +498,28 @@ class AgentService:
             iteration_count=response.metadata.iteration_count,
             status="error" if response.error else "success",
         )
+
+        # ── Automated Production Sampling (Evaluation Flywheel) ──────────────
+        import random
+        from api.evaluation.argilla_client import push_records_for_review
+
+        if random.random() < agent_config.prod_sampling_rate:
+            try:
+                import uuid
+                record = {
+                    "id": f"prod-{uuid.uuid4().hex[:8]}",
+                    "query": request.query,
+                    "actual_output": response.answer,
+                    "retrieval_context": getattr(response, "raw_context", []),
+                    "actual_tools": [tc.tool for tc in response.tool_calls],
+                    "category": "production_sampling",
+                    "layer": "agent",
+                }
+                # Push synchronously (simple network call)
+                push_records_for_review([record], source="production_sampling")
+                logger.info("Production record sampled and sent to Argilla")
+            except Exception as e:
+                logger.warning("Production sampling to Argilla failed", error=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

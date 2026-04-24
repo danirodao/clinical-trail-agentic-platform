@@ -759,6 +759,7 @@ clinical-trial/
 - **Docker Desktop** (latest)
 - **Python 3.12+** (for local scripts)
 - **OpenAI API Key** (embeddings + agent reasoning)
+- **jq not required** for `./scripts/bootstrap_auth.sh` (script uses Python JSON parsing fallback)
 
 ### 1. Configure Environment
 
@@ -1553,6 +1554,7 @@ clinical-trial/
 - **Docker Desktop** (latest)
 - **Python 3.12+** (for local scripts)
 - **OpenAI API Key** (embeddings + agent reasoning)
+- **jq not required** for `./scripts/bootstrap_auth.sh` (script uses Python JSON parsing fallback)
 
 ### 1. Configure Environment
 

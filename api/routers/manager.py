@@ -67,11 +67,14 @@ async def list_org_grants(
     """List all active access grants for my organization."""
     rows = await db_pool.fetch(
         """SELECT ag.grant_id, ag.asset_id, da.reference_id as trial_id, ag.scope, ag.granted_at,
-                  ag.expires_at, ag.is_active,
+                  ag.expires_at,
+                  (ag.revoked_at IS NULL AND ag.expires_at > NOW()) AS is_active,
                   da.title as asset_title, da.asset_type
            FROM access_grant ag
            JOIN data_asset da ON ag.asset_id = da.asset_id
-           WHERE ag.organization_id = $1 AND ag.is_active = TRUE
+           WHERE ag.organization_id = $1
+             AND ag.revoked_at IS NULL
+             AND ag.expires_at > NOW()
            ORDER BY ag.granted_at DESC""",
         user.organization_id,
     )
@@ -183,6 +186,16 @@ async def assign_researcher(
                     f"Failed to write OpenFGA tuples for assignment "
                     f"{assignment['assignment_id']}, batch starting at {i}"
                 )
+
+    # Keep cohort assignment relation in OpenFGA for can_access checks.
+    if body.cohort_id:
+        success = await fga.write_tuples([{
+            "user": f"user:{body.researcher_username}",
+            "relation": "assigned_researcher",
+            "object": f"cohort:{body.cohort_id}",
+        }])
+        if success:
+            fga_tuples_written += 1
 
     # ── Audit log ─────────────────────────────────────────────
     
@@ -305,6 +318,30 @@ async def revoke_assignment(
                 if success:
                     fga_tuples_deleted += 1
 
+    # Remove cohort assignment relation if this was the last active assignment for that cohort.
+    if assignment["cohort_id"]:
+        other_cohort_active = await db_pool.fetchval(
+            """SELECT COUNT(*) FROM researcher_assignment
+               WHERE researcher_id = $1
+               AND organization_id = $2
+               AND cohort_id = $3
+               AND revoked_at IS NULL
+               AND expires_at > NOW()
+               AND assignment_id != $4""",
+            assignment["researcher_id"],
+            assignment["organization_id"],
+            assignment["cohort_id"],
+            assignment_id,
+        )
+        if other_cohort_active == 0:
+            success = await fga.delete_tuples([{
+                "user": f"user:{assignment['researcher_id']}",
+                "relation": "assigned_researcher",
+                "object": f"cohort:{assignment['cohort_id']}",
+            }])
+            if success:
+                fga_tuples_deleted += 1
+
     # Audit
     await db_pool.execute(
         """INSERT INTO auth_audit_log
@@ -343,7 +380,7 @@ async def list_assignments(
                ra.access_level, ra.assigned_by,
                ra.assigned_at, ra.expires_at,
                ra.revoked_at, ra.revoked_by,
-               ra.is_active,
+             (ra.revoked_at IS NULL AND ra.expires_at > NOW()) AS is_active,
                ct.nct_id as trial_nct_id, ct.title as trial_title,
                c.name as cohort_name
         FROM researcher_assignment ra

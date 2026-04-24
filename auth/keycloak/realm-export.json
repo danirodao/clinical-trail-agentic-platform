@@ -32,6 +32,111 @@
     },
     "clientScopes": [
         {
+            "name": "profile",
+            "description": "OpenID Connect built-in profile scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "true"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "email",
+            "description": "OpenID Connect built-in email scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "true"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "roles",
+            "description": "OpenID Connect scope for role claims",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false"
+            },
+            "protocolMappers": [
+                {
+                    "name": "realm roles",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-realm-role-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "multivalued": "true",
+                        "userinfo.token.claim": "true",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "realm_access.roles",
+                        "jsonType.label": "String"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "web-origins",
+            "description": "OpenID Connect scope for allowed web origins",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "acr",
+            "description": "OpenID Connect built-in acr scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "address",
+            "description": "OpenID Connect built-in address scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "true"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "phone",
+            "description": "OpenID Connect built-in phone scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "true"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "offline_access",
+            "description": "OpenID Connect built-in offline_access scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "true"
+            },
+            "protocolMappers": []
+        },
+        {
+            "name": "microprofile-jwt",
+            "description": "MicroProfile JWT built-in scope",
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false"
+            },
+            "protocolMappers": []
+        },
+        {
             "name": "clinical-platform-claims",
             "description": "Custom claims for the clinical trial platform",
             "protocol": "openid-connect",
@@ -83,12 +188,61 @@
                         "claim.name": "realm_roles",
                         "jsonType.label": "String"
                     }
+                },
+                {
+                    "name": "subject-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-sub-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "id.token.claim": "true",
+                        "access.token.claim": "true"
+                    }
+                },
+                {
+                    "name": "username-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-property-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "userinfo.token.claim": "true",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "preferred_username",
+                        "jsonType.label": "String",
+                        "user.attribute": "username"
+                    }
+                },
+                {
+                    "name": "email-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-property-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "userinfo.token.claim": "true",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "email",
+                        "jsonType.label": "String",
+                        "user.attribute": "email"
+                    }
                 }
             ]
         }
     ],
     "defaultDefaultClientScopes": [
+        "profile",
+        "email",
+        "roles",
+        "web-origins",
         "clinical-platform-claims"
+    ],
+    "defaultOptionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "microprofile-jwt",
+        "acr"
     ],
     "clients": [
         {
@@ -113,7 +267,18 @@
             "implicitFlowEnabled": false,
             "fullScopeAllowed": true,
             "defaultClientScopes": [
+                "profile",
+                "email",
+                "roles",
+                "web-origins",
+                "acr",
                 "clinical-platform-claims"
+            ],
+            "optionalClientScopes": [
+                "address",
+                "phone",
+                "offline_access",
+                "microprofile-jwt"
             ]
         },
         {
@@ -132,7 +297,18 @@
             "standardFlowEnabled": true,
             "fullScopeAllowed": true,
             "defaultClientScopes": [
+                "profile",
+                "email",
+                "roles",
+                "web-origins",
+                "acr",
                 "clinical-platform-claims"
+            ],
+            "optionalClientScopes": [
+                "address",
+                "phone",
+                "offline_access",
+                "microprofile-jwt"
             ]
         }
     ],
@@ -286,24 +462,6 @@
                     "BioTech Inc"
                 ]
             }
-        }
-    ],
-    "scopeMappings": [
-        {
-            "client": "research-platform-api",
-            "roles": [
-                "domain_owner",
-                "manager",
-                "researcher"
-            ]
-        },
-        {
-            "client": "research-platform-frontend",
-            "roles": [
-                "domain_owner",
-                "manager",
-                "researcher"
-            ]
         }
     ]
 }

@@ -21,6 +21,7 @@ from api.metrics import metrics_router, instrument_app
 from api.routers import domain_owner, manager, researcher, marketplace, eval_router
 from api.collection_consumer import CollectionRefreshConsumer
 from auth.openfga_client import get_openfga_client
+from auth.reconciliation_service import ReconciliationService
 from api.metrics import metrics_router, instrument_app
 from api.logging_config import configure_logging, get_logger
 configure_logging()  # structlog configured before anything else logs
@@ -33,6 +34,12 @@ setup_observability()
 collection_consumer: CollectionRefreshConsumer = None
 
 log = get_logger(__name__)
+
+
+async def run_reconciliation_job(pool):
+    service = ReconciliationService(db_pool=pool)
+    result = await service.reconcile_all()
+    log.info("OpenFGA reconciliation run completed", result=result)
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -74,6 +81,23 @@ async def lifespan(app: FastAPI):
             )
             eval_scheduler.start()
             log.info("Evaluation scheduler started (nightly at 02:00 UTC)")
+
+            # ── OpenFGA Reconciliation Scheduler ───────────────────────────
+            if os.getenv("ENABLE_FGA_RECONCILIATION", "true").lower() == "true":
+                minutes = int(os.getenv("FGA_RECONCILIATION_INTERVAL_MINUTES", "10"))
+                eval_scheduler.add_job(
+                    run_reconciliation_job,
+                    "interval",
+                    minutes=minutes,
+                    id="fga_reconciliation",
+                    name="OpenFGA tuple reconciliation",
+                    replace_existing=True,
+                    kwargs={"pool": pool},
+                )
+                log.info("OpenFGA reconciliation scheduler started", interval_minutes=minutes)
+
+                # Run once at startup to heal drift quickly.
+                await run_reconciliation_job(pool)
         except ImportError:
             log.warning(
                 "apscheduler not installed — nightly evaluation disabled. "

@@ -434,6 +434,8 @@ services:
         condition: service_healthy
       openfga:
         condition: service_healthy
+      openfga-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     volumes:

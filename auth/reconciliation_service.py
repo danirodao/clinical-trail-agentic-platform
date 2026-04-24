@@ -30,6 +30,7 @@ class ReconciliationService:
         results = {
             "org_grants": await self._reconcile_org_grants(),
             "researcher_assignments": await self._reconcile_researcher_assignments(),
+            "cohort_assignments": await self._reconcile_cohort_assignments(),
         }
         return results
 
@@ -43,7 +44,8 @@ class ReconciliationService:
             """SELECT DISTINCT ag.organization_id, da.reference_id as trial_id
                FROM access_grant ag
                JOIN data_asset da ON ag.asset_id = da.asset_id
-               WHERE ag.is_active = TRUE"""
+             WHERE ag.revoked_at IS NULL
+             AND ag.expires_at > NOW()"""
         )
 
         for grant in active_grants:
@@ -70,13 +72,14 @@ class ReconciliationService:
             """SELECT DISTINCT ag.organization_id, da.reference_id as trial_id
                FROM access_grant ag
                JOIN data_asset da ON ag.asset_id = da.asset_id
-               WHERE ag.is_active = FALSE
+               WHERE (ag.revoked_at IS NOT NULL OR ag.expires_at <= NOW())
                AND NOT EXISTS (
                    SELECT 1 FROM access_grant ag2
                    JOIN data_asset da2 ON ag2.asset_id = da2.asset_id
                    WHERE da2.reference_id = da.reference_id
                    AND ag2.organization_id = ag.organization_id
-                   AND ag2.is_active = TRUE
+                   AND ag2.revoked_at IS NULL
+                   AND ag2.expires_at > NOW()
                )"""
         )
 
@@ -95,6 +98,65 @@ class ReconciliationService:
                     "user": f"organization:{grant['organization_id']}",
                     "relation": "granted_org",
                     "object": f"clinical_trial:{grant['trial_id']}",
+                }])
+                if success:
+                    removed += 1
+
+        return {"tuples_added": added, "stale_tuples_removed": removed}
+
+    async def _reconcile_cohort_assignments(self) -> dict:
+        """Ensure active cohort assignments have OpenFGA cohort tuples."""
+        added = 0
+        removed = 0
+
+        active = await self.db.fetch(
+            """SELECT DISTINCT researcher_id, cohort_id
+               FROM researcher_assignment
+               WHERE cohort_id IS NOT NULL
+               AND revoked_at IS NULL
+               AND expires_at > NOW()"""
+        )
+
+        for a in active:
+            result = await self.fga.check(
+                user=f"user:{a['researcher_id']}",
+                relation="assigned_researcher",
+                object=f"cohort:{a['cohort_id']}",
+            )
+            if not result.allowed:
+                success = await self.fga.write_tuples([{
+                    "user": f"user:{a['researcher_id']}",
+                    "relation": "assigned_researcher",
+                    "object": f"cohort:{a['cohort_id']}",
+                }])
+                if success:
+                    added += 1
+
+        stale = await self.db.fetch(
+            """SELECT DISTINCT ra.researcher_id, ra.cohort_id
+               FROM researcher_assignment ra
+               WHERE ra.cohort_id IS NOT NULL
+               AND (ra.revoked_at IS NOT NULL OR ra.expires_at <= NOW())
+               AND NOT EXISTS (
+                   SELECT 1 FROM researcher_assignment ra2
+                   WHERE ra2.researcher_id = ra.researcher_id
+                   AND ra2.cohort_id = ra.cohort_id
+                   AND ra2.revoked_at IS NULL
+                   AND ra2.expires_at > NOW()
+               )"""
+        )
+
+        for a in stale:
+            result = await self.fga.check(
+                user=f"user:{a['researcher_id']}",
+                relation="assigned_researcher",
+                object=f"cohort:{a['cohort_id']}",
+            )
+            if result.allowed:
+                success = await self.fga.delete_tuples([{
+                    "user": f"user:{a['researcher_id']}",
+                    "relation": "assigned_researcher",
+                    "object": f"cohort:{a['cohort_id']}",
                 }])
                 if success:
                     removed += 1

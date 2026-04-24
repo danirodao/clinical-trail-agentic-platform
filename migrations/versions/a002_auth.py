@@ -62,7 +62,7 @@ def upgrade() -> None:
             revoked_at TIMESTAMPTZ,
             revoked_by VARCHAR(255),
             revoke_reason TEXT,
-            is_active BOOLEAN GENERATED ALWAYS AS (revoked_at IS NULL AND expires_at > NOW()) STORED,
+            is_active BOOLEAN ,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
@@ -80,7 +80,7 @@ def upgrade() -> None:
             expires_at TIMESTAMPTZ NOT NULL,
             revoked_at TIMESTAMPTZ,
             revoked_by VARCHAR(255),
-            is_active BOOLEAN GENERATED ALWAYS AS (revoked_at IS NULL AND expires_at > NOW()) STORED,
+            is_active BOOLEAN ,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             CHECK (trial_id IS NOT NULL OR cohort_id IS NOT NULL)
         )

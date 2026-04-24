@@ -112,8 +112,15 @@ async def verify_token(credentials: HTTPAuthorizationCredentials) -> UserContext
                 detail="Token missing organization_id claim. Contact administrator."
             )
 
+        subject = payload.get("sub")
+        if not subject:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid token: missing 'sub' claim. Request an OpenID Connect user access token."
+            )
+
         return UserContext(
-            user_id=payload["sub"],
+            user_id=subject,
             username=payload.get("preferred_username", "unknown"),
             email=payload.get("email"),
             role=role,

@@ -129,11 +129,7 @@ class AgentService:
             initial_state = self._build_initial_state(request, access_profile)
 
             async with AsyncPostgresSaver.from_conn_string(_pg_url()) as saver:
-                async with self._mcp_session() as session:
-                    tools = await create_secure_tools(
-                        session=session,
-                        access_context_json=initial_state["access_context_json"],
-                    )
+                async with self._dual_mcp_sessions(initial_state["access_context_json"]) as tools:
                     graph = build_agent_graph(tools, start_time, checkpointer=saver)
                     final_state = await graph.ainvoke(initial_state, config=config)
 
@@ -207,11 +203,7 @@ class AgentService:
             yield StatusEvent(data={"message": "Connecting to data services..."})
 
             async with AsyncPostgresSaver.from_conn_string(_pg_url()) as saver:
-                async with self._mcp_session() as session:
-                    tools = await create_secure_tools(
-                        session=session,
-                        access_context_json=initial_state["access_context_json"],
-                    )
+                async with self._dual_mcp_sessions(initial_state["access_context_json"]) as tools:
 
                     if not tools:
                         logger.error(
@@ -405,13 +397,65 @@ class AgentService:
         )
 
     @asynccontextmanager
-    async def _mcp_session(self):
+    async def _dual_mcp_sessions(self, access_context_json: str):
         """
-        Open an authenticated SSE connection to the MCP server.
+        Open SSE sessions to both the Data MCP and Semantic MCP servers,
+        create tool wrappers from each, deduplicate by name (Data MCP wins
+        on collision), and yield the merged tool list.
+
+        Both sessions stay alive for the entire duration the caller holds the
+        context, so tool closures can always call session.call_tool().
+
+        Falls back gracefully if Semantic MCP is disabled or unreachable —
+        in that case only Data MCP tools are yielded.
+        """
+        async with self._mcp_session(agent_config.mcp_server_url) as data_session:
+            data_tools = await create_secure_tools(
+                session=data_session,
+                access_context_json=access_context_json,
+            )
+            logger.debug("Data MCP tools loaded: %d", len(data_tools))
+
+            if not agent_config.semantic_mcp_enabled:
+                logger.debug("Semantic MCP disabled — using Data MCP tools only")
+                yield data_tools
+                return
+
+            # Open the Semantic MCP session and keep it alive alongside the
+            # Data MCP session for the full duration of the graph run.
+            try:
+                async with self._mcp_session(
+                    agent_config.semantic_mcp_server_url
+                ) as sem_session:
+                    semantic_tools = await create_secure_tools(
+                        session=sem_session,
+                        access_context_json=access_context_json,
+                    )
+                    logger.debug("Semantic MCP tools loaded: %d", len(semantic_tools))
+
+                    data_names = {t.name for t in data_tools}
+                    extra = [t for t in semantic_tools if t.name not in data_names]
+                    all_tools = data_tools + extra
+                    logger.info(
+                        "Merged tool catalog: %d total (%d data, %d semantic)",
+                        len(all_tools), len(data_tools), len(extra),
+                    )
+                    # yield here: both sessions remain open until caller exits
+                    yield all_tools
+
+            except Exception as exc:
+                logger.warning(
+                    "Semantic MCP unavailable, continuing with Data MCP only: %s", exc
+                )
+                yield data_tools
+
+    @asynccontextmanager
+    async def _mcp_session(self, url: str):
+        """
+        Open an authenticated SSE connection to any MCP server.
         Yields a ready-to-use ClientSession.
         Includes a retry loop to handle transient container startup delays.
         """
-        url = agent_config.mcp_server_url
         token = await get_mcp_access_token()
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -426,7 +470,7 @@ class AgentService:
                         await session.initialize()
                         logger.debug(f"MCP session initialized → {url} (attempt {attempt})")
                         yield session
-                        return # Success
+                        return  # Success
 
             except (BaseException, Exception) as exc:
                 last_exc = exc
@@ -434,26 +478,25 @@ class AgentService:
                 root = exc
                 if hasattr(exc, "exceptions") and exc.exceptions:
                     root = exc.exceptions[0]
-                
+
                 msg = str(root)
                 logger.warning(
-                    f"MCP connection attempt {attempt}/{max_retries} failed: {msg}"
+                    f"MCP connection attempt {attempt}/{max_retries} failed for {url}: {msg}"
                 )
-                
+
                 if attempt < max_retries:
                     await asyncio.sleep(retry_delay * attempt)
                 else:
-                    # Final attempt failed
                     if "401" in msg:
-                        detail = "MCP auth failed — check MCP_BEARER_TOKEN"
+                        detail = f"MCP auth failed — check MCP_BEARER_TOKEN ({url})"
                     elif "404" in msg:
                         detail = f"MCP endpoint not found — check {url}"
                     elif "Connection refused" in msg or "ConnectError" in msg:
-                        detail = "MCP server unreachable — check container state"
+                        detail = f"MCP server unreachable — check container ({url})"
                     else:
                         detail = f"MCP connection error: {msg[:120]}"
 
-                    logger.error(f"MCP final connection failure: {type(root).__name__}: {root}")
+                    logger.error("MCP final connection failure: %s: %s", type(root).__name__, root)
                     raise RuntimeError(detail) from root
 
 

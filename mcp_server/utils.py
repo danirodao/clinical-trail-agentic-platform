@@ -9,6 +9,8 @@ import decimal
 import logging
 from typing import Any, Optional
 
+from semantic_layer import build_inline_semantic_context
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,7 @@ def make_tool_response(
     metadata: dict | None = None,
     error: str | None = None,
     code: str | None = None,
+    tool_name: str | None = None,
 ) -> str:
     """Create a standardized tool response JSON string."""
     response: dict[str, Any] = {"status": status}
@@ -137,6 +140,18 @@ def make_tool_response(
         response["error"] = error
     if code:
         response["code"] = code
+
+    # Attach semantic context inline so downstream agents can interpret fields
+    # without separate ontology lookups.
+    try:
+        response["semantic_context"] = build_inline_semantic_context(
+            data=data,
+            metadata=metadata,
+            tool_name=tool_name,
+        )
+    except Exception as exc:
+        logger.warning("Semantic context generation failed: %s", exc)
+
     return to_json(response)
 
 

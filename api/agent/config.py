@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AgentConfig:
-    # ── MCP Server ────────────────────────────────────────────────────────────
+    # ── Data MCP Server ───────────────────────────────────────────────────────
     mcp_server_url: str = field(
         default_factory=lambda: os.getenv(
             "MCP_SERVER_URL", "http://mcp-server:8001/sse"
@@ -12,6 +12,16 @@ class AgentConfig:
     )
     mcp_bearer_token: str = field(
         default_factory=lambda: os.getenv("MCP_BEARER_TOKEN", "")
+    )
+
+    # ── Semantic MCP Server ───────────────────────────────────────────────────
+    semantic_mcp_server_url: str = field(
+        default_factory=lambda: os.getenv(
+            "SEMANTIC_MCP_SERVER_URL", "http://semantic-mcp-server:8002/sse"
+        )
+    )
+    semantic_mcp_enabled: bool = field(
+        default_factory=lambda: os.getenv("SEMANTIC_MCP_ENABLED", "true").lower() == "true"
     )
 
     # ── LLM ───────────────────────────────────────────────────────────────────

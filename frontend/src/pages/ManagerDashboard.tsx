@@ -31,6 +31,26 @@ export default function ManagerDashboard({ user }: Props) {
 
     useEffect(() => { loadAll(); }, []);
 
+    const shortId = (id?: string) => (id ? `${id.slice(0, 8)}...` : 'unknown');
+
+    const resolveTrialLabel = (trialId?: string) => {
+        if (!trialId) return null;
+        const grant = grants.find((g) => g.trial_id === trialId);
+        if (grant?.asset_title) {
+            return `${grant.asset_title} (${shortId(trialId)})`;
+        }
+        return `Trial ${shortId(trialId)}`;
+    };
+
+    const resolveCohortLabel = (cohortId?: string) => {
+        if (!cohortId) return null;
+        const cohort = cohorts.find((c) => c.cohort_id === cohortId);
+        if (cohort?.name) {
+            return `${cohort.name} (${shortId(cohortId)})`;
+        }
+        return `Cohort ${shortId(cohortId)}`;
+    };
+
     async function loadAll() {
         setLoading(true);
         try {
@@ -256,8 +276,10 @@ export default function ManagerDashboard({ user }: Props) {
                             {assignments.map((a) => (
                                 <tr key={a.assignment_id} className="hover:bg-gray-50">
                                     <td className="px-6 py-4 text-sm font-medium text-gray-900">{a.researcher_id}</td>
-                                    <td className="px-6 py-4 text-sm text-gray-500 font-mono">
-                                        {a.trial_id ? `Trial: ${a.trial_id.slice(0, 8)}...` : `Cohort: ${a.cohort_id?.slice(0, 8)}...`}
+                                    <td className="px-6 py-4 text-sm text-gray-700">
+                                        {a.trial_id
+                                            ? `Trial: ${resolveTrialLabel(a.trial_id)}`
+                                            : `Cohort: ${resolveCohortLabel(a.cohort_id)}`}
                                     </td>
                                     <td className="px-6 py-4">
                                         <StatusBadge status={a.access_level === 'individual' ? 'sensitive' : 'standard'} />
@@ -344,7 +366,7 @@ export default function ManagerDashboard({ user }: Props) {
                                             <option value="">Select a trial...</option>
                                             {grants.filter(g => g.is_active).map((g) => (
                                                 <option key={g.grant_id} value={g.trial_id}>
-                                                    {g.asset_title}
+                                                    {g.asset_title} ({shortId(g.trial_id)})
                                                 </option>
                                             ))}
                                         </select>

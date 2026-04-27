@@ -218,3 +218,29 @@ CREATE INDEX IF NOT EXISTS idx_audit_actor ON auth_audit_log (actor_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON auth_audit_log (action);
 
 CREATE INDEX IF NOT EXISTS idx_audit_created ON auth_audit_log (created_at);
+
+-- OpenFGA tuple outbox for reliable async sync (replaces direct dual-write)
+CREATE TABLE IF NOT EXISTS openfga_tuple_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    operation VARCHAR(10) NOT NULL CHECK (operation IN ('write', 'delete')),
+    tuple_user TEXT NOT NULL,
+    tuple_relation TEXT NOT NULL,
+    tuple_object TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'failed', 'applied', 'dead')
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source TEXT,
+    correlation_id TEXT,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_openfga_outbox_pending
+ON openfga_tuple_outbox (status, available_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_openfga_outbox_correlation
+ON openfga_tuple_outbox (correlation_id);

@@ -34,7 +34,7 @@ def serialize_access_profile(access_profile: "AccessProfile") -> Dict[str, Any]:
 
     access_levels: Dict[str, str] = {}
     patient_filters: Dict[str, List[Dict]] = {}
-    trial_metadata: Dict[str, Dict] = {}
+    trial_metadata: Dict[str, Dict] = dict(getattr(access_profile, 'trial_metadata', {}) or {})
 
     if hasattr(access_profile, 'trial_scopes'):
         for tid, scope in access_profile.trial_scopes.items():
@@ -144,6 +144,20 @@ def build_access_summary_for_prompt(access_profile: Any) -> str:
     lines = []
     individual_trials = []
     aggregate_trials = []
+    trial_metadata = getattr(access_profile, "trial_metadata", {}) or {}
+
+    def trial_label(trial_id: str) -> str:
+        meta = trial_metadata.get(trial_id, {}) if isinstance(trial_metadata, dict) else {}
+        nct = (meta.get("nct_id") or "").strip() if isinstance(meta, dict) else ""
+        title = (meta.get("title") or "").strip() if isinstance(meta, dict) else ""
+
+        parts = []
+        if nct:
+            parts.append(f"NCT={nct}")
+        if title:
+            parts.append(f"title={title}")
+
+        return f" ({'; '.join(parts)})" if parts else ""
 
     for tid, scope in access_profile.trial_scopes.items():
         if scope.access_level == "individual":
@@ -152,9 +166,9 @@ def build_access_summary_for_prompt(access_profile: Any) -> str:
                 names = ", ".join(cs.cohort_name for cs in scope.cohort_scopes)
                 filter_note = f" [cohort: {names}]"
             # Show UUID explicitly
-            individual_trials.append(f"  • UUID={tid}{filter_note}")
+            individual_trials.append(f"  • UUID={tid}{trial_label(tid)}{filter_note}")
         else:
-            aggregate_trials.append(f"  • UUID={tid}")
+            aggregate_trials.append(f"  • UUID={tid}{trial_label(tid)}")
 
     if individual_trials:
         lines.append(f"INDIVIDUAL ACCESS ({len(individual_trials)} trial(s)):")

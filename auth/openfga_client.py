@@ -6,6 +6,8 @@ and ListObjects queries for computing access profiles.
 
 import os
 import logging
+import asyncio
+import time
 from typing import Optional
 from dataclasses import dataclass
 
@@ -17,6 +19,8 @@ OPENFGA_API_URL = os.environ.get("OPENFGA_API_URL", "http://openfga:8080")
 OPENFGA_STORE_ID = os.environ.get("OPENFGA_STORE_ID", "")
 FAIL_CLOSED = os.environ.get("OPENFGA_FAIL_CLOSED", "true").lower() == "true"
 CHECK_TIMEOUT = float(os.environ.get("OPENFGA_CHECK_TIMEOUT", "2.0"))
+OPENFGA_CACHE_TTL_SECONDS = float(os.environ.get("OPENFGA_CACHE_TTL_SECONDS", "30"))
+OPENFGA_CACHE_MAX_ENTRIES = int(os.environ.get("OPENFGA_CACHE_MAX_ENTRIES", "5000"))
 
 
 @dataclass
@@ -37,6 +41,37 @@ class OpenFGAClient:
         self.api_url = api_url
         self.store_id = store_id
         self._client: Optional[httpx.AsyncClient] = None
+        self._cache_ttl = OPENFGA_CACHE_TTL_SECONDS
+        self._cache_max_entries = OPENFGA_CACHE_MAX_ENTRIES
+        self._cache: dict[str, tuple[float, object]] = {}
+        self._cache_lock = asyncio.Lock()
+
+    async def _cache_get(self, key: str):
+        if self._cache_ttl <= 0:
+            return None
+        async with self._cache_lock:
+            item = self._cache.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if expires_at < time.monotonic():
+                self._cache.pop(key, None)
+                return None
+            return value
+
+    async def _cache_set(self, key: str, value: object):
+        if self._cache_ttl <= 0:
+            return
+        async with self._cache_lock:
+            if len(self._cache) >= self._cache_max_entries:
+                oldest = next(iter(self._cache), None)
+                if oldest is not None:
+                    self._cache.pop(oldest, None)
+            self._cache[key] = (time.monotonic() + self._cache_ttl, value)
+
+    async def clear_cache(self):
+        async with self._cache_lock:
+            self._cache.clear()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -57,12 +92,19 @@ class OpenFGAClient:
         user: str,
         relation: str,
         object: str,
+        use_cache: bool = True,
     ) -> CheckResult:
         """
         Check if a user has a relation to an object.
         Returns CheckResult with .allowed boolean.
         FAIL CLOSED: Returns denied if OpenFGA is unreachable.
         """
+        cache_key = f"check:{user}|{relation}|{object}"
+        if use_cache:
+            cached = await self._cache_get(cache_key)
+            if isinstance(cached, CheckResult):
+                return cached
+
         try:
             client = await self._get_client()
             resp = await client.post(
@@ -77,10 +119,13 @@ class OpenFGAClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            return CheckResult(
+            result = CheckResult(
                 allowed=data.get("allowed", False),
                 resolution_metadata=data.get("resolution_metadata"),
             )
+            if use_cache:
+                await self._cache_set(cache_key, result)
+            return result
 
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.error(f"OpenFGA unreachable: {e}")
@@ -126,11 +171,18 @@ class OpenFGAClient:
         user: str,
         relation: str,
         object_type: str,
+        use_cache: bool = True,
     ) -> list[str]:
         """
         List all objects of a type that a user has a relation to.
         Used to compute access profiles (e.g., all trials a user can view).
         """
+        cache_key = f"list:{user}|{relation}|{object_type}"
+        if use_cache:
+            cached = await self._cache_get(cache_key)
+            if isinstance(cached, list):
+                return cached
+
         try:
             client = await self._get_client()
             resp = await client.post(
@@ -146,7 +198,10 @@ class OpenFGAClient:
             # Returns list like ["clinical_trial:uuid1", "clinical_trial:uuid2"]
             objects = data.get("objects", [])
             # Strip the type prefix to return just IDs
-            return [obj.split(":", 1)[1] if ":" in obj else obj for obj in objects]
+            ids = [obj.split(":", 1)[1] if ":" in obj else obj for obj in objects]
+            if use_cache:
+                await self._cache_set(cache_key, ids)
+            return ids
 
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.error(f"OpenFGA list-objects failed: {e}")
@@ -171,6 +226,8 @@ class OpenFGAClient:
         """
         Write relationship tuples.
         Each tuple: {"user": "user:X", "relation": "R", "object": "type:Y"}
+        
+        Idempotent: Treats "already exists" as success (tuple was already there).
         """
         try:
             client = await self._get_client()
@@ -191,7 +248,21 @@ class OpenFGAClient:
             )
             if resp.status_code == 200:
                 logger.info(f"Wrote {len(tuples)} tuples to OpenFGA")
+                await self.clear_cache()
                 return True
+            elif resp.status_code == 400:
+                # Check if error is "tuple already exists" (idempotent)
+                try:
+                    error_resp = resp.json()
+                    error_msg = error_resp.get("message", "")
+                    if "already exists" in error_msg.lower():
+                        logger.info(f"Tuple already exists (idempotent): {error_msg}")
+                        await self.clear_cache()
+                        return True  # Treat as success
+                except:
+                    pass
+                logger.error(f"Tuple write failed: {resp.status_code} {resp.text}")
+                return False
             else:
                 logger.error(f"Tuple write failed: {resp.status_code} {resp.text}")
                 return False
@@ -201,7 +272,10 @@ class OpenFGAClient:
             return False
 
     async def delete_tuples(self, tuples: list[dict]) -> bool:
-        """Delete relationship tuples (for revocation)."""
+        """Delete relationship tuples (for revocation).
+        
+        Idempotent: Treats "tuple not found" as success (tuple was already gone).
+        """
         try:
             client = await self._get_client()
             resp = await client.post(
@@ -219,11 +293,39 @@ class OpenFGAClient:
                     }
                 }
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                logger.info(f"Deleted {len(tuples)} tuples from OpenFGA")
+                await self.clear_cache()
+                return True
+            elif resp.status_code == 400:
+                # Check if error is "tuple not found" (idempotent)
+                try:
+                    error_resp = resp.json()
+                    error_msg = error_resp.get("message", "")
+                    if ("did not exist" in error_msg.lower() or 
+                        "not found" in error_msg.lower()):
+                        logger.info(f"Tuple not found (idempotent): {error_msg}")
+                        await self.clear_cache()
+                        return True  # Treat as success
+                except:
+                    pass
+                logger.error(f"Tuple delete failed: {resp.status_code} {resp.text}")
+                return False
+            else:
+                logger.error(f"Tuple delete failed: {resp.status_code} {resp.text}")
+                return False
 
         except Exception as e:
             logger.error(f"Tuple delete error: {e}")
             return False
+
+    async def tuple_exists(self, user: str, relation: str, object: str) -> bool:
+        """
+        Check if a tuple exists in OpenFGA.
+        Uses the check API to verify if a user has a relation to an object.
+        """
+        result = await self.check(user, relation, object, use_cache=False)
+        return result.allowed
 
     # ─── Convenience: Grant org access to trial ───────────────
 

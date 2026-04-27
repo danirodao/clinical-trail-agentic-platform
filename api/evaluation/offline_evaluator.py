@@ -243,13 +243,29 @@ async def _evaluate_agent_case(
         from api.agent.service import AgentService
         from api.agent.models import QueryRequest
 
-        # Build test access profile (full access for evaluation)
-        profile = await _build_eval_access_profile()
-
         service = AgentService()
         trial_ids = case.get("trial_ids", None)
         request = QueryRequest(query=query, trial_ids=trial_ids)
-        response = await service.query(request, profile)
+
+        # ── Identity impersonation ─────────────────────────────────────────
+        # If the golden record carries an evaluation_persona snapshot (captured
+        # from the original production request), replay under that identity so
+        # access-control behaviour is identical to what the real user saw.
+        # Fallback to the synthetic eval-runner profile only when no persona
+        # is stored (e.g. seed dataset records or MCP-layer cases).
+        evaluation_persona = case.get("evaluation_persona")
+        if evaluation_persona:
+            if isinstance(evaluation_persona, str):
+                try:
+                    evaluation_persona = json.loads(evaluation_persona)
+                except (json.JSONDecodeError, TypeError):
+                    evaluation_persona = None
+
+        if evaluation_persona:
+            response = await service.query_with_profile(request, evaluation_persona)
+        else:
+            profile = await _build_eval_access_profile()
+            response = await service.query(request, profile)
 
         actual_output = response.answer
         actual_tools = [tc.tool for tc in response.tool_calls]

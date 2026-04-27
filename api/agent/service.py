@@ -70,6 +70,44 @@ from .tool_wrappers import create_secure_tools
 
 logger = structlog.get_logger(__name__)
 
+MAX_QUERY_LOG_CHARS = 1200
+MAX_ANSWER_LOG_CHARS = 1800
+
+
+def _preview_text(text: str, max_chars: int) -> str:
+    """Bound large user/model payloads for logs."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "... [truncated]"
+
+
+def _root_exception(exc: BaseException) -> BaseException:
+    """
+    Unwrap ExceptionGroup / chained exceptions to the most informative root.
+
+    MCP SSE failures often surface as "unhandled errors in a TaskGroup"
+    where the useful cause is nested one or more levels deeper.
+    """
+    current: BaseException = exc
+
+    while True:
+        # Python 3.11+ ExceptionGroup
+        nested = getattr(current, "exceptions", None)
+        if nested and isinstance(nested, (list, tuple)) and nested:
+            current = nested[0]
+            continue
+
+        # Standard exception chaining
+        if getattr(current, "__cause__", None):
+            current = current.__cause__
+            continue
+
+        if getattr(current, "__context__", None):
+            current = current.__context__
+            continue
+
+        return current
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: build the PostgreSQL connection string from environment variables
@@ -171,6 +209,33 @@ class AgentService:
                 model=model_used, complexity=complexity
             ).observe(duration)
             ACTIVE_QUERIES.dec()
+
+    async def query_with_profile(
+        self,
+        request: QueryRequest,
+        access_profile_snapshot: dict,
+    ) -> QueryResponse:
+        """
+        Replay a query using a pre-computed AccessProfile snapshot.
+
+        Intended EXCLUSIVELY for the offline evaluator.  The snapshot is
+        restored via AccessProfile.from_snapshot() which bypasses OpenFGA and
+        PostgreSQL auth calls, impersonating the original user's exact access
+        context at the time the golden record was captured.
+
+        Args:
+            request:                 The original QueryRequest (query + trial_ids).
+            access_profile_snapshot: Dict produced by AccessProfile.to_snapshot()
+                                     and stored in the Argilla evaluation_persona field.
+
+        Returns:
+            QueryResponse identical to what the live agent would return for
+            this user at this point in time.
+        """
+        from auth.authorization_service import AccessProfile
+
+        profile = AccessProfile.from_snapshot(access_profile_snapshot)
+        return await self.query(request, profile)
 
     async def query_stream(
         self,
@@ -414,15 +479,26 @@ class AgentService:
                 session=data_session,
                 access_context_json=access_context_json,
             )
-            logger.debug("Data MCP tools loaded: %d", len(data_tools))
+            logger.info(
+                "mcp_tools_loaded",
+                mcp_role="data",
+                mcp_url=agent_config.mcp_server_url,
+                tool_count=len(data_tools),
+                tool_names=[t.name for t in data_tools],
+            )
 
             if not agent_config.semantic_mcp_enabled:
-                logger.debug("Semantic MCP disabled — using Data MCP tools only")
+                logger.info(
+                    "semantic_mcp_disabled_using_data_only",
+                    data_mcp_url=agent_config.mcp_server_url,
+                    data_tool_count=len(data_tools),
+                )
                 yield data_tools
                 return
 
             # Open the Semantic MCP session and keep it alive alongside the
             # Data MCP session for the full duration of the graph run.
+            yielded_semantic_tools = False
             try:
                 async with self._mcp_session(
                     agent_config.semantic_mcp_server_url
@@ -431,21 +507,41 @@ class AgentService:
                         session=sem_session,
                         access_context_json=access_context_json,
                     )
-                    logger.debug("Semantic MCP tools loaded: %d", len(semantic_tools))
+                    logger.info(
+                        "mcp_tools_loaded",
+                        mcp_role="semantic",
+                        mcp_url=agent_config.semantic_mcp_server_url,
+                        tool_count=len(semantic_tools),
+                        tool_names=[t.name for t in semantic_tools],
+                    )
 
                     data_names = {t.name for t in data_tools}
                     extra = [t for t in semantic_tools if t.name not in data_names]
                     all_tools = data_tools + extra
                     logger.info(
-                        "Merged tool catalog: %d total (%d data, %d semantic)",
-                        len(all_tools), len(data_tools), len(extra),
+                        "mcp_tool_catalog_merged",
+                        data_mcp_url=agent_config.mcp_server_url,
+                        semantic_mcp_url=agent_config.semantic_mcp_server_url,
+                        total_tool_count=len(all_tools),
+                        data_tool_count=len(data_tools),
+                        semantic_unique_tool_count=len(extra),
                     )
                     # yield here: both sessions remain open until caller exits
+                    yielded_semantic_tools = True
                     yield all_tools
 
             except Exception as exc:
+                # If execution already entered the yielded body, propagate the
+                # caller exception. Falling back here would violate async
+                # contextmanager shutdown semantics (generator must stop).
+                if yielded_semantic_tools:
+                    raise
                 logger.warning(
-                    "Semantic MCP unavailable, continuing with Data MCP only: %s", exc
+                    "semantic_mcp_unavailable_using_data_only",
+                    semantic_mcp_url=agent_config.semantic_mcp_server_url,
+                    data_mcp_url=agent_config.mcp_server_url,
+                    data_tool_count=len(data_tools),
+                    error=str(exc),
                 )
                 yield data_tools
 
@@ -461,7 +557,6 @@ class AgentService:
 
         max_retries = 3
         retry_delay = 1.0
-        last_exc = None
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -469,30 +564,51 @@ class AgentService:
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         logger.debug(f"MCP session initialized → {url} (attempt {attempt})")
-                        yield session
+                        try:
+                            yield session
+                        except GeneratorExit:
+                            # Client disconnected or request task group is being
+                            # torn down. This is a normal shutdown path.
+                            logger.debug("MCP session closed during generator shutdown → %s", url)
+                            return
                         return  # Success
 
-            except (BaseException, Exception) as exc:
-                last_exc = exc
-                # Unwrap ExceptionGroup if present
-                root = exc
-                if hasattr(exc, "exceptions") and exc.exceptions:
-                    root = exc.exceptions[0]
+            except Exception as exc:
+                root = _root_exception(exc)
 
                 msg = str(root)
-                logger.warning(
-                    f"MCP connection attempt {attempt}/{max_retries} failed for {url}: {msg}"
-                )
+                if attempt < max_retries:
+                    logger.info(
+                        "MCP connection attempt %d/%d failed for %s (%s: %s) — retrying",
+                        attempt,
+                        max_retries,
+                        url,
+                        type(root).__name__,
+                        msg,
+                    )
+                else:
+                    logger.warning(
+                        "MCP connection attempt %d/%d failed for %s (%s: %s)",
+                        attempt,
+                        max_retries,
+                        url,
+                        type(root).__name__,
+                        msg,
+                    )
 
                 if attempt < max_retries:
                     await asyncio.sleep(retry_delay * attempt)
                 else:
                     if "401" in msg:
                         detail = f"MCP auth failed — check MCP_BEARER_TOKEN ({url})"
+                    elif "403" in msg or "Missing Authorization header" in msg or "Invalid Token" in msg:
+                        detail = f"MCP authorization rejected — check Keycloak token audience/realm ({url})"
                     elif "404" in msg:
                         detail = f"MCP endpoint not found — check {url}"
                     elif "Connection refused" in msg or "ConnectError" in msg:
                         detail = f"MCP server unreachable — check container ({url})"
+                    elif "ReadTimeout" in msg or "Timeout" in msg:
+                        detail = f"MCP handshake timed out — server may be overloaded ({url})"
                     else:
                         detail = f"MCP connection error: {msg[:120]}"
 
@@ -531,11 +647,13 @@ class AgentService:
             user_id=getattr(access_profile, "user_id", "unknown"),
             organization_id=getattr(access_profile, "organization_id", "unknown"),
             query_length=len(request.query),
+            query_preview=_preview_text(request.query, MAX_QUERY_LOG_CHARS),
             trial_scope=request.trial_ids,
             access_level=response.access_level_applied,
             model_used=response.metadata.model_used,
             tools_called=[tc.tool for tc in response.tool_calls],
             tool_call_count=len(response.tool_calls),
+            answer_preview=_preview_text(response.answer or "", MAX_ANSWER_LOG_CHARS),
             total_tokens=response.metadata.total_tokens,
             duration_ms=response.metadata.duration_ms,
             iteration_count=response.metadata.iteration_count,
@@ -544,23 +662,25 @@ class AgentService:
 
         # ── Automated Production Sampling (Evaluation Flywheel) ──────────────
         import random
-        from api.evaluation.argilla_client import push_records_for_review
+        from api.evaluation.argilla_client import capture_production_request
 
         if random.random() < agent_config.prod_sampling_rate:
             try:
-                import uuid
-                record = {
-                    "id": f"prod-{uuid.uuid4().hex[:8]}",
-                    "query": request.query,
-                    "actual_output": response.answer,
-                    "retrieval_context": getattr(response, "raw_context", []),
-                    "actual_tools": [tc.tool for tc in response.tool_calls],
-                    "category": "production_sampling",
-                    "layer": "agent",
-                }
-                # Push synchronously (simple network call)
-                push_records_for_review([record], source="production_sampling")
-                logger.info("Production record sampled and sent to Argilla")
+                snapshot = _access_profile_snapshot(access_profile)
+
+                stored = capture_production_request(
+                    query=request.query,
+                    actual_output=response.answer,
+                    access_profile_snapshot=snapshot,
+                    tool_calls=[tc.tool for tc in response.tool_calls],
+                    retrieval_context=getattr(response, "raw_context", []),
+                    category="production_sampling",
+                    run_id=request.session_id or "live",
+                )
+                if stored:
+                    logger.info("Production record sampled and sent to Argilla")
+                else:
+                    logger.warning("Production record sampled but not stored in Argilla")
             except Exception as e:
                 logger.warning("Production sampling to Argilla failed", error=str(e))
 
@@ -620,6 +740,31 @@ def _serialize_profile(access_profile: Any) -> dict:
         "trial_scopes": trial_scopes,
         "trial_metadata": trial_metadata,
     }
+
+
+def _access_profile_snapshot(access_profile: Any) -> dict:
+    """
+    Build a replay-safe snapshot for Argilla evaluation_persona.
+
+    Priority:
+      1) AccessProfile.to_snapshot() if available
+      2) Existing dict values (already serialized)
+      3) Fallback to _serialize_profile()
+    """
+    if isinstance(access_profile, dict):
+        return access_profile
+
+    to_snapshot = getattr(access_profile, "to_snapshot", None)
+    if callable(to_snapshot):
+        try:
+            snapshot = to_snapshot()
+            if isinstance(snapshot, dict):
+                return snapshot
+        except Exception:
+            # Fall back to generic serialisation below
+            pass
+
+    return _serialize_profile(access_profile)
 
 
 def _sanitize_for_display(args: dict) -> dict:

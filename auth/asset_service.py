@@ -19,6 +19,7 @@ import asyncpg
 
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
+from auth.openfga_outbox import enqueue_delete_tuples, enqueue_write_tuples
 
 logger = logging.getLogger(__name__)
 
@@ -254,12 +255,12 @@ class AssetService:
                         })
                         published_count += 1
 
-        # 3. Write OpenFGA tuples (batch, outside transaction)
-        if fga_tuples:
-            # OpenFGA max batch size is 100
-            for i in range(0, len(fga_tuples), 100):
-                batch = fga_tuples[i:i + 100]
-                await self.fga.write_tuples(batch)
+                await enqueue_write_tuples(
+                    conn,
+                    fga_tuples,
+                    source="asset.publish_collection",
+                    correlation_id=str(collection_id),
+                )
 
         # 4. Audit
         await self._audit(
@@ -412,10 +413,13 @@ class AssetService:
                     # Update collection summary
                     await self._update_collection_summary(conn, coll_id)
 
-            # Write OpenFGA tuples
-            all_tuples = fga_owner_tuples + fga_grant_tuples
-            for i in range(0, len(all_tuples), 100):
-                await self.fga.write_tuples(all_tuples[i:i + 100])
+                    all_tuples = fga_owner_tuples + fga_grant_tuples
+                    await enqueue_write_tuples(
+                        conn,
+                        all_tuples,
+                        source="asset.refresh_dynamic_collections",
+                        correlation_id=str(coll_id),
+                    )
 
             results.append({
                 "collection_id": str(coll_id),
@@ -465,10 +469,6 @@ class AssetService:
                 "object": f"clinical_trial:{trial_id}",
             })
 
-        if fga_tuples:
-            for i in range(0, len(fga_tuples), 100):
-                await self.fga.write_tuples(fga_tuples[i:i + 100])
-
         return fga_tuples
     # ═══════════════════════════════════════════════════════════
     # GRANT MANAGEMENT
@@ -486,51 +486,61 @@ class AssetService:
         Grant an organization access to all trials in a collection.
         Creates per-trial access_grant + OpenFGA tuples.
         """
-        assets = await self.db.fetch(
-            """SELECT da.asset_id, da.reference_id as trial_id
-               FROM data_asset da
-               JOIN collection_asset ca ON da.asset_id = ca.asset_id
-               WHERE ca.collection_id = $1""",
-            collection_id,
-        )
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                assets = await conn.fetch(
+                    """SELECT da.asset_id, da.reference_id as trial_id
+                       FROM data_asset da
+                       JOIN collection_asset ca ON da.asset_id = ca.asset_id
+                       WHERE ca.collection_id = $1""",
+                    collection_id,
+                )
 
-        if not assets:
-            raise ValueError("Collection has no assets")
+                if not assets:
+                    raise ValueError("Collection has no assets")
 
-        grant_ids = []
-        fga_tuples = []
+                grant_ids = []
+                fga_tuples = []
 
-        for asset in assets:
-            # Idempotent: skip if grant already exists
-            existing = await self.db.fetchrow(
-                """SELECT grant_id FROM access_grant
-                   WHERE asset_id = $1 AND organization_id = $2 AND is_active = TRUE""",
-                asset["asset_id"], org_id,
-            )
-            if existing:
-                grant_ids.append(existing["grant_id"])
-                continue
+                for asset in assets:
+                    # Idempotent: skip if grant already exists
+                    existing = await conn.fetchrow(
+                        """SELECT grant_id FROM access_grant
+                           WHERE asset_id = $1 AND organization_id = $2 AND is_active = TRUE""",
+                        asset["asset_id"],
+                        org_id,
+                    )
+                    if existing:
+                        grant_ids.append(existing["grant_id"])
+                        continue
 
-            row = await self.db.fetchrow(
-                """INSERT INTO access_grant
-                   (request_id, asset_id, collection_id, organization_id,
-                    granted_by, expires_at)
-                   VALUES ($1, $2, $3, $4, $5, $6)
-                   RETURNING grant_id""",
-                request_id, asset["asset_id"], collection_id,
-                org_id, granted_by, expires_at,
-            )
-            grant_ids.append(row["grant_id"])
+                    row = await conn.fetchrow(
+                        """INSERT INTO access_grant
+                           (request_id, asset_id, collection_id, organization_id,
+                            granted_by, expires_at)
+                           VALUES ($1, $2, $3, $4, $5, $6)
+                           RETURNING grant_id""",
+                        request_id,
+                        asset["asset_id"],
+                        collection_id,
+                        org_id,
+                        granted_by,
+                        expires_at,
+                    )
+                    grant_ids.append(row["grant_id"])
 
-            fga_tuples.append({
-                "user": f"organization:{org_id}",
-                "relation": "granted_org",
-                "object": f"clinical_trial:{asset['trial_id']}",
-            })
+                    fga_tuples.append({
+                        "user": f"organization:{org_id}",
+                        "relation": "granted_org",
+                        "object": f"clinical_trial:{asset['trial_id']}",
+                    })
 
-        # Write OpenFGA tuples
-        for i in range(0, len(fga_tuples), 100):
-            await self.fga.write_tuples(fga_tuples[i:i + 100])
+                await enqueue_write_tuples(
+                    conn,
+                    fga_tuples,
+                    source="asset.grant_collection_access",
+                    correlation_id=str(collection_id),
+                )
 
         return {
             "grants_created": len(fga_tuples),
@@ -546,33 +556,41 @@ class AssetService:
         reason: str,
     ) -> dict:
         """Revoke all grants for an org on a collection."""
-        grants = await self.db.fetch(
-            """SELECT ag.grant_id, da.reference_id as trial_id
-               FROM access_grant ag
-               JOIN data_asset da ON ag.asset_id = da.asset_id
-               WHERE ag.collection_id = $1
-               AND ag.organization_id = $2
-               AND ag.is_active = TRUE""",
-            collection_id, org_id,
-        )
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                grants = await conn.fetch(
+                    """SELECT ag.grant_id, da.reference_id as trial_id
+                       FROM access_grant ag
+                       JOIN data_asset da ON ag.asset_id = da.asset_id
+                       WHERE ag.collection_id = $1
+                       AND ag.organization_id = $2
+                       AND ag.is_active = TRUE""",
+                    collection_id,
+                    org_id,
+                )
 
-        fga_deletes = []
-        for g in grants:
-            await self.db.execute(
-                """UPDATE access_grant
-                   SET revoked_at = NOW(), revoked_by = $1, revoke_reason = $2
-                   WHERE grant_id = $3""",
-                revoked_by, reason, g["grant_id"],
-            )
-            fga_deletes.append({
-                "user": f"organization:{org_id}",
-                "relation": "granted_org",
-                "object": f"clinical_trial:{g['trial_id']}",
-            })
+                fga_deletes = []
+                for g in grants:
+                    await conn.execute(
+                        """UPDATE access_grant
+                           SET revoked_at = NOW(), revoked_by = $1, revoke_reason = $2
+                           WHERE grant_id = $3""",
+                        revoked_by,
+                        reason,
+                        g["grant_id"],
+                    )
+                    fga_deletes.append({
+                        "user": f"organization:{org_id}",
+                        "relation": "granted_org",
+                        "object": f"clinical_trial:{g['trial_id']}",
+                    })
 
-        if fga_deletes:
-            for i in range(0, len(fga_deletes), 100):
-                await self.fga.delete_tuples(fga_deletes[i:i + 100])
+                await enqueue_delete_tuples(
+                    conn,
+                    fga_deletes,
+                    source="asset.revoke_collection_access",
+                    correlation_id=str(collection_id),
+                )
 
         return {"revoked_count": len(grants)}
 

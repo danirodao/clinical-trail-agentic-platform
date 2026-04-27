@@ -434,12 +434,59 @@ flowchart TD
     N --> O[Inject into every tool call]
 ```
 
+### Where Cohort Filters Are Kept (And Enforced)
+
+The platform prevents data leakage by storing cohort filters in PostgreSQL and enforcing them in MCP SQL generation for every patient-level tool.
+
+1. Source of truth in PostgreSQL:
+  - `cohort.filter_criteria` (JSONB) stores cohort constraints like age range, sex, country, ethnicity, condition, disposition, arm.
+  - `cohort_trial` maps cohorts to trial IDs.
+  - `researcher_assignment` maps researchers to cohorts/trials.
+2. Authorization profile assembly in API:
+  - `AuthorizationService` loads active assignments and builds per-trial `cohort_scopes` with `filter_criteria`.
+  - Access context sent to MCP includes `patient_filters` per trial.
+3. Runtime enforcement in MCP:
+  - `AccessContext.build_authorized_patient_filter()` always gates patient queries by authorized trial IDs first.
+  - For filtered trials, `_build_single_cohort_filter()` compiles criteria into parameterized SQL predicates.
+  - Multiple cohort filters on a trial are combined using `OR` (union of allowed subsets).
+  - If no valid trial/filter scope resolves, queries return `1=0` (deny by default).
+4. Ceiling principle still applies:
+  - If mixed trial access levels are requested, response is downgraded to aggregate-only.
+
+Security outcome: cohort filters are not only metadata; they are hard SQL constraints applied before data is returned.
+
 ### Access Grant Chain
 
 1. **Domain Owner** publishes a trial → writes `owner` tuple
 2. **Domain Owner** approves organization access request → writes `granted_org` tuple → all org members get `can_view_aggregate`
 3. **Manager** assigns a researcher to a trial → writes `assigned_researcher` tuple → researcher gets `can_view_individual`
 4. **Manager** assigns a researcher to a cohort → cohort's `filter_criteria` are loaded from PostgreSQL and applied as patient-level WHERE clauses
+
+### Recent Authorization Hardening (April 2026)
+
+The following production fixes were applied to prevent access drift, schema mismatches, and SQL filter bugs:
+
+1. OpenFGA tuple writes/deletes made idempotent:
+  - Duplicate writes (`already exists`) are treated as success.
+  - Missing deletes (`not found`) are treated as success.
+2. Cohort visibility made resilient to tuple-sync delays:
+  - `AuthorizationService` now unions OpenFGA cohort visibility with active DB cohort assignments.
+  - This prevents temporary missing cohorts/trials in researcher dashboards.
+3. Cohort-to-trial expansion reconciliation hardened:
+  - Reconciliation ensures cohort assignments are expanded into per-trial `assigned_researcher` tuples in OpenFGA.
+4. Agent tool schema union support fixed:
+  - Dynamic schema mapping now supports JSON Schema `anyOf` unions (for example `list[string] | string | null`).
+  - Prevents false validation failures when `trial_ids` is passed as a list.
+5. Tool invocation coercion for `trial_ids` fixed:
+  - Tool node now inspects `anyOf` and preserves arrays when tool schemas support arrays.
+6. MCP cohort filter SQL fixed (critical):
+  - `_build_single_cohort_filter()` now maps criteria keys to real patient columns.
+  - Example: `age_min`/`age_max` now map to `p.age` (not `p.age_min`/`p.age_max`).
+  - SQL parameter placeholders now increment correctly to avoid asyncpg type conflicts.
+7. Composite outcome SQL aliases fixed:
+  - `cohort_outcome_snapshot` now references `patient` table columns (`p.arm_assigned`, `p.disposition_status`) instead of invalid aliases.
+
+Operational impact: researcher queries now maintain strict cohort-boundary enforcement while avoiding prior false negatives and runtime SQL failures.
 
 ---
 

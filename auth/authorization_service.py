@@ -75,6 +75,93 @@ class AccessProfile:
     # Pre-built filter clauses
     sql_trial_filter: str = "1=0"
 
+    # Optional trial labels for human-readable UX/prompts.
+    # {trial_uuid: {"nct_id": "NCT...", "title": "..."}}
+    trial_metadata: dict[str, dict] = field(default_factory=dict)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict) -> "AccessProfile":
+        """
+        Reconstruct an AccessProfile from a previously serialised snapshot dict.
+
+        Used exclusively by the offline evaluator to replay a request under the
+        original user's exact access context without re-querying OpenFGA or
+        PostgreSQL.  The snapshot format is produced by AccessProfile.to_snapshot().
+
+        No live auth calls are made — the snapshot IS the authoritative profile.
+        """
+        trial_scopes: dict[str, TrialAccessScope] = {}
+        for tid, scope_dict in snapshot.get("trial_scopes", {}).items():
+            cohort_scopes = [
+                CohortScope(
+                    cohort_id=cs["cohort_id"],
+                    cohort_name=cs["cohort_name"],
+                    filter_criteria=cs.get("filter_criteria", {}),
+                )
+                for cs in scope_dict.get("cohort_scopes", [])
+            ]
+            trial_scopes[tid] = TrialAccessScope(
+                trial_id=scope_dict["trial_id"],
+                access_level=scope_dict["access_level"],
+                cohort_scopes=cohort_scopes,
+            )
+
+        allowed = snapshot.get("allowed_trial_ids", [])
+        individual = snapshot.get("individual_trial_ids", [])
+        aggregate = snapshot.get("aggregate_trial_ids", [])
+
+        sql_filter = (
+            f"trial_id IN ({', '.join(repr(t) for t in allowed)})"
+            if allowed
+            else "1=0"
+        )
+
+        return cls(
+            user_id=snapshot["user_id"],
+            role=snapshot["role"],
+            organization_id=snapshot["organization_id"],
+            trial_scopes=trial_scopes,
+            allowed_trial_ids=allowed,
+            individual_trial_ids=individual,
+            aggregate_trial_ids=aggregate,
+            has_any_access=bool(allowed),
+            has_individual_access=bool(individual),
+            aggregate_only=not bool(individual),
+            sql_trial_filter=sql_filter,
+            trial_metadata=snapshot.get("trial_metadata", {}),
+        )
+
+    def to_snapshot(self) -> dict:
+        """
+        Serialise this AccessProfile to a plain dict suitable for storage in
+        Argilla (or any other evaluation store) and later restoration via
+        AccessProfile.from_snapshot().
+        """
+        return {
+            "user_id": self.user_id,
+            "role": self.role,
+            "organization_id": self.organization_id,
+            "allowed_trial_ids": self.allowed_trial_ids,
+            "individual_trial_ids": self.individual_trial_ids,
+            "aggregate_trial_ids": self.aggregate_trial_ids,
+            "trial_scopes": {
+                tid: {
+                    "trial_id": scope.trial_id,
+                    "access_level": scope.access_level,
+                    "cohort_scopes": [
+                        {
+                            "cohort_id": cs.cohort_id,
+                            "cohort_name": cs.cohort_name,
+                            "filter_criteria": cs.filter_criteria,
+                        }
+                        for cs in scope.cohort_scopes
+                    ],
+                }
+                for tid, scope in self.trial_scopes.items()
+            },
+            "trial_metadata": self.trial_metadata,
+        }
+
 
 class AuthorizationService:
     """Computes and validates two-layer access profiles."""
@@ -131,6 +218,7 @@ class AuthorizationService:
         #    (not just individual — aggregate trials need metadata too)
         if profile.allowed_trial_ids:
             await self._load_trial_scopes(profile, user)
+            await self._load_trial_metadata(profile)
 
         logger.info(
             f"AccessProfile for {user.username}: "
@@ -139,13 +227,47 @@ class AuthorizationService:
         )
 
         return profile
+
+    async def _load_trial_metadata(self, profile: AccessProfile):
+        """Load lightweight trial labels (NCT ID + title) for authorized trials."""
+        if not profile.allowed_trial_ids:
+            profile.trial_metadata = {}
+            return
+
+        rows = await self.db.fetch(
+            """
+            SELECT trial_id::text AS trial_id, nct_id, title
+            FROM clinical_trial
+            WHERE trial_id::text = ANY($1::text[])
+            """,
+            profile.allowed_trial_ids,
+        )
+
+        profile.trial_metadata = {
+            r["trial_id"]: {
+                "nct_id": r.get("nct_id") or "",
+                "title": r.get("title") or "",
+            }
+            for r in rows
+        }
     async def _load_trial_scopes(
-    self, profile: AccessProfile, user: UserContext
+        self, profile: AccessProfile, user: UserContext
     ):
         """
         Build trial scopes for ALL accessible trials (individual AND aggregate).
         """
         individual_set = set(profile.individual_trial_ids)
+
+        # Policy-first: Get cohorts the user can access in OpenFGA.
+        # NOTE: Some tuples may still be in the outbox queue, so we also include
+        # cohorts from the database where the user has active assignments.
+        allowed_cohort_ids = set(
+            await self.fga.list_objects(
+                user=f"user:{profile.user_id}",
+                relation="can_access",
+                object_type="cohort",
+            )
+        )
 
         # ── 1. Get ALL active cohort assignments (any access level) ──
         cohort_assignments = await self.db.fetch(
@@ -165,6 +287,13 @@ class AuthorizationService:
             profile.user_id,
             profile.organization_id,
         )
+
+        # ── 1b. Get assigned cohort IDs from DB (in case tuples still in outbox) ──
+        db_assigned_cohort_ids = {str(ca["cohort_id"]) for ca in cohort_assignments}
+
+        # Union OpenFGA + DB cohorts (defensive: if OpenFGA tuple hasn't synced yet,
+        # the DB assignment still counts)
+        allowed_cohort_ids = allowed_cohort_ids.union(db_assigned_cohort_ids)
 
         # ── 2. Get ALL direct trial assignments (any access level) ───
         direct_assignments = await self.db.fetch(
@@ -187,6 +316,8 @@ class AuthorizationService:
 
         cohort_by_trial: dict[str, list] = {}
         for ca in cohort_assignments:
+            if str(ca["cohort_id"]) not in allowed_cohort_ids:
+                continue
             tid = str(ca["trial_id"])
             if tid not in cohort_by_trial:
                 cohort_by_trial[tid] = []

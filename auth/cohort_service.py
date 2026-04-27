@@ -12,6 +12,7 @@ import asyncpg
 
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
+from auth.openfga_outbox import enqueue_write_tuples
 
 logger = logging.getLogger(__name__)
 
@@ -276,26 +277,38 @@ class CohortService:
                         cohort_id, *params,
                     )
 
-                # Write OpenFGA tuples
-                await self.fga.write_tuples([
-                    {
-                        "user": f"user:{user.user_id}",
-                        "relation": "creator",
-                        "object": f"cohort:{cohort_id}",
-                    },
-                    {
-                        "user": f"organization:{user.organization_id}",
-                        "relation": "owning_org",
-                        "object": f"cohort:{cohort_id}",
-                    },
-                ])
+                # Queue OpenFGA tuple sync via transactional outbox.
+                await enqueue_write_tuples(
+                    conn,
+                    [
+                        {
+                            "user": f"user:{user.user_id}",
+                            "relation": "creator",
+                            "object": f"cohort:{cohort_id}",
+                        },
+                        {
+                            "user": f"organization:{user.organization_id}",
+                            "relation": "owning_org",
+                            "object": f"cohort:{cohort_id}",
+                        },
+                    ],
+                    source="cohort.create",
+                    correlation_id=str(cohort_id),
+                )
 
-                for trial_id in trial_ids:
-                    await self.fga.write_tuples([{
-                        "user": f"clinical_trial:{trial_id}",
-                        "relation": "includes_trial",
-                        "object": f"cohort:{cohort_id}",
-                    }])
+                await enqueue_write_tuples(
+                    conn,
+                    [
+                        {
+                            "user": f"clinical_trial:{trial_id}",
+                            "relation": "includes_trial",
+                            "object": f"cohort:{cohort_id}",
+                        }
+                        for trial_id in trial_ids
+                    ],
+                    source="cohort.create",
+                    correlation_id=str(cohort_id),
+                )
 
         return {"cohort_id": str(cohort_id), "status": "created"}
 

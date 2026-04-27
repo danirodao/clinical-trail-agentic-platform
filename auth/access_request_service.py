@@ -12,6 +12,7 @@ import asyncpg
 
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
+from auth.openfga_outbox import enqueue_delete_tuples, enqueue_write_tuples
 
 logger = logging.getLogger(__name__)
 
@@ -142,15 +143,20 @@ class AccessRequestService:
                     user.user_id, expires_at,
                 )
 
-        # Write OpenFGA tuple: grant organization access to the trial
-        if request["asset_type"] == "clinical_trial":
-            trial_id = str(request["reference_id"])
-            org_id = request["requesting_org_id"]
-            success = await self.fga.grant_org_trial_access(org_id, trial_id)
-            if not success:
-                logger.error(
-                    f"Failed to write OpenFGA tuple for grant {grant['grant_id']}"
-                )
+                # Queue OpenFGA tuple sync via transactional outbox.
+                if request["asset_type"] == "clinical_trial":
+                    trial_id = str(request["reference_id"])
+                    org_id = request["requesting_org_id"]
+                    await enqueue_write_tuples(
+                        conn,
+                        [{
+                            "user": f"organization:{org_id}",
+                            "relation": "granted_org",
+                            "object": f"clinical_trial:{trial_id}",
+                        }],
+                        source="access_request.approve",
+                        correlation_id=str(grant["grant_id"]),
+                    )
 
         # Audit log
         await self._audit_log(
@@ -208,30 +214,53 @@ class AccessRequestService:
         reason: str,
     ) -> dict:
         """Domain owner revokes an active access grant → removes OpenFGA tuples."""
-        grant = await self.db.fetchrow(
-            """SELECT ag.*, da.reference_id, da.asset_type
-               FROM access_grant ag
-               JOIN data_asset da ON ag.asset_id = da.asset_id
-               WHERE ag.grant_id = $1 AND ag.revoked_at IS NULL""",
-            grant_id,
-        )
-        if not grant:
-            raise ValueError(f"Grant {grant_id} not found or already revoked")
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                grant = await conn.fetchrow(
+                    """SELECT ag.*, da.reference_id, da.asset_type
+                       FROM access_grant ag
+                       JOIN data_asset da ON ag.asset_id = da.asset_id
+                       WHERE ag.grant_id = $1 AND ag.revoked_at IS NULL""",
+                    grant_id,
+                )
+                if not grant:
+                    raise ValueError(f"Grant {grant_id} not found or already revoked")
 
-        # Soft revoke in database
-        await self.db.execute(
-            """UPDATE access_grant
-               SET revoked_at = NOW(), revoked_by = $1, revoke_reason = $2
-               WHERE grant_id = $3""",
-            user.user_id, reason, grant_id,
-        )
+                await conn.execute(
+                    """UPDATE access_grant
+                       SET revoked_at = NOW(), revoked_by = $1, revoke_reason = $2
+                       WHERE grant_id = $3""",
+                    user.user_id,
+                    reason,
+                    grant_id,
+                )
 
-        # Remove OpenFGA tuple
-        if grant["asset_type"] == "clinical_trial":
-            await self.fga.revoke_org_trial_access(
-                grant["organization_id"],
-                str(grant["reference_id"]),
-            )
+                # Only remove the OpenFGA tuple if no other active grant exists
+                # for the same org/trial combination.
+                if grant["asset_type"] == "clinical_trial":
+                    still_active = await conn.fetchval(
+                        """SELECT COUNT(*) FROM access_grant ag2
+                           JOIN data_asset da2 ON ag2.asset_id = da2.asset_id
+                           WHERE ag2.organization_id = $1
+                           AND da2.reference_id = $2
+                           AND ag2.revoked_at IS NULL
+                           AND ag2.expires_at > NOW()
+                           AND ag2.grant_id != $3""",
+                        grant["organization_id"],
+                        grant["reference_id"],
+                        grant_id,
+                    )
+                    if still_active == 0:
+                        await enqueue_delete_tuples(
+                            conn,
+                            [{
+                                "user": f"organization:{grant['organization_id']}",
+                                "relation": "granted_org",
+                                "object": f"clinical_trial:{grant['reference_id']}",
+                            }],
+                            source="access_request.revoke",
+                            correlation_id=str(grant_id),
+                        )
 
         await self._audit_log(
             action="access_revoked",

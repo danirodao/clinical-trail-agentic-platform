@@ -12,6 +12,7 @@ from auth.cohort_service import CohortService, CeilingViolationError
 from auth.dependencies import CurrentUser, require_role
 from auth.access_request_service import AccessRequestService
 from auth.openfga_client import get_openfga_client
+from auth.openfga_outbox import enqueue_delete_tuples, enqueue_write_tuples
 from api.database import get_db_pool
 import json
 
@@ -119,7 +120,7 @@ async def assign_researcher(
             raise HTTPException(400, f"Cohort {body.cohort_id} has no trials linked")
 
     elif body.trial_id:
-        trial_ids = [body.trial_id]
+        trial_ids = [str(body.trial_id)]
 
     # ── Ceiling check: verify org has access to ALL trials ────
     for tid in trial_ids:
@@ -142,88 +143,78 @@ async def assign_researcher(
     expires_at = datetime.now(timezone.utc) + timedelta(days=body.duration_days)
 
     # ── Write PostgreSQL record ───────────────────────────────
-    
+    outbox_tuples_enqueued = 0
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            assignment = await conn.fetchrow(
+                """INSERT INTO researcher_assignment
+                   (researcher_id, organization_id, trial_id, cohort_id,
+                    access_level, assigned_by, expires_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING assignment_id""",
+                body.researcher_username,
+                user.organization_id,
+                to_uuid(body.trial_id),
+                to_uuid(body.cohort_id),
+                body.access_level,
+                user.user_id,
+                expires_at,
+            )
 
-
-    assignment = await db_pool.fetchrow(
-        """INSERT INTO researcher_assignment
-           (researcher_id, organization_id, trial_id, cohort_id,
-            access_level, assigned_by, expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           RETURNING assignment_id""",
-        body.researcher_username,
-        user.organization_id,
-        to_uuid(body.trial_id),
-        to_uuid(body.cohort_id),
-        body.access_level,
-        user.user_id,
-        expires_at,
-    )
-
-    # ── Write OpenFGA tuples (individual access only) ─────────
-    fga_tuples_written = 0
-
-    if body.access_level == "individual":
-        tuples = [
-            {
-                "user": f"user:{body.researcher_username}",
-                "relation": "assigned_researcher",
-                "object": f"clinical_trial:{tid}",
-            }
-            for tid in trial_ids
-        ]
-
-        # Write in batches of 100 (OpenFGA limit)
-        for i in range(0, len(tuples), 100):
-            batch = tuples[i:i + 100]
-            success = await fga.write_tuples(batch)
-            if success:
-                fga_tuples_written += len(batch)
-            else:
-                # Log but don't fail — PG record exists for reconciliation
-                import logging
-                logging.getLogger(__name__).error(
-                    f"Failed to write OpenFGA tuples for assignment "
-                    f"{assignment['assignment_id']}, batch starting at {i}"
+            if body.access_level == "individual":
+                tuples = [
+                    {
+                        "user": f"user:{body.researcher_username}",
+                        "relation": "assigned_researcher",
+                        "object": f"clinical_trial:{tid}",
+                    }
+                    for tid in trial_ids
+                ]
+                outbox_tuples_enqueued += await enqueue_write_tuples(
+                    conn,
+                    tuples,
+                    source="manager.assign_researcher",
+                    correlation_id=str(assignment["assignment_id"]),
                 )
 
-    # Keep cohort assignment relation in OpenFGA for can_access checks.
-    if body.cohort_id:
-        success = await fga.write_tuples([{
-            "user": f"user:{body.researcher_username}",
-            "relation": "assigned_researcher",
-            "object": f"cohort:{body.cohort_id}",
-        }])
-        if success:
-            fga_tuples_written += 1
+            if body.cohort_id:
+                outbox_tuples_enqueued += await enqueue_write_tuples(
+                    conn,
+                    [{
+                        "user": f"user:{body.researcher_username}",
+                        "relation": "assigned_researcher",
+                        "object": f"cohort:{body.cohort_id}",
+                    }],
+                    source="manager.assign_researcher",
+                    correlation_id=str(assignment["assignment_id"]),
+                )
 
-    # ── Audit log ─────────────────────────────────────────────
-    
-    await db_pool.execute(
-        """INSERT INTO auth_audit_log
-           (action, actor_id, actor_role, target_type, target_id, details)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)""",
-        "researcher_assigned",
-        user.user_id,
-        user.role,
-        "researcher_assignment",
-        str(assignment["assignment_id"]),
-        json.dumps({
-            "researcher": body.researcher_username,
-            "trial_ids": [str(t) for t in trial_ids],
-            "cohort_id": str(body.cohort_id) if body.cohort_id else None,
-            "access_level": body.access_level,
-            "fga_tuples_written": fga_tuples_written,
-            "duration_days": body.duration_days,
-        }),
-    )
+            await conn.execute(
+                """INSERT INTO auth_audit_log
+                   (action, actor_id, actor_role, target_type, target_id, details)
+                   VALUES ($1, $2, $3, $4, $5, $6::jsonb)""",
+                "researcher_assigned",
+                user.user_id,
+                user.role,
+                "researcher_assignment",
+                str(assignment["assignment_id"]),
+                json.dumps({
+                    "researcher": body.researcher_username,
+                    "trial_ids": [str(t) for t in trial_ids],
+                    "cohort_id": str(body.cohort_id) if body.cohort_id else None,
+                    "access_level": body.access_level,
+                    "outbox_tuples_enqueued": outbox_tuples_enqueued,
+                    "duration_days": body.duration_days,
+                }),
+            )
 
     return {
         "assignment_id": str(assignment["assignment_id"]),
         "researcher": body.researcher_username,
         "trial_ids": trial_ids,
         "access_level": body.access_level,
-        "fga_tuples_written": fga_tuples_written,
+        "outbox_tuples_enqueued": outbox_tuples_enqueued,
+        "fga_sync_status": "queued",
         "expires_at": expires_at.isoformat(),
         "status": "assigned",
     }
@@ -247,124 +238,122 @@ async def revoke_assignment(
     Revoke a researcher's assignment.
     Soft-deletes the PG record AND removes OpenFGA tuples.
     """
-    fga = get_openfga_client()
+    outbox_tuples_enqueued = 0
 
-    # Get the assignment
-    assignment = await db_pool.fetchrow(
-        """SELECT assignment_id, researcher_id, organization_id,
-                  trial_id, cohort_id, access_level
-           FROM researcher_assignment
-           WHERE assignment_id = $1
-           AND organization_id = $2
-           AND revoked_at IS NULL""",
-        assignment_id, user.organization_id,
-    )
-
-    if not assignment:
-        raise HTTPException(404, "Assignment not found or already revoked")
-
-    # Resolve trial IDs (same logic as assignment)
-    trial_ids: list[str] = []
-    if assignment["cohort_id"]:
-        rows = await db_pool.fetch(
-            "SELECT trial_id FROM cohort_trial WHERE cohort_id = $1",
-            assignment["cohort_id"],
-        )
-        trial_ids = [str(r["trial_id"]) for r in rows]
-    elif assignment["trial_id"]:
-        trial_ids = [str(assignment["trial_id"])]
-
-    # Soft-delete in PostgreSQL
-    await db_pool.execute(
-        """UPDATE researcher_assignment
-           SET revoked_at = NOW(), revoked_by = $1
-           WHERE assignment_id = $2""",
-        user.user_id, assignment_id,
-    )
-
-    # Remove OpenFGA tuples (only if individual access was granted)
-    fga_tuples_deleted = 0
-    if assignment["access_level"] == "individual" and trial_ids:
-        # Before deleting, check if the researcher has OTHER active assignments
-        # for the same trial. If so, don't delete the OpenFGA tuple.
-        for tid in trial_ids:
-            other_active = await db_pool.fetchval(
-                """SELECT COUNT(*) FROM researcher_assignment
-                   WHERE researcher_id = $1
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            assignment = await conn.fetchrow(
+                """SELECT assignment_id, researcher_id, organization_id,
+                          trial_id, cohort_id, access_level
+                   FROM researcher_assignment
+                   WHERE assignment_id = $1
                    AND organization_id = $2
-                   AND access_level = 'individual'
-                   AND revoked_at IS NULL
-                   AND expires_at > NOW()
-                   AND assignment_id != $3
-                   AND (
-                       trial_id = $4::uuid
-                       OR cohort_id IN (
-                           SELECT cohort_id FROM cohort_trial WHERE trial_id = $4::uuid
-                       )
-                   )""",
-                assignment["researcher_id"],
-                assignment["organization_id"],
+                   AND revoked_at IS NULL""",
                 assignment_id,
-                UUID(tid),
+                user.organization_id,
             )
 
-            if other_active == 0:
-                # Safe to delete — no other assignment covers this trial
-                success = await fga.delete_tuples([{
-                    "user": f"user:{assignment['researcher_id']}",
-                    "relation": "assigned_researcher",
-                    "object": f"clinical_trial:{tid}",
-                }])
-                if success:
-                    fga_tuples_deleted += 1
+            if not assignment:
+                raise HTTPException(404, "Assignment not found or already revoked")
 
-    # Remove cohort assignment relation if this was the last active assignment for that cohort.
-    if assignment["cohort_id"]:
-        other_cohort_active = await db_pool.fetchval(
-            """SELECT COUNT(*) FROM researcher_assignment
-               WHERE researcher_id = $1
-               AND organization_id = $2
-               AND cohort_id = $3
-               AND revoked_at IS NULL
-               AND expires_at > NOW()
-               AND assignment_id != $4""",
-            assignment["researcher_id"],
-            assignment["organization_id"],
-            assignment["cohort_id"],
-            assignment_id,
-        )
-        if other_cohort_active == 0:
-            success = await fga.delete_tuples([{
-                "user": f"user:{assignment['researcher_id']}",
-                "relation": "assigned_researcher",
-                "object": f"cohort:{assignment['cohort_id']}",
-            }])
-            if success:
-                fga_tuples_deleted += 1
+            trial_ids: list[str] = []
+            if assignment["cohort_id"]:
+                rows = await conn.fetch(
+                    "SELECT trial_id FROM cohort_trial WHERE cohort_id = $1",
+                    assignment["cohort_id"],
+                )
+                trial_ids = [str(r["trial_id"]) for r in rows]
+            elif assignment["trial_id"]:
+                trial_ids = [str(assignment["trial_id"])]
 
-    # Audit
-    await db_pool.execute(
-        """INSERT INTO auth_audit_log
-           (action, actor_id, actor_role, target_type, target_id, details)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)""",
-        "researcher_assignment_revoked",
-        user.user_id,
-        user.role,
-        "researcher_assignment",
-        str(assignment_id),
-        json.dumps({
-            "researcher": assignment["researcher_id"],
-            "trial_ids": [str(t) for t in trial_ids],
-            "access_level": assignment["access_level"],
-            "fga_tuples_deleted": fga_tuples_deleted,
-            "reason": body.reason,
-        }),
-    )
+            await conn.execute(
+                """UPDATE researcher_assignment
+                   SET revoked_at = NOW(), revoked_by = $1
+                   WHERE assignment_id = $2""",
+                user.user_id,
+                assignment_id,
+            )
+
+            fga_delete_tuples: list[dict] = []
+            if assignment["access_level"] == "individual" and trial_ids:
+                for tid in trial_ids:
+                    other_active = await conn.fetchval(
+                        """SELECT COUNT(*) FROM researcher_assignment
+                           WHERE researcher_id = $1
+                           AND organization_id = $2
+                           AND access_level = 'individual'
+                           AND revoked_at IS NULL
+                           AND expires_at > NOW()
+                           AND assignment_id != $3
+                           AND (
+                               trial_id = $4::uuid
+                               OR cohort_id IN (
+                                   SELECT cohort_id FROM cohort_trial WHERE trial_id = $4::uuid
+                               )
+                           )""",
+                        assignment["researcher_id"],
+                        assignment["organization_id"],
+                        assignment_id,
+                        UUID(tid),
+                    )
+                    if other_active == 0:
+                        fga_delete_tuples.append({
+                            "user": f"user:{assignment['researcher_id']}",
+                            "relation": "assigned_researcher",
+                            "object": f"clinical_trial:{tid}",
+                        })
+
+            if assignment["cohort_id"]:
+                other_cohort_active = await conn.fetchval(
+                    """SELECT COUNT(*) FROM researcher_assignment
+                       WHERE researcher_id = $1
+                       AND organization_id = $2
+                       AND cohort_id = $3
+                       AND revoked_at IS NULL
+                       AND expires_at > NOW()
+                       AND assignment_id != $4""",
+                    assignment["researcher_id"],
+                    assignment["organization_id"],
+                    assignment["cohort_id"],
+                    assignment_id,
+                )
+                if other_cohort_active == 0:
+                    fga_delete_tuples.append({
+                        "user": f"user:{assignment['researcher_id']}",
+                        "relation": "assigned_researcher",
+                        "object": f"cohort:{assignment['cohort_id']}",
+                    })
+
+            outbox_tuples_enqueued = await enqueue_delete_tuples(
+                conn,
+                fga_delete_tuples,
+                source="manager.revoke_assignment",
+                correlation_id=str(assignment_id),
+            )
+
+            await conn.execute(
+                """INSERT INTO auth_audit_log
+                   (action, actor_id, actor_role, target_type, target_id, details)
+                   VALUES ($1, $2, $3, $4, $5, $6::jsonb)""",
+                "researcher_assignment_revoked",
+                user.user_id,
+                user.role,
+                "researcher_assignment",
+                str(assignment_id),
+                json.dumps({
+                    "researcher": assignment["researcher_id"],
+                    "trial_ids": [str(t) for t in trial_ids],
+                    "access_level": assignment["access_level"],
+                    "outbox_tuples_enqueued": outbox_tuples_enqueued,
+                    "reason": body.reason,
+                }),
+            )
 
     return {
         "assignment_id": str(assignment_id),
         "status": "revoked",
-        "fga_tuples_deleted": fga_tuples_deleted,
+        "outbox_tuples_enqueued": outbox_tuples_enqueued,
+        "fga_sync_status": "queued",
     }
 
 @router.get("/assignments/", dependencies=[Depends(require_role("manager"))])

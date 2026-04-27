@@ -67,6 +67,43 @@ def _get_argilla_client():
         return None
 
 
+def _dataset_field_names(dataset) -> set[str]:
+    """Return the current Argilla dataset field names, or an empty set on failure."""
+    try:
+        schema = dataset.settings.schema
+        if hasattr(schema, "keys"):
+            return set(schema.keys())
+    except Exception as exc:
+        logger.warning("Could not inspect Argilla dataset schema: %s", exc)
+    return set()
+
+
+def _dataset_supports_field(dataset, field_name: str) -> bool:
+    """True when the current Argilla dataset schema includes the given field."""
+    return field_name in _dataset_field_names(dataset)
+
+
+def _filter_supported_fields(dataset, fields: dict[str, Any]) -> dict[str, Any]:
+    """Drop fields that are not present in the current dataset schema."""
+    supported = _dataset_field_names(dataset)
+    if not supported:
+        return fields
+
+    unsupported = sorted(name for name in fields if name not in supported)
+    if unsupported:
+        logger.warning(
+            "Argilla dataset '%s' is missing fields %s; skipping them during record log",
+            DATASET_NAME,
+            ", ".join(unsupported),
+        )
+
+    return {
+        name: value
+        for name, value in fields.items()
+        if name in supported
+    }
+
+
 def _ensure_dataset(client) -> Any | None:
     """
     Create the evaluation dataset in Argilla if it doesn't exist.
@@ -93,6 +130,12 @@ def _ensure_dataset(client) -> Any | None:
         try:
             existing = client.datasets(name=DATASET_NAME, workspace=WORKSPACE)
             if existing:
+                if not _dataset_supports_field(existing, "evaluation_persona"):
+                    logger.warning(
+                        "Argilla dataset '%s' exists without the 'evaluation_persona' field. "
+                        "Persona snapshots will be skipped until the dataset schema is recreated or migrated.",
+                        DATASET_NAME,
+                    )
                 _DATASET_CACHE = existing
                 return existing
         except Exception:
@@ -122,6 +165,12 @@ def _ensure_dataset(client) -> Any | None:
                     name="evaluation_scores",
                     title="Automated Evaluation Scores",
                     use_markdown=True,
+                    required=False,
+                ),
+                rg.TextField(
+                    name="evaluation_persona",
+                    title="User Access Context (Evaluation Persona)",
+                    use_markdown=False,
                     required=False,
                 ),
             ],
@@ -170,6 +219,7 @@ def _ensure_dataset(client) -> Any | None:
                 rg.TermsMetadataProperty(name="source", title="Source"),
                 rg.TermsMetadataProperty(name="eval_run_id", title="Evaluation Run ID"),
                 rg.TermsMetadataProperty(name="imported", title="Imported Status"),
+                rg.TermsMetadataProperty(name="persona_key", title="Persona Key (user_id:role)"),
             ],
         )
 
@@ -260,6 +310,105 @@ def push_failed_cases(
         logger.error("Failed to push failed cases to Argilla: %s", exc)
 
     return 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Capture Production Requests with User Context
+# ══════════════════════════════════════════════════════════════════════════════
+
+def capture_production_request(
+    query: str,
+    actual_output: str,
+    access_profile_snapshot: dict,
+    tool_calls: list[str] | None = None,
+    retrieval_context: list[str] | None = None,
+    category: str = "production",
+    run_id: str = "live",
+) -> bool:
+    """
+    Capture a production request together with the caller's full AccessProfile
+    snapshot so it can later be replayed under the exact same identity.
+
+    Call this from any API handler AFTER a successful agent response to build
+    a continuously growing evaluation dataset from real traffic.
+
+    The access_profile_snapshot is produced by AccessProfile.to_snapshot():
+        snapshot = access_profile.to_snapshot()
+        capture_production_request(query, answer, snapshot, ...)
+
+    During evaluation replay, the offline evaluator reads this snapshot and
+    calls AgentService.query_with_profile(request, snapshot) to impersonate
+    the original user without re-authenticating through Keycloak or OpenFGA.
+
+    Args:
+        query:                    The user's original query text.
+        actual_output:            The agent's response at capture time.
+        access_profile_snapshot:  Dict from AccessProfile.to_snapshot().
+        tool_calls:               Tool names invoked during the request.
+        retrieval_context:        Raw tool outputs used as context.
+        category:                 Logical category label (default 'production').
+        run_id:                   Identifier for the capture run / session.
+
+    Returns:
+        True if the record was pushed to Argilla successfully, False otherwise.
+    """
+    client = _get_argilla_client()
+    if client is None:
+        return False
+
+    dataset = _ensure_dataset(client)
+    if dataset is None:
+        return False
+
+    try:
+        import argilla as rg
+        import hashlib
+
+        user_id = access_profile_snapshot.get("user_id", "unknown")
+        role = access_profile_snapshot.get("role", "unknown")
+        persona_key = f"{user_id}:{role}"
+
+        # Deterministic ID so repeated captures of the same query+user dedup cleanly
+        record_id = hashlib.sha256(
+            f"{query}|{user_id}|{role}".encode()
+        ).hexdigest()[:16]
+
+        context_str = ""
+        if tool_calls:
+            context_str += f"**Tools used:** {', '.join(tool_calls)}\n\n"
+        if retrieval_context:
+            context_str += "\n---\n".join(str(c) for c in retrieval_context)[:4000]
+
+        record = rg.Record(
+            id=record_id,
+            fields=_filter_supported_fields(dataset, {
+                "query":              query,
+                "actual_output":      _strip_uuids(actual_output)[:5000],
+                "retrieval_context":  _strip_uuids(context_str)[:5000],
+                "evaluation_scores":  "",
+                "evaluation_persona": json.dumps(access_profile_snapshot, default=str),
+            }),
+            metadata={
+                "case_id":     record_id,
+                "category":    category,
+                "layer":       "agent",
+                "source":      "production_capture",
+                "eval_run_id": run_id,
+                "imported":    "false",
+                "persona_key": persona_key,
+            },
+        )
+
+        dataset.records.log([record])
+        logger.debug(
+            "Captured production request record_id=%s persona=%s",
+            record_id, persona_key,
+        )
+        return True
+
+    except Exception as exc:
+        logger.warning("capture_production_request failed (non-fatal): %s", exc)
+        return False
+
 
 def _build_existing_record_map(dataset) -> dict[str, Any]:
     """
@@ -361,18 +510,23 @@ def push_records_for_review(
             # preserved server-side and are never overwritten by log().
             argilla_records.append(rg.Record(
                 id=case_id,
-                fields={
-                    "query":             rec.get("query", ""),
-                    "actual_output":     _strip_uuids(output)[:5000],
-                    "retrieval_context": _strip_uuids(context)[:5000],
-                    "evaluation_scores": str(eval_data)[:2000],
-                },
+                fields=_filter_supported_fields(dataset, {
+                    "query":              rec.get("query", ""),
+                    "actual_output":      _strip_uuids(output)[:5000],
+                    "retrieval_context":  _strip_uuids(context)[:5000],
+                    "evaluation_scores":  str(eval_data)[:2000],
+                    "evaluation_persona": json.dumps(
+                        rec.get("evaluation_persona", {}), default=str
+                    ),
+                }),
                 metadata={
                     "case_id":     case_id,
                     "category":    rec.get("category", "unknown"),
                     "layer":       rec.get("layer", "unknown"),
                     "source":      source,
                     "eval_run_id": rec.get("run_id", "unknown"),
+                    "imported":    "false",
+                    "persona_key": rec.get("persona_key", ""),
                 },
                 suggestions=suggestions,
             ))

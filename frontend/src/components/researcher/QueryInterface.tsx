@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useStreamingQuery } from '../../hooks/useStreamingQuery';
 import { TrialAccess, researcherApi } from '../../api/client';
 import { Search, Loader2, Wrench, ShieldAlert, CheckCircle2, XCircle, MessageSquarePlus, Clock } from 'lucide-react';
+import { RichAgentMessage } from './RichAgentMessage';
 
 interface QueryInterfaceProps {
     accessibleTrials: TrialAccess[];
@@ -156,7 +157,12 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                                         className="mt-0.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                                     />
                                     <div className="flex-1 min-w-0">
-                                        <div className="text-xs font-medium text-gray-900 truncate">{trial.nct_id}</div>
+                                        <div className="text-xs font-medium text-gray-900 truncate">
+                                            {trial.title || trial.nct_id}
+                                        </div>
+                                        <div className="text-[10px] text-gray-500 truncate mt-0.5">
+                                            {trial.nct_id} • {trial.trial_id.slice(0, 8)}...
+                                        </div>
                                         <div className="mt-0.5 flex flex-wrap gap-1">
                                             <span className={`inline-flex px-1 py-0.5 rounded text-[9px] font-medium ${trial.access_level === 'individual' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'}`}>
                                                 {trial.access_level}
@@ -203,8 +209,12 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                                     <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white font-bold text-sm shrink-0 ${msg.role === 'user' ? 'bg-blue-600' : 'bg-indigo-600'}`}>
                                         {msg.role === 'user' ? 'You' : 'AI'}
                                     </div>
-                                    <div className={`flex-1 p-4 rounded-lg shadow-sm text-sm whitespace-pre-wrap leading-relaxed border ${msg.role === 'user' ? 'bg-white border-gray-100 text-gray-800 rounded-tl-none' : 'bg-gray-50 border-gray-200 text-gray-700 rounded-tr-none'}`}>
-                                        {msg.content}
+                                    <div className={`flex-1 p-4 rounded-lg shadow-sm text-sm leading-relaxed border ${msg.role === 'user' ? 'bg-white border-gray-100 text-gray-800 rounded-tl-none' : 'bg-gray-50 border-gray-200 text-gray-700 rounded-tr-none'}`}>
+                                        {msg.role === 'agent' ? (
+                                            <RichAgentMessage content={msg.content} />
+                                        ) : (
+                                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                                        )}
                                     </div>
                                 </div>
                             ))}
@@ -261,8 +271,8 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
 
                                         {/* Streamed Answer Text */}
                                         {(answerText || finalResponse) && (
-                                            <div className="bg-white p-5 rounded-lg rounded-tl-none shadow-sm border border-gray-100 text-gray-800 text-sm whitespace-pre-wrap leading-relaxed">
-                                                {finalResponse ? finalResponse.answer : answerText}
+                                            <div className="bg-white p-5 rounded-lg rounded-tl-none shadow-sm border border-gray-100 text-gray-800 text-sm leading-relaxed">
+                                                <RichAgentMessage content={finalResponse ? finalResponse.answer : answerText} />
                                                 {isQuerying && answerText && <span className="inline-block w-1.5 h-4 ml-1 bg-indigo-500 animate-pulse align-middle" />}
                                             </div>
                                         )}

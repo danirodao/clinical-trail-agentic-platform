@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import structlog
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from opentelemetry import trace
@@ -27,8 +28,17 @@ from ..config import agent_config
 from ..models import AgentState
 from ..prompts import build_system_prompt
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 tracer = get_tracer()
+
+MAX_PROMPT_LOG_CHARS = 2500
+
+
+def _preview_text(value: str, max_chars: int = MAX_PROMPT_LOG_CHARS) -> str:
+    """Return bounded text for readable logs."""
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "... [truncated]"
 
 
 async def agent_node(state: AgentState, tools: list) -> dict:
@@ -97,6 +107,12 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             )
             messages = [SystemMessage(content=system_prompt)] + messages
             logger.debug("agent_node: System prompt injected into messages.")
+            logger.info(
+                "agent_prompt",
+                model=model_name,
+                iteration=iteration,
+                prompt_preview=_preview_text(system_prompt),
+            )
 
         # ── Token Optimizer: Sliding Window & Tool Pruning ────────────────────
         messages = _prune_context(
@@ -159,7 +175,13 @@ async def agent_node(state: AgentState, tools: list) -> dict:
 
         if has_tool_calls:
             tool_names = [tc.get("name", "?") for tc in tool_calls]
-            logger.debug(f"agent_node: LLM triggered tool calls → {tool_names}")
+            logger.info(
+                "llm_tool_plan",
+                model=model_name,
+                iteration=iteration,
+                tools=tool_names,
+                tool_args=[tc.get("args", {}) for tc in tool_calls],
+            )
         else:
             logger.debug(
                 "agent_node: LLM returned direct text response (no tool calls)"
@@ -245,9 +267,9 @@ def _prune_context(
         result.extend(turn_msgs)
 
     logger.debug(
-        "context_pruned original_count=%s final_count=%s turns_kept=%s",
-        len(messages),
-        len(result),
-        len(turns),
+        "context_pruned",
+        original_count=len(messages),
+        final_count=len(result),
+        turns_kept=len(turns),
     )
     return result

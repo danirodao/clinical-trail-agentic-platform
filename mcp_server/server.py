@@ -49,6 +49,7 @@ def register_all_tools():
         "patient_analytics",
         "clinical_analysis",
         "knowledge_discovery",
+        "composite_tools",
         # semantic_layer tools removed — now served by the dedicated
         # Semantic MCP service (semantic-mcp-server:8002)
     ]

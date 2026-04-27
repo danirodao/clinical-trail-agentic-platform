@@ -216,6 +216,10 @@ def _trace_to_golden_record(
         "extracted_at": datetime.now(timezone.utc).isoformat(),
         "prompt_injection": False,
         "notes": "Auto-extracted from Phoenix production trace",
+        # evaluation_persona is empty for Phoenix-extracted records unless enriched
+        # externally via capture_production_request().  The offline evaluator falls
+        # back to the synthetic eval-runner profile when this field is absent.
+        "evaluation_persona": None,
     }
 
 

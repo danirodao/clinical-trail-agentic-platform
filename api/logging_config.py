@@ -49,7 +49,8 @@ def configure_logging() -> None:
       - stdlib loggers (uvicorn, LangChain, httpx…) also emit structured output
     """
     is_dev = os.getenv("ENVIRONMENT", "development") == "development"
-    log_level = logging.DEBUG if is_dev else logging.INFO
+    level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, level_name, logging.INFO)
 
     # ── Processors shared by both structlog and stdlib renderers ──────────────
     # These run on every log call, in order.
@@ -89,10 +90,23 @@ def configure_logging() -> None:
     root_logger.addHandler(handler)
     root_logger.setLevel(log_level)
 
-    # Quiet noisy libraries in production
-    if not is_dev:
-        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-        logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Suppress noisy framework and transport logs. We emit our own request/
+    # tool/response telemetry, so these channels are mostly redundant noise.
+    noisy_loggers = [
+        "uvicorn.access",
+        "uvicorn.error",
+        "httpx",
+        "httpcore",
+        "openai",
+        "watchfiles.main",
+        "apscheduler.executors.default",
+    ]
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Keep application logs visible in dev while still avoiding transport spam.
+    if is_dev and level_name == "DEBUG":
+        logging.getLogger("api").setLevel(logging.DEBUG)
 
 
 def get_logger(name: str = "api") -> structlog.stdlib.BoundLogger:

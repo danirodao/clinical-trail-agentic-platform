@@ -253,21 +253,25 @@ class AccessContext:
         idx = param_offset
         pa = patient_alias
 
-        # Logic remains mostly same, but added better safety
+        # Build placeholder SQL dynamically so each filter uses its own param index.
+        # Map criteria keys to actual patient table columns.
         mapping = [
-            ("age_min", f"{pa}.age >= ${idx}"),
-            ("age_max", f"{pa}.age <= ${idx}"),
-            ("sex", f"{pa}.sex = ANY(${idx}::text[])"),
-            ("ethnicity", f"{pa}.ethnicity = ANY(${idx}::text[])"),
-            ("country", f"{pa}.country = ANY(${idx}::text[])"),
-            ("disposition_status", f"{pa}.disposition_status = ANY(${idx}::text[])"),
-            ("arm_assigned", f"{pa}.arm_assigned = ANY(${idx}::text[])"),
+            ("age_min", "age", ">=", False),
+            ("age_max", "age", "<=", False),
+            ("sex", "sex", "= ANY", True),
+            ("ethnicity", "ethnicity", "= ANY", True),
+            ("country", "country", "= ANY", True),
+            ("disposition_status", "disposition_status", "= ANY", True),
+            ("arm_assigned", "arm_assigned", "= ANY", True),
         ]
 
-        for key, sql in mapping:
+        for key, column, op, is_array in mapping:
             val = criteria.get(key)
             if val is not None and val != []:
-                conditions.append(sql)
+                if is_array:
+                    conditions.append(f"{pa}.{column} {op}(${idx}::text[])")
+                else:
+                    conditions.append(f"{pa}.{column} {op} ${idx}")
                 params.append(val)
                 idx += 1
 

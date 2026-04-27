@@ -207,20 +207,21 @@ def _coerce_trial_ids(tool: BaseTool, tool_args: dict) -> dict:
     """
     try:
         schema = tool.args_schema.model_json_schema()
-        expected_type = (
-            schema.get("properties", {})
-            .get("trial_ids", {})
-            .get("type")
+        trial_ids_schema = schema.get("properties", {}).get("trial_ids", {})
+        expected_type = trial_ids_schema.get("type")
+        any_of = trial_ids_schema.get("anyOf", [])
+        supports_array = expected_type == "array" or any(
+            opt.get("type") == "array" for opt in any_of if isinstance(opt, dict)
         )
 
         value = tool_args["trial_ids"]
 
-        if expected_type == "string" and isinstance(value, list):
-            # Tool wants a JSON-encoded list string, LLM gave a plain list
+        if isinstance(value, list) and not supports_array:
+            # Tool schema is string-like; convert list into CSV string.
             tool_args = dict(tool_args)
-            tool_args["trial_ids"] = json.dumps(value)
+            tool_args["trial_ids"] = ",".join(str(v) for v in value)
 
-        elif expected_type == "array" and isinstance(value, str):
+        elif supports_array and isinstance(value, str):
             # Tool wants a list, LLM gave a bare string
             tool_args = dict(tool_args)
             try:

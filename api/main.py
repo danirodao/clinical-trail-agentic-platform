@@ -5,6 +5,7 @@ All endpoints require JWT authentication via Keycloak.
 
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 import asyncpg
@@ -21,6 +22,11 @@ from api.metrics import metrics_router, instrument_app
 from api.routers import domain_owner, manager, researcher, marketplace, eval_router
 from api.collection_consumer import CollectionRefreshConsumer
 from auth.openfga_client import get_openfga_client
+from auth.openfga_outbox import (
+    OpenFGAOutboxRelay,
+    ensure_outbox_schema,
+    run_outbox_relay_loop,
+)
 from auth.reconciliation_service import ReconciliationService
 from api.metrics import metrics_router, instrument_app
 from api.logging_config import configure_logging, get_logger
@@ -32,6 +38,8 @@ setup_observability()
 
 
 collection_consumer: CollectionRefreshConsumer = None
+outbox_relay_task: asyncio.Task | None = None
+outbox_relay_stop_event: asyncio.Event | None = None
 
 log = get_logger(__name__)
 
@@ -48,8 +56,9 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle manager."""
-    global collection_consumer
+    global collection_consumer, outbox_relay_task, outbox_relay_stop_event
     pool = await init_db_pool()
+    await ensure_outbox_schema(pool)
     db_url= f"postgresql://{os.environ.get('POSTGRES_USER', 'ctuser')}:{os.environ.get('POSTGRES_PASSWORD', 'ctpassword')}@{os.environ.get('POSTGRES_HOST', 'postgres')}:{os.environ.get('POSTGRES_PORT', 5432)}/{os.environ.get('POSTGRES_DB', 'clinical_trials')}"
     app.state.checkpointer_url =db_url
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -62,6 +71,14 @@ async def lifespan(app: FastAPI):
         fga_client_factory=get_openfga_client,
     )
     collection_consumer.start()
+
+    if os.getenv("ENABLE_OPENFGA_OUTBOX_RELAY", "true").lower() == "true":
+        relay = OpenFGAOutboxRelay(db_pool=pool)
+        outbox_relay_stop_event = asyncio.Event()
+        outbox_relay_task = asyncio.create_task(
+            run_outbox_relay_loop(relay, outbox_relay_stop_event)
+        )
+        log.info("OpenFGA outbox relay started")
 
     # ── Nightly Evaluation Scheduler ──────────────────────────────────────
     eval_scheduler = None
@@ -111,6 +128,10 @@ async def lifespan(app: FastAPI):
     # ── Shutdown ──────────────────────────────────────────────────────────
     if eval_scheduler:
         eval_scheduler.shutdown(wait=False)
+    if outbox_relay_stop_event:
+        outbox_relay_stop_event.set()
+    if outbox_relay_task:
+        await outbox_relay_task
     if collection_consumer:
         collection_consumer.stop()
     await close_db_pool()

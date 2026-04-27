@@ -115,26 +115,41 @@ The platform follows a **microservices architecture** coordinated via Docker Com
 
 ```mermaid
 graph TD
-    User([Researcher]) <-->|OIDC Login| Frontend[React SPA]
-    Frontend <-->|JWT Bearer| API[FastAPI Gateway]
-    API <-->|Validate JWT| KC[Keycloak OIDC]
-    API <-->|Check Tuples| FGA[OpenFGA]
-    API <-->|SSE + JSON-RPC| MCP[MCP Server]
+  User([Researcher / Manager / Domain Owner]) <-->|OIDC Login| Frontend[React SPA :3001]
+  Frontend <-->|JWT Bearer| API[FastAPI Gateway :8000]
 
-    subgraph "Intelligent Data Mesh"
-        MCP <-->|SQL| PG[(PostgreSQL)]
-        MCP <-->|Cosine Similarity| QD[(Qdrant)]
-        MCP <-->|Cypher| NEO[(Neo4j)]
-    end
+  API <-->|JWKS + Token Validation| KC[Keycloak :8180]
+  API <-->|ReBAC Checks + List Objects| FGA[OpenFGA :8082]
+  API <-->|SSE + JSON-RPC| MCP[MCP Server :8001]
+  API <-->|SSE + JSON-RPC| SMCP[Semantic MCP :8002]
 
-    subgraph "Async Data Pipeline"
-        GEN[Generator] -->|pdf.generated| KFK((Kafka))
-        KFK -->|consume| PROC[Processor]
-        PROC --> PG
-        PROC --> QD
-        PROC --> NEO
-        PROC --> MINIO[(MinIO S3)]
-    end
+  subgraph "Intelligent Data Mesh"
+    MCP <-->|SQL| PG[(PostgreSQL :5432)]
+    MCP <-->|Vector Search| QD[(Qdrant :6333)]
+    MCP <-->|Cypher| NEO[(Neo4j :7687)]
+    SMCP <-->|Ontology Graph| NEO
+  end
+
+  subgraph "Async Generation + Ingestion"
+    GEN[Generator profile] -->|Upload PDF| MINIO[(MinIO :9000/9001)]
+    GEN -->|Publish pdf-generated| KFK((Kafka :9092))
+    KFK -->|Consume pdf-generated| PROC[Processor]
+    PROC -->|Read PDF| MINIO
+    PROC -->|Load curated data| PG
+    PROC -->|Upsert embeddings| QD
+    PROC -->|Create graph relations| NEO
+    PROC -->|Publish trial-ingested| KFK
+  end
+
+  subgraph "Observability + Evaluation"
+    API -->|OTLP spans| PHX[Phoenix :6006]
+    API -->|/metrics| PROM[Prometheus :9090]
+    MCP -->|/metrics| PROM
+    PROM --> GRAF[Grafana :3010]
+    API --> ARG[Argilla :6900]
+    ARG --> ES[(Elasticsearch :9200)]
+    ARG --> REDIS[(Redis :6379)]
+  end
 ```
 
 ### Component Summary
@@ -144,6 +159,7 @@ graph TD
 | **Frontend** | React SPA with Keycloak SSO, chat UI, role-based dashboards | `3001` |
 | **API Gateway** | FastAPI — orchestrates LangGraph agent, computes access profiles | `8000` |
 | **MCP Server** | FastMCP — 15 clinical tools exposed via SSE/JSON-RPC | `8001` |
+| **Semantic MCP Server** | Ontology/concept disambiguation service used by API agent | `8002` |
 | **Keycloak** | OIDC Identity Provider — JWT issuance, realm roles, PKCE | `8180` |
 | **OpenFGA** | Zanzibar-style ReBAC engine — trial/patient/cohort tuples | `8082` |
 | **PostgreSQL** | Relational store — trials, patients, labs, AEs, auth tables | `5432` |
@@ -156,6 +172,7 @@ graph TD
 | **Grafana** | Dashboards — Agent Performance + Semantic Layer Quality | `3010` |
 | **Argilla** | Human-in-the-loop evaluation review | `6900` |
 | **Elasticsearch** | Backend store for Argilla annotations | `9200` |
+| **Redis** | Cache/queue backend for Argilla | `6379` |
 
 ---
 
@@ -172,15 +189,16 @@ The Generator and Processor communicate exclusively via Kafka events. The Genera
 ```mermaid
 sequenceDiagram
     participant Gen as Generator
-    participant MinIO as MinIO (S3)
-    participant Kafka as Kafka
+  participant MinIO as MinIO (S3)
+  participant Kafka as Kafka
     participant Proc as Processor
     participant PG as PostgreSQL
     participant QD as Qdrant
     participant Neo as Neo4j
+  participant API as API Gateway
 
     Gen->>MinIO: Upload PDF
-    Gen->>Kafka: Publish PDFGeneratedEvent
+  Gen->>Kafka: Publish PDFGeneratedEvent (pdf-generated)
     Note over Kafka: topic: pdf-generated<br/>key: NCT ID (partition ordering)
     Kafka->>Proc: Consume event
     Proc->>MinIO: Download PDF
@@ -192,7 +210,8 @@ sequenceDiagram
         Proc->>QD: Upsert embedding chunks
         Proc->>Neo: Create graph nodes + relationships
     end
-    Proc->>Kafka: Publish TrialIngestedEvent
+      Proc->>Kafka: Publish TrialIngestedEvent (trial-ingested)
+      API->>PG: Query structured trial/patient data
 ```
 
 ### Idempotent Producer
@@ -418,20 +437,25 @@ type cohort
 flowchart TD
     A[User Request] --> B{Role = domain_owner?}
     B -->|Yes| C[Full Access - 1=1]
-    B -->|No| D[Layer 1: OpenFGA]
-    D --> E[ListObjects: can_view_aggregate]
-    D --> F[ListObjects: can_view_individual]
-    E --> G[Aggregate Trial IDs]
-    F --> H[Individual Trial IDs]
-    G --> I[Layer 2: PostgreSQL]
-    H --> I
-    I --> J[Load Cohort Scopes]
-    J --> K{Has Cohort Filter?}
-    K -->|Yes| L[Build patient WHERE clause<br/>age, sex, ethnicity, country, conditions]
-    K -->|No| M[Unrestricted - all patients]
-    L --> N[AccessProfile]
-    M --> N
-    N --> O[Inject into every tool call]
+  B -->|No| D[Layer 1: OpenFGA]
+  D --> E[ListObjects: can_view_aggregate]
+  D --> F[ListObjects: can_view_individual]
+  E --> G[Aggregate Trial IDs]
+  F --> H[Individual Trial IDs]
+  G --> I[Layer 2: PostgreSQL Assignments]
+  H --> I
+  I --> J[Join researcher_assignment + cohort + cohort_trial]
+  J --> K[Load cohort.filter_criteria JSONB]
+  K --> L[Build AccessProfile + patient_filters]
+  L --> M[Serialize access_context JSON]
+  M --> N[Inject into each MCP tool call]
+  N --> O[MCP AccessContext validates trial scope]
+  O --> P{Has cohort filters?}
+  P -->|Yes| Q[Parameterized SQL filters<br/>age/sex/ethnicity/country/conditions/disposition/arm]
+  P -->|No| R[Unrestricted per-trial individual scope]
+  Q --> S[Authorized rows only]
+  R --> S
+  S --> T[Apply ceiling principle on mixed access]
 ```
 
 ### Where Cohort Filters Are Kept (And Enforced)
@@ -669,6 +693,8 @@ graph TB
         GoldenDS["Golden Dataset (JSON)"]
         Evaluator["Offline Evaluator (DeepEval)"]
         Argilla["Argilla (HITL Review)"]
+        Elastic[(Elasticsearch)]
+        Redis[(Redis)]
     end
 
     API --> Agent --> MCP
@@ -681,6 +707,8 @@ graph TB
     Evaluator -->|scores| Phoenix
     Evaluator -->|eval_* gauges| Prom
     Evaluator -->|failed cases| Argilla
+    Argilla --> Elastic
+    Argilla --> Redis
     Prom --> Grafana
 ```
 

@@ -668,12 +668,24 @@ class AgentService:
             try:
                 snapshot = _access_profile_snapshot(access_profile)
 
+                # Compute the effective trial scope that was actually used.
+                # If the researcher supplied explicit trial_ids, use those.
+                # If the request was unscoped (trial_ids=None), the agent used
+                # the full profile scope — pin that now so evaluation replays
+                # see the same data regardless of future access-control changes.
+                effective_trial_ids = (
+                    request.trial_ids
+                    if request.trial_ids
+                    else getattr(access_profile, "allowed_trial_ids", [])
+                )
+
                 stored = capture_production_request(
                     query=request.query,
                     actual_output=response.answer,
                     access_profile_snapshot=snapshot,
                     tool_calls=[tc.tool for tc in response.tool_calls],
                     retrieval_context=getattr(response, "raw_context", []),
+                    requested_trial_ids=effective_trial_ids,
                     category="production_sampling",
                     run_id=request.session_id or "live",
                 )

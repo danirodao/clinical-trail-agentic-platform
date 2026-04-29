@@ -104,6 +104,49 @@ def _filter_supported_fields(dataset, fields: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dataset_metadata_property_names(dataset) -> set[str]:
+    """Return the set of registered metadata property names for the dataset.
+
+    Argilla 2.x stores them under dataset.settings.metadata as a list of
+    MetadataProperty objects, each with a .name attribute.
+    Falls back to an empty set so callers can treat it as "no restriction".
+    """
+    try:
+        metadata_props = dataset.settings.metadata
+        if metadata_props is None:
+            return set()
+        # Argilla 2.x: list of MetadataProperty objects
+        if hasattr(metadata_props, "__iter__"):
+            return {getattr(p, "name", None) for p in metadata_props} - {None}
+    except Exception as exc:
+        logger.warning("Could not inspect Argilla metadata properties: %s", exc)
+    return set()
+
+
+def _filter_supported_metadata(dataset, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Drop metadata keys that are not registered as properties in the dataset.
+
+    This prevents UnprocessableEntityError when the live Argilla dataset was
+    created before a new metadata property (e.g. 'persona_key') was added to
+    the schema definition in code.
+    """
+    allowed = _dataset_metadata_property_names(dataset)
+    if not allowed:
+        # Could not inspect → pass everything through (fail-open)
+        return metadata
+
+    unsupported = sorted(k for k in metadata if k not in allowed)
+    if unsupported:
+        logger.warning(
+            "Argilla dataset '%s' metadata schema is missing properties %s; "
+            "dropping them. Recreate the dataset to include the new properties.",
+            DATASET_NAME,
+            ", ".join(unsupported),
+        )
+
+    return {k: v for k, v in metadata.items() if k in allowed}
+
+
 def _ensure_dataset(client) -> Any | None:
     """
     Create the evaluation dataset in Argilla if it doesn't exist.
@@ -220,6 +263,10 @@ def _ensure_dataset(client) -> Any | None:
                 rg.TermsMetadataProperty(name="eval_run_id", title="Evaluation Run ID"),
                 rg.TermsMetadataProperty(name="imported", title="Imported Status"),
                 rg.TermsMetadataProperty(name="persona_key", title="Persona Key (user_id:role)"),
+                # Pinned trial scope — JSON-encoded list of UUIDs scoped at capture time.
+                # Stored so the evaluator can replay under the EXACT same data scope,
+                # preventing false failures when a user's trial access changes later.
+                rg.TermsMetadataProperty(name="trial_ids", title="Requested Trial IDs (JSON)"),
             ],
         )
 
@@ -289,13 +336,13 @@ def push_failed_cases(
                     "retrieval_context":  context,
                     "evaluation_scores":  scores_md,
                 },
-                metadata={
+                metadata=_filter_supported_metadata(dataset, {
                     "case_id":     case_id,
                     "category":    getattr(result, "category", "unknown"),
                     "layer":       getattr(result, "layer", "unknown"),
                     "source":      source,
                     "eval_run_id": run_id,
-                },
+                }),
             ))
 
         if records:
@@ -321,6 +368,7 @@ def capture_production_request(
     access_profile_snapshot: dict,
     tool_calls: list[str] | None = None,
     retrieval_context: list[str] | None = None,
+    requested_trial_ids: list[str] | None = None,
     category: str = "production",
     run_id: str = "live",
 ) -> bool:
@@ -345,6 +393,12 @@ def capture_production_request(
         access_profile_snapshot:  Dict from AccessProfile.to_snapshot().
         tool_calls:               Tool names invoked during the request.
         retrieval_context:        Raw tool outputs used as context.
+        requested_trial_ids:      The effective trial scope at request time.
+                                  Pass request.trial_ids if the user scoped
+                                  explicitly, OR the full profile.allowed_trial_ids
+                                  when the request was unscoped. Stored as a
+                                  JSON list so replays use the exact same data
+                                  scope regardless of later access changes.
         category:                 Logical category label (default 'production').
         run_id:                   Identifier for the capture run / session.
 
@@ -367,9 +421,17 @@ def capture_production_request(
         role = access_profile_snapshot.get("role", "unknown")
         persona_key = f"{user_id}:{role}"
 
-        # Deterministic ID so repeated captures of the same query+user dedup cleanly
+        # Normalise trial scope — always a sorted list for determinism.
+        # Caller must pass the effective scope (explicit request.trial_ids OR
+        # the full profile.allowed_trial_ids when the request was unscoped).
+        pinned_trial_ids: list[str] = sorted(requested_trial_ids or [])
+        trial_ids_json = json.dumps(pinned_trial_ids)
+
+        # Deterministic ID — includes trial scope so two queries with the same
+        # text but different scopes (e.g. different cohort filters) produce
+        # distinct Argilla records rather than silently overwriting each other.
         record_id = hashlib.sha256(
-            f"{query}|{user_id}|{role}".encode()
+            f"{query}|{user_id}|{role}|{trial_ids_json}".encode()
         ).hexdigest()[:16]
 
         context_str = ""
@@ -387,7 +449,7 @@ def capture_production_request(
                 "evaluation_scores":  "",
                 "evaluation_persona": json.dumps(access_profile_snapshot, default=str),
             }),
-            metadata={
+            metadata=_filter_supported_metadata(dataset, {
                 "case_id":     record_id,
                 "category":    category,
                 "layer":       "agent",
@@ -395,13 +457,15 @@ def capture_production_request(
                 "eval_run_id": run_id,
                 "imported":    "false",
                 "persona_key": persona_key,
-            },
+                # Pinned at capture time — survives access-control changes.
+                "trial_ids":   trial_ids_json,
+            }),
         )
 
         dataset.records.log([record])
         logger.debug(
-            "Captured production request record_id=%s persona=%s",
-            record_id, persona_key,
+            "Captured production request record_id=%s persona=%s trial_ids=%d",
+            record_id, persona_key, len(pinned_trial_ids),
         )
         return True
 
@@ -519,7 +583,7 @@ def push_records_for_review(
                         rec.get("evaluation_persona", {}), default=str
                     ),
                 }),
-                metadata={
+                metadata=_filter_supported_metadata(dataset, {
                     "case_id":     case_id,
                     "category":    rec.get("category", "unknown"),
                     "layer":       rec.get("layer", "unknown"),
@@ -527,7 +591,7 @@ def push_records_for_review(
                     "eval_run_id": rec.get("run_id", "unknown"),
                     "imported":    "false",
                     "persona_key": rec.get("persona_key", ""),
-                },
+                }),
                 suggestions=suggestions,
             ))
 
@@ -674,6 +738,16 @@ def fetch_reviewed_gold_records() -> list[dict]:
             else lambda k, d=None: record_fields.get(k, d) if isinstance(record_fields, dict) else d
         )
 
+        # Restore the pinned trial scope from metadata so the evaluator
+        # replays the case against the exact same data the original user saw.
+        raw_trial_ids = get_meta("trial_ids", "[]")
+        try:
+            trial_ids_list = json.loads(raw_trial_ids) if raw_trial_ids else []
+            if not isinstance(trial_ids_list, list):
+                trial_ids_list = []
+        except (json.JSONDecodeError, TypeError):
+            trial_ids_list = []
+
         gold_cases.append({
             "id":              get_meta("case_id", f"argilla-{record.id}"),
             "query":           get_field("query", ""),
@@ -681,6 +755,10 @@ def fetch_reviewed_gold_records() -> list[dict]:
             "layer":           get_meta("layer", "agent"),
             "category":        "argilla_gold",
             "tags":            ["argilla", "human_validated"],
+            # Pinned data scope — restored so offline_evaluator replays faithfully.
+            "trial_ids":       trial_ids_list or None,
+            # Persona snapshot for identity impersonation on replay.
+            "evaluation_persona": get_field("evaluation_persona", ""),
         })
 
     # ── Diagnostic logging — always emitted so you know exactly why count is N ──

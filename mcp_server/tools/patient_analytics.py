@@ -19,7 +19,7 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response, serialize_row, _append_demographic_filters
+from utils import success_response, error_response, serialize_row, _append_demographic_filters, build_abac_sql_filters
 
 from db import postgres
 from observability import instrument_tool
@@ -91,6 +91,22 @@ def _describe_filters(*args: str) -> list[str]:
         for label, value in zip(labels, args)
         if value and value.strip()
     ]
+
+
+def _log_filter_debug(
+    tool_name: str,
+    authorized: list[str],
+    where_clause: str,
+    params: list[Any],
+) -> None:
+    """Emit a compact debug line with effective SQL filters and parameters."""
+    logger.info(
+        "[DEBUG %s] authorized_trials=%s where=%s params=%s",
+        tool_name,
+        authorized,
+        " ".join(where_clause.split())[:2000],
+        [f"${i+1}:{type(v).__name__}={v!r}" for i, v in enumerate(params)],
+    )
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -169,6 +185,28 @@ def register_tools(mcp: FastMCP) -> None:
             # 4. Additional user-supplied filters
             extra_conditions: list[str] = []
 
+            # Enforce ABAC trial dimensions (region/area/phase) against
+            # clinical_trial rows even when the query is patient-centric.
+            # skip_allowed_fallbacks=True: trial authorization is already
+            # enforced by build_authorized_patient_filter. Applying governance-
+            # ceiling fallbacks (allowed_areas/regions/phases) on top would
+            # incorrectly block patients in individually-granted trials outside
+            # the governance envelope (e.g. Endocrinology when envelope only
+            # covers Cardiology/Oncology). Only explicit requested_area/region/
+            # phase user filters are applied here.
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context, table_alias="ct", param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                extra_conditions.append(
+                    "EXISTS (SELECT 1 FROM clinical_trial ct "
+                    "WHERE ct.trial_id = pte.trial_id AND "
+                    + " AND ".join(abac_conds)
+                    + ")"
+                )
+                params.extend(abac_params)
+
             idx = _append_demographic_filters(
                 extra_conditions, params, idx,
                 sex=sex, ethnicity=ethnicity, country=country,
@@ -177,24 +215,11 @@ def register_tools(mcp: FastMCP) -> None:
             )
 
             if condition.strip():
-                extra_conditions.append(f"LOWER(p.medical_conditions) LIKE LOWER(${idx})")
-                params.append(f"%{condition.strip()}%")
-                idx += 1
-
-
-            if disposition_status.strip():
-                extra_conditions.append(
-                    f"LOWER(p.disposition_status) LIKE LOWER(${idx})"
-                )
-                params.append(f"%{disposition_status.strip()}%")
-                idx += 1
-
-            if condition.strip():
                 extra_conditions.append(f"""
                     EXISTS (
                         SELECT 1 FROM patient_condition pc
                         WHERE pc.patient_id = p.patient_id
-                        AND LOWER(pc.condition_name) LIKE LOWER(${idx})
+                        AND LOWER(pc.condition_name) LIKE LOWER(${idx}::text)
                     )
                 """)
                 params.append(f"%{condition.strip()}%")
@@ -254,6 +279,12 @@ def register_tools(mcp: FastMCP) -> None:
                     WHERE {where_clause}
                 """
 
+            # DEBUG: Log the SQL and parameters
+            logger.info(f"[DEBUG count_patients] SQL: {sql.strip()}")
+            logger.info(f"[DEBUG count_patients] Params ({len(params)}): {params}")
+            logger.info(f"[DEBUG count_patients] Auth WHERE: {auth_where}")
+            logger.info(f"[DEBUG count_patients] Extra conditions: {extra_conditions}")
+
             rows = await postgres.fetch(sql, *params)
 
             if group_columns:
@@ -282,7 +313,13 @@ def register_tools(mcp: FastMCP) -> None:
             )
 
         except Exception as e:
-            logger.error(f"count_patients error: {e}", exc_info=True)
+            logger.error(
+                "count_patients error: %s | sql=%s | params=%s",
+                e,
+                " ".join(sql.split())[:1200],
+                [f"${i+1}:{type(v).__name__}={v!r}" for i, v in enumerate(params[:30])],
+                exc_info=True,
+            )
             return error_response(str(e), "TOOL_ERROR")
 
     # -----------------------------------------------------------------------
@@ -344,6 +381,20 @@ def register_tools(mcp: FastMCP) -> None:
 
             # 4. Additional user-supplied filters
             extra: list[str] = []
+
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context, table_alias="ct", param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                extra.append(
+                    "EXISTS (SELECT 1 FROM clinical_trial ct "
+                    "WHERE ct.trial_id = pte.trial_id AND "
+                    + " AND ".join(abac_conds)
+                    + ")"
+                )
+                params.extend(abac_params)
+
             idx = _append_demographic_filters(
                 extra, params, idx,
                 sex=sex, ethnicity=ethnicity, country=country,
@@ -353,6 +404,13 @@ def register_tools(mcp: FastMCP) -> None:
             
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
+
+            _log_filter_debug(
+                "get_patient_demographics",
+                authorized,
+                where,
+                params,
+            )
 
 
 
@@ -513,6 +571,20 @@ def register_tools(mcp: FastMCP) -> None:
 
             # 4. Additional user-supplied filters
             extra: list[str] = []
+
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context, table_alias="ct", param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                extra.append(
+                    "EXISTS (SELECT 1 FROM clinical_trial ct "
+                    "WHERE ct.trial_id = pte.trial_id AND "
+                    + " AND ".join(abac_conds)
+                    + ")"
+                )
+                params.extend(abac_params)
+
             idx = _append_demographic_filters(
                 extra, params, idx,
                 sex=sex, ethnicity=ethnicity, country=country,
@@ -522,6 +594,13 @@ def register_tools(mcp: FastMCP) -> None:
             
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
+
+            _log_filter_debug(
+                "get_patient_disposition",
+                authorized,
+                where,
+                params,
+            )
 
 
 
@@ -639,7 +718,13 @@ def register_tools(mcp: FastMCP) -> None:
             )
 
         except Exception as e:
-            logger.error(f"get_patient_disposition error: {e}", exc_info=True)
+            logger.error(
+                "get_patient_disposition error: %s | sql=%s | params=%s",
+                e,
+                " ".join(sql.split())[:1200],
+                [f"${i+1}:{type(v).__name__}={v!r}" for i, v in enumerate(params[:30])],
+                exc_info=True,
+            )
             return error_response(str(e), "TOOL_ERROR")
 
     logger.info(

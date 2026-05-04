@@ -5,13 +5,19 @@ All trial_ids in a cohort must be within the org's access ceiling.
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 import asyncpg
 
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
+from auth.openfga.context_builder import (
+    ALLOWED_AREAS,
+    ALLOWED_PHASES,
+    ALLOWED_REGIONS,
+    DEFAULT_ALLOWED_PURPOSES,
+)
 from auth.openfga_outbox import enqueue_write_tuples
 
 logger = logging.getLogger(__name__)
@@ -35,25 +41,149 @@ class CohortService:
         self.fga = fga_client or get_openfga_client()
 
     async def _verify_ceiling(self, org_id: str, trial_ids: list[str]) -> tuple[bool, list[str]]:
-        """Verify all trial_ids are within the org's access ceiling."""
-        violations = []
-        for trial_id in trial_ids:
-            result = await self.fga.check(
-                user=f"organization:{org_id}",
-                relation="granted_org",
-                object=f"clinical_trial:{trial_id}",
-            )
-            if not result.allowed:
-                violations.append(
-                    f"Organization {org_id} does not have access to trial {trial_id}"
-                )
+        """
+        Verify all trial_ids are within the org's access ceiling.
+
+        For cohort creation/preview, PostgreSQL active grants are the source of
+        truth. This avoids false denies when OpenFGA conditional checks require
+        runtime context not provided in this endpoint.
+        """
+        if not trial_ids:
+            return True, []
+
+        rows = await self.db.fetch(
+            """
+            SELECT DISTINCT da.reference_id::text AS trial_id
+            FROM access_grant ag
+            JOIN data_asset da ON da.asset_id = ag.asset_id
+            WHERE ag.organization_id = $1
+              AND da.asset_type = 'clinical_trial'
+              AND da.reference_id::text = ANY($2::text[])
+              AND ag.revoked_at IS NULL
+              AND ag.expires_at > NOW()
+            """,
+            org_id,
+            trial_ids,
+        )
+
+        allowed = {r["trial_id"] for r in rows}
+        violations = [
+            f"Organization {org_id} does not have access to trial {trial_id}"
+            for trial_id in trial_ids
+            if trial_id not in allowed
+        ]
+
         return len(violations) == 0, violations
 
-    def _build_patient_filter_query(self, filter_criteria: dict, param_start_idx: int = 1) -> tuple[str, list]:
+    def _coerce_scope_list(self, scope: dict[str, Any], *keys: str) -> list[str]:
+        for key in keys:
+            value = scope.get(key)
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+            if isinstance(value, list):
+                cleaned = [str(v).strip() for v in value if str(v).strip()]
+                if cleaned:
+                    return cleaned
+        return []
+
+    async def _load_inherited_trial_constraints(
+        self,
+        org_id: str,
+        trial_ids: list[str],
+    ) -> dict[str, dict[str, list[str]]]:
+        """
+        Load inherited restrictions (from active grants) for each selected trial.
+
+        These become the mandatory base-layer constraints. Manager-selected
+        patient filters are applied on top (logical AND).
+        """
+        if not trial_ids:
+            return {}
+
+        rows = await self.db.fetch(
+            """
+            SELECT DISTINCT ON (da.reference_id)
+                   da.reference_id::text AS trial_id,
+                   ag.scope
+            FROM access_grant ag
+            JOIN data_asset da ON da.asset_id = ag.asset_id
+            WHERE ag.organization_id = $1
+              AND da.asset_type = 'clinical_trial'
+              AND da.reference_id::text = ANY($2::text[])
+              AND ag.revoked_at IS NULL
+              AND ag.expires_at > NOW()
+            ORDER BY da.reference_id, ag.expires_at DESC
+            """,
+            org_id,
+            trial_ids,
+        )
+
+        constraints: dict[str, dict[str, list[str]]] = {}
+        for row in rows:
+            scope = dict(row.get("scope") or {})
+            constraints[row["trial_id"]] = {
+                "regions": self._coerce_scope_list(scope, "permitted_regions", "regions", "region"),
+                "countries": self._coerce_scope_list(scope, "permitted_countries", "countries", "country"),
+            }
+        return constraints
+
+    def _build_inherited_filter_query(
+        self,
+        trial_constraints: dict[str, dict[str, list[str]]],
+        param_start_idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """
+        Build SQL enforcing inherited restrictions per trial.
+
+        Output shape:
+          (trial=A AND region in A_regions AND country in A_countries)
+          OR
+          (trial=B AND region in B_regions)
+        """
+        if not trial_constraints:
+            return "1=1", [], param_start_idx
+
+        params: list[Any] = []
+        idx = param_start_idx
+        per_trial_clauses: list[str] = []
+
+        for trial_id, c in trial_constraints.items():
+            parts: list[str] = [f"pte.trial_id = ${idx}::uuid"]
+            params.append(trial_id)
+            idx += 1
+
+            if c.get("regions"):
+                parts.append(f"p.region = ANY(${idx}::text[])")
+                params.append(c["regions"])
+                idx += 1
+
+            if c.get("countries"):
+                parts.append(f"p.country = ANY(${idx}::text[])")
+                params.append(c["countries"])
+                idx += 1
+
+            per_trial_clauses.append("(" + " AND ".join(parts) + ")")
+
+        return "(" + " OR ".join(per_trial_clauses) + ")", params, idx
+
+    def _build_patient_filter_query(
+        self,
+        filter_criteria: dict,
+        param_start_idx: int = 1,
+        inherited_trial_constraints: Optional[dict[str, dict[str, list[str]]]] = None,
+    ) -> tuple[str, list]:
         """Build dynamic WHERE clause and params for filtering patients."""
         conditions = []
         params = []
         param_idx = param_start_idx
+
+        inherited_clause, inherited_params, param_idx = self._build_inherited_filter_query(
+            inherited_trial_constraints or {},
+            param_idx,
+        )
+        if inherited_clause:
+            conditions.append(inherited_clause)
+            params.extend(inherited_params)
 
         trial_ids = filter_criteria.get("trial_ids", [])
         if trial_ids:
@@ -125,6 +255,10 @@ class CohortService:
             "ethnicity": [r["ethnicity"] for r in ethnicities],
             "disposition_status": [r["disposition_status"] for r in statuses],
             "arm_assigned": [r["arm_assigned"] for r in arms],
+            "regions": sorted(ALLOWED_REGIONS),
+            "therapeutic_areas": sorted(ALLOWED_AREAS),
+            "phases": sorted(ALLOWED_PHASES),
+            "purposes": sorted(DEFAULT_ALLOWED_PURPOSES),
         }
 
     async def preview_cohort(
@@ -153,8 +287,17 @@ class CohortService:
                 "ceiling_violations": [],
             }
 
+        inherited_constraints = await self._load_inherited_trial_constraints(
+            user.organization_id,
+            trial_ids,
+        )
+
         # Build dynamic WHERE clause from filter_criteria
-        where_clause, params = self._build_patient_filter_query(filter_criteria, param_start_idx=1)
+        where_clause, params = self._build_patient_filter_query(
+            filter_criteria,
+            param_start_idx=1,
+            inherited_trial_constraints=inherited_constraints,
+        )
 
         # Count patients
         patient_count = await self.db.fetchval(
@@ -236,6 +379,11 @@ class CohortService:
         if not within_ceiling:
             raise CeilingViolationError(violations)
 
+        inherited_constraints = await self._load_inherited_trial_constraints(
+            user.organization_id,
+            trial_ids,
+        )
+
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 # Create cohort
@@ -264,7 +412,11 @@ class CohortService:
 
                 # If static, snapshot current patients
                 if not is_dynamic:
-                    where_clause, params = self._build_patient_filter_query(filter_criteria, param_start_idx=2)
+                    where_clause, params = self._build_patient_filter_query(
+                        filter_criteria,
+                        param_start_idx=2,
+                        inherited_trial_constraints=inherited_constraints,
+                    )
                  
                     await conn.execute(
                         f"""
@@ -282,7 +434,7 @@ class CohortService:
                     conn,
                     [
                         {
-                            "user": f"user:{user.user_id}",
+                            "user": f"user:{user.username}",
                             "relation": "creator",
                             "object": f"cohort:{cohort_id}",
                         },
@@ -351,7 +503,15 @@ class CohortService:
                 # Merge trial_ids into filter criteria to use the common method
                 f_crit = dict(r["filter_criteria"])
                 f_crit["trial_ids"] = trial_ids
-                where_clause, params = self._build_patient_filter_query(f_crit, param_start_idx=1)
+                inherited_constraints = await self._load_inherited_trial_constraints(
+                    user.organization_id,
+                    trial_ids,
+                )
+                where_clause, params = self._build_patient_filter_query(
+                    f_crit,
+                    param_start_idx=1,
+                    inherited_trial_constraints=inherited_constraints,
+                )
                 
                 patient_count = await self.db.fetchval(
                     f"""

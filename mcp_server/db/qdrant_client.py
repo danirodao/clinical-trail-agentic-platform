@@ -114,6 +114,7 @@ async def search_vectors(
     limit: int = 10,
     section: str | None = None,
     score_threshold: float = 0.3,
+    extra_must_conditions: list | None = None,
 ) -> list[dict[str, Any]]:
     """
     Semantic search over clinical trial document chunks.
@@ -124,6 +125,8 @@ async def search_vectors(
         limit: Maximum results to return.
         section: Optional section filter (e.g., 'adverse_events', 'demographics').
         score_threshold: Minimum similarity score.
+        extra_must_conditions: Additional Qdrant FieldConditions to add to the
+            must filter — used by ABAC enforcement (area, phase payload filters).
 
     Returns:
         List of dicts with keys: id, score, chunk_text, trial_id, nct_id, section, source_pdf.
@@ -145,6 +148,9 @@ async def search_vectors(
             must_conditions.append(
                 FieldCondition(key="section", match=MatchValue(value=section))
             )
+        # Append ABAC scope conditions (area/phase payload filters)
+        if extra_must_conditions:
+            must_conditions.extend(extra_must_conditions)
 
         results = await _client.search(
             collection_name=COLLECTION_NAME,

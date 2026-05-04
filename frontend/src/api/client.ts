@@ -84,6 +84,21 @@ export const domainOwnerApi = {
             method: 'POST',
             body: JSON.stringify({ reason }),
         }),
+
+    // Governance purpose catalog
+    listGovernancePurposes: () =>
+        request<{ purposes: GovernancePurpose[] }>('/governance/purposes'),
+
+    createGovernancePurpose: (data: GovernancePurposeCreate) =>
+        request<{ purpose: GovernancePurpose }>('/governance/purposes', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+
+    deactivateGovernancePurpose: (purposeKey: string) =>
+        request(`/governance/purposes/${encodeURIComponent(purposeKey)}`, {
+            method: 'DELETE',
+        }),
 };
 
 
@@ -96,7 +111,15 @@ export const managerApi = {
     getCollectionDetail: (id: string) =>
         request<CollectionDetail>(`/marketplace/${id}`),
 
-    requestAccess: (data: { collection_id: string; justification: string; requested_duration_days: number }) =>
+    getRequestOptions: (id: string) =>
+        request<CollectionRequestOptions>(`/marketplace/${id}/request-options`),
+
+    requestAccess: (data: {
+        collection_id: string;
+        justification: string;
+        requested_duration_days: number;
+        scope?: Record<string, unknown>;
+    }) =>
         request('/marketplace/request-access', {
             method: 'POST',
             body: JSON.stringify(data),
@@ -122,6 +145,12 @@ export const managerApi = {
 
     assignResearcher: (data: AssignResearcherRequest) =>
         request('/assignments/', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+
+    previewAssignmentVisiblePatients: (data: AssignmentVisiblePatientsPreviewRequest) =>
+        request<AssignmentVisiblePatientsPreviewResponse>('/assignments/preview-visible-patients', {
             method: 'POST',
             body: JSON.stringify(data),
         }),
@@ -240,6 +269,10 @@ export interface FilterOptionsResponse {
     ethnicity: string[];
     disposition_status: string[];
     arm_assigned: string[];
+    regions: string[];
+    therapeutic_areas: string[];
+    phases: string[];
+    purposes: string[];
 }
 
 // ─── Researcher API ──────────────────────────────────────────
@@ -247,6 +280,9 @@ export interface FilterOptionsResponse {
 export const researcherApi = {
     getMyAccess: () =>
         request<AccessSummary>('/research/my-access'),
+
+    getGovernanceOptions: () =>
+        request<GovernanceOptions>('/research/governance-options'),
 
     query: (q: string) =>
         request('/research/query', {
@@ -412,6 +448,7 @@ export interface MarketplaceCollection {
     phases: string[];
     regions: string[];
     countries: string[];
+    filter_criteria: TrialFilter;
     drug_names: string[];
     condition_names: string[];
     access_status: 'full_access' | 'partial_access' | 'pending' | 'no_access';
@@ -429,12 +466,22 @@ export interface CollectionDetail {
     };
 }
 
+export interface CollectionRequestOptions {
+    collection_id: string;
+    purposes: Array<{
+        purpose_key: string;
+        label: string;
+        description?: string;
+    }>;
+}
+
 export interface PendingRequest {
     request_id: string;
     collection_id: string;
     collection_name: string;
     requesting_org_id: string;
     justification: string;
+    scope?: Record<string, unknown>;
     trial_count: number;
     therapeutic_areas: string[];
     phases: string[];
@@ -451,6 +498,22 @@ export interface CollectionGrant {
     first_granted: string;
     earliest_expiry: string;
     all_active: boolean;
+    filter_criteria?: TrialFilter;
+}
+
+export interface GovernancePurpose {
+    purpose_key: string;
+    label: string;
+    description?: string;
+    owner_id?: string | null;
+    is_active: boolean;
+    created_at: string;
+}
+
+export interface GovernancePurposeCreate {
+    purpose_key: string;
+    label: string;
+    description?: string;
 }
 
 export interface DashboardStats {
@@ -503,6 +566,10 @@ export interface AccessGrant {
     asset_type: string;
     organization_id: string;
     scope: Record<string, unknown>;
+    trial_regions?: string[];
+    trial_phases?: string[];
+    trial_therapeutic_area?: string;
+    permitted_patient_count?: number;
     granted_at: string;
     expires_at: string;
     is_active: boolean;
@@ -581,6 +648,12 @@ export interface AssignResearcherRequest {
     cohort_id?: string;
     access_level: 'individual' | 'aggregate';
     duration_days: number;
+    assignment_scope?: {
+        region?: string[];
+        area?: string[];
+        phase?: string[];
+        purpose?: string[];
+    };
 }
 
 export interface Assignment {
@@ -592,6 +665,28 @@ export interface Assignment {
     assigned_at: string;
     expires_at: string;
     is_active: boolean;
+    assignment_scope?: Record<string, unknown>;
+    cohort_filter_criteria?: CohortFilter;
+    trial_grant_scope?: Record<string, unknown>;
+    cohort_grant_scope?: Record<string, unknown>;
+    visible_patient_count?: number;
+}
+
+export interface AssignmentVisiblePatientsPreviewRequest {
+    trial_id?: string;
+    cohort_id?: string;
+    duration_days?: number;
+    assignment_scope?: {
+        region?: string[];
+        area?: string[];
+        phase?: string[];
+        purpose?: string[];
+    };
+}
+
+export interface AssignmentVisiblePatientsPreviewResponse {
+    visible_patient_count: number;
+    trial_count: number;
 }
 
 export interface CohortFilterCriteria {
@@ -603,6 +698,8 @@ export interface CohortFilterCriteria {
     trial_ids?: string[];
     conditions?: string[];
     therapeutic_areas?: string[];
+    region?: string[];
+    regions?: string[];
     country?: string[];
     disposition_status?: string[];
     arm_assigned?: string[];
@@ -625,6 +722,8 @@ export interface TrialAccess {
     patient_count: number;
     access_level: 'individual' | 'aggregate';
     is_unrestricted: boolean;
+    effective_restrictions_label?: string;
+    effective_restrictions?: TrialCohortFilter[];
     cohort_filters: TrialCohortFilter[];
 }
 
@@ -643,10 +742,30 @@ export interface AccessSummary {
     };
     trial_access: TrialAccess[];           // ← THIS WAS MISSING
 }
+export interface QueryScopeParams {
+    region: string;   // e.g. "EU" — must match ALLOWED_REGIONS on the server
+    area: string;     // e.g. "oncology" — must match ALLOWED_AREAS
+    phase: string;    // e.g. "III" — must match ALLOWED_PHASES
+    purpose: string;  // e.g. "study_ONCO_2026" — must match ALLOWED_PURPOSES
+}
+
+export interface GovernanceOptions {
+    regions: string[];
+    areas: string[];
+    phases: string[];
+    purposes: string[];
+    purpose_mismatch_mode?: 'block' | 'warn' | 'off' | string;
+}
+
 export interface QueryRequest {
     query: string;
     trial_ids?: string[];
     session_id?: string;
+    // ABAC scope — optional. When present the server validates all values
+    // against server-side allowlists and enforces them via OpenFGA CEL conditions.
+    // clearance_level and current_time are NEVER sent from the client —
+    // they are read from the JWT and server clock respectively.
+    scope_params?: QueryScopeParams;
 }
 
 export interface ToolCallRecord {
@@ -683,6 +802,27 @@ export interface QueryResponse {
     error?: string;
 }
 
+export interface GovernanceErrorDetail {
+    message: string;
+    code?: string;
+    missing_scope_fields?: string[];
+    purpose_mismatch?: boolean;
+    declared_purpose?: string;
+    inferred_purpose?: string;
+}
+
+export class StreamingApiError extends Error {
+    status: number;
+    detail?: GovernanceErrorDetail;
+
+    constructor(status: number, message: string, detail?: GovernanceErrorDetail) {
+        super(message);
+        this.name = 'StreamingApiError';
+        this.status = status;
+        this.detail = detail;
+    }
+}
+
 // Streaming Event Types (NDJSON)
 export type StreamEvent =
     | { event: 'status'; data: { message: string } }
@@ -712,11 +852,31 @@ async function fetchStream(endpoint: string, body: any): Promise<ReadableStreamD
 
     if (!response.ok) {
         let errorMsg = `HTTP Error ${response.status}`;
+        let detail: GovernanceErrorDetail | undefined;
         try {
             const errorJson = await response.json();
-            errorMsg = errorJson.detail || errorJson.error || errorMsg;
+            const d = errorJson?.detail;
+            if (d && typeof d === 'object') {
+                detail = {
+                    message: String(d.message || errorMsg),
+                    code: d.code ? String(d.code) : undefined,
+                    missing_scope_fields: Array.isArray(d.missing_scope_fields)
+                        ? d.missing_scope_fields.map((v: unknown) => String(v))
+                        : undefined,
+                    purpose_mismatch: Boolean(d.purpose_mismatch),
+                    declared_purpose: d.declared_purpose
+                        ? String(d.declared_purpose)
+                        : undefined,
+                    inferred_purpose: d.inferred_purpose
+                        ? String(d.inferred_purpose)
+                        : undefined,
+                };
+                errorMsg = detail.message;
+            } else {
+                errorMsg = d || errorJson?.error || errorMsg;
+            }
         } catch (e) { }
-        throw new Error(errorMsg);
+        throw new StreamingApiError(response.status, errorMsg, detail);
     }
 
     if (!response.body) {

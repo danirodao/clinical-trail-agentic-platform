@@ -19,7 +19,7 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response, serialize_row
+from utils import success_response, error_response, serialize_row, build_abac_sql_filters, build_abac_qdrant_filters
 from db import postgres, qdrant_client
 from observability import instrument_tool
 
@@ -105,11 +105,16 @@ def register_tools(mcp: FastMCP) -> None:
             # --- Semantic search via Qdrant ---
             if query.strip():
                 try:
+                    # Apply ABAC scope (area/phase) as Qdrant payload filters
+                    # so semantic search only returns chunks from approved trials
+                    # that also match the governance scope dimensions.
+                    abac_qdrant = build_abac_qdrant_filters(ctx.abac_context)
                     vector_results = await qdrant_client.search_vectors(
                         query_text=query.strip(),
                         trial_ids=ctx.allowed_trial_ids,
                         limit=max_results,
                         score_threshold=0.25,
+                        extra_must_conditions=abac_qdrant,
                     )
                     # Group by trial_id, keep highest score per trial
                     for chunk in vector_results:
@@ -133,6 +138,13 @@ def register_tools(mcp: FastMCP) -> None:
             idx = 1
 
             # Always filter to authorized trials only
+            # Then also apply ABAC scope filters (region/area/phase) against
+            # real DB columns — enforces governance scope at the SQL level.
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context, table_alias="ct", param_offset=idx
+            )
+            conditions.extend(abac_conds)
+            params.extend(abac_params)
             trial_filter, trial_params, idx = ctx.build_trial_id_filter(
                 ctx.allowed_trial_ids, param_offset=idx, column="ct.trial_id"
             )

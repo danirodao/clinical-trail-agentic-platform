@@ -218,6 +218,7 @@ class Patient(BaseModel):
     race: Optional[str] = None
     ethnicity: Optional[str] = None
     country: Optional[str] = None
+    region: Optional[str] = None
     enrollment_date: Optional[date] = None
     arm_assigned: Optional[str] = None
     disposition_status: str = "Enrolled"

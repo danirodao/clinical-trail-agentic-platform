@@ -10,6 +10,10 @@ from typing import Optional
 
 import asyncpg
 
+from auth.openfga.condition_payload import (
+    build_condition_context_from_scope,
+    build_delegation_context_from_ceiling,
+)
 from auth.openfga_client import OpenFGAClient, get_openfga_client
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,63 @@ class ReconciliationService:
         }
         return results
 
+    async def _load_trial_ceiling_context(
+        self,
+        organization_id: str,
+        trial_id,
+    ) -> Optional[dict]:
+        row = await self.db.fetchrow(
+            """
+            SELECT ag.scope, ag.expires_at
+            FROM access_grant ag
+            JOIN data_asset da ON ag.asset_id = da.asset_id
+            WHERE ag.organization_id = $1
+              AND da.reference_id = $2
+              AND ag.revoked_at IS NULL
+              AND ag.expires_at > NOW()
+            ORDER BY ag.expires_at DESC
+            LIMIT 1
+            """,
+            organization_id,
+            trial_id,
+        )
+        if not row:
+            return None
+
+        return build_condition_context_from_scope(
+            row["scope"] or {},
+            valid_until=row["expires_at"],
+        )
+
+    async def _load_cohort_ceiling_context(
+        self,
+        organization_id: str,
+        cohort_id,
+    ) -> Optional[dict]:
+        row = await self.db.fetchrow(
+            """
+            SELECT ag.scope, ag.expires_at
+            FROM cohort_trial ct
+            JOIN data_asset da ON da.reference_id = ct.trial_id
+            JOIN access_grant ag ON ag.asset_id = da.asset_id
+            WHERE ct.cohort_id = $1
+              AND ag.organization_id = $2
+              AND ag.revoked_at IS NULL
+              AND ag.expires_at > NOW()
+            ORDER BY ag.expires_at DESC
+            LIMIT 1
+            """,
+            cohort_id,
+            organization_id,
+        )
+        if not row:
+            return None
+
+        return build_condition_context_from_scope(
+            row["scope"] or {},
+            valid_until=row["expires_at"],
+        )
+
     async def _reconcile_org_grants(self) -> dict:
         """Ensure every active access_grant has an OpenFGA tuple."""
         added = 0
@@ -41,28 +102,38 @@ class ReconciliationService:
 
         # Find active grants that should have tuples
         active_grants = await self.db.fetch(
-            """SELECT DISTINCT ag.organization_id, da.reference_id as trial_id
+             """SELECT DISTINCT ON (ag.organization_id, da.reference_id)
+                 ag.organization_id,
+                 da.reference_id as trial_id,
+                 ag.scope,
+                 ag.expires_at
                FROM access_grant ag
                JOIN data_asset da ON ag.asset_id = da.asset_id
              WHERE ag.revoked_at IS NULL
-             AND ag.expires_at > NOW()"""
+             AND ag.expires_at > NOW()
+             ORDER BY ag.organization_id, da.reference_id, ag.expires_at DESC"""
         )
 
         for grant in active_grants:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"organization:{grant['organization_id']}",
                 relation="granted_org",
                 object=f"clinical_trial:{grant['trial_id']}",
             )
-            if not result.allowed:
+            if not exists:
                 logger.warning(
                     f"RECONCILE: Missing tuple org:{grant['organization_id']} "
                     f"→ granted_org → trial:{grant['trial_id']}"
                 )
-                success = await self.fga.write_tuples([{
+                success = await self.fga.write_conditional_tuples([{
                     "user": f"organization:{grant['organization_id']}",
                     "relation": "granted_org",
                     "object": f"clinical_trial:{grant['trial_id']}",
+                    "condition_name": "check_fine_grained_access",
+                    "condition_context": build_condition_context_from_scope(
+                        grant["scope"] or {},
+                        valid_until=grant["expires_at"],
+                    ),
                 }])
                 if success:
                     added += 1
@@ -84,12 +155,12 @@ class ReconciliationService:
         )
 
         for grant in revoked_grants:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"organization:{grant['organization_id']}",
                 relation="granted_org",
                 object=f"clinical_trial:{grant['trial_id']}",
             )
-            if result.allowed:
+            if exists:
                 logger.warning(
                     f"RECONCILE: Stale tuple org:{grant['organization_id']} "
                     f"→ granted_org → trial:{grant['trial_id']}"
@@ -110,7 +181,7 @@ class ReconciliationService:
         removed = 0
 
         active = await self.db.fetch(
-            """SELECT DISTINCT researcher_id, cohort_id
+            """SELECT DISTINCT researcher_id, organization_id, cohort_id, expires_at
                FROM researcher_assignment
                WHERE cohort_id IS NOT NULL
                AND revoked_at IS NULL
@@ -118,16 +189,34 @@ class ReconciliationService:
         )
 
         for a in active:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"user:{a['researcher_id']}",
                 relation="assigned_researcher",
                 object=f"cohort:{a['cohort_id']}",
             )
-            if not result.allowed:
-                success = await self.fga.write_tuples([{
+            if not exists:
+                ceiling_context = await self._load_cohort_ceiling_context(
+                    a["organization_id"],
+                    a["cohort_id"],
+                )
+                if not ceiling_context:
+                    logger.warning(
+                        "RECONCILE: Skipping cohort tuple rebuild without active org ceiling: "
+                        "user:%s cohort:%s org:%s",
+                        a["researcher_id"],
+                        a["cohort_id"],
+                        a["organization_id"],
+                    )
+                    continue
+                success = await self.fga.write_conditional_tuples([{
                     "user": f"user:{a['researcher_id']}",
                     "relation": "assigned_researcher",
                     "object": f"cohort:{a['cohort_id']}",
+                    "condition_name": "check_fine_grained_access",
+                    "condition_context": build_delegation_context_from_ceiling(
+                        ceiling_context,
+                        delegated_valid_until=a["expires_at"],
+                    ),
                 }])
                 if success:
                     added += 1
@@ -147,12 +236,12 @@ class ReconciliationService:
         )
 
         for a in stale:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"user:{a['researcher_id']}",
                 relation="assigned_researcher",
                 object=f"cohort:{a['cohort_id']}",
             )
-            if result.allowed:
+            if exists:
                 success = await self.fga.delete_tuples([{
                     "user": f"user:{a['researcher_id']}",
                     "relation": "assigned_researcher",
@@ -172,7 +261,7 @@ class ReconciliationService:
 
         # Direct trial assignments
         direct_assigns = await self.db.fetch(
-            """SELECT researcher_id, trial_id
+            """SELECT researcher_id, organization_id, trial_id, expires_at
                FROM researcher_assignment
                WHERE access_level = 'individual'
                AND trial_id IS NOT NULL
@@ -181,27 +270,45 @@ class ReconciliationService:
         )
 
         for a in direct_assigns:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"user:{a['researcher_id']}",
                 relation="assigned_researcher",
                 object=f"clinical_trial:{a['trial_id']}",
             )
-            if not result.allowed:
+            if not exists:
                 logger.warning(
                     f"RECONCILE: Missing tuple user:{a['researcher_id']} "
                     f"→ assigned_researcher → trial:{a['trial_id']}"
                 )
-                success = await self.fga.write_tuples([{
+                ceiling_context = await self._load_trial_ceiling_context(
+                    a["organization_id"],
+                    a["trial_id"],
+                )
+                if not ceiling_context:
+                    logger.warning(
+                        "RECONCILE: Skipping direct assignment rebuild without active org ceiling: "
+                        "user:%s trial:%s org:%s",
+                        a["researcher_id"],
+                        a["trial_id"],
+                        a["organization_id"],
+                    )
+                    continue
+                success = await self.fga.write_conditional_tuples([{
                     "user": f"user:{a['researcher_id']}",
                     "relation": "assigned_researcher",
                     "object": f"clinical_trial:{a['trial_id']}",
+                    "condition_name": "check_fine_grained_access",
+                    "condition_context": build_delegation_context_from_ceiling(
+                        ceiling_context,
+                        delegated_valid_until=a["expires_at"],
+                    ),
                 }])
                 if success:
                     added += 1
 
         # Cohort assignments (expand to per-trial)
         cohort_assigns = await self.db.fetch(
-            """SELECT ra.researcher_id, ct.trial_id
+            """SELECT ra.researcher_id, ra.organization_id, ra.expires_at, ct.trial_id
                FROM researcher_assignment ra
                JOIN cohort_trial ct ON ra.cohort_id = ct.cohort_id
                WHERE ra.access_level = 'individual'
@@ -211,20 +318,38 @@ class ReconciliationService:
         )
 
         for a in cohort_assigns:
-            result = await self.fga.check(
+            exists = await self.fga.tuple_exists(
                 user=f"user:{a['researcher_id']}",
                 relation="assigned_researcher",
                 object=f"clinical_trial:{a['trial_id']}",
             )
-            if not result.allowed:
+            if not exists:
                 logger.warning(
                     f"RECONCILE: Missing cohort tuple user:{a['researcher_id']} "
                     f"→ assigned_researcher → trial:{a['trial_id']}"
                 )
-                success = await self.fga.write_tuples([{
+                ceiling_context = await self._load_trial_ceiling_context(
+                    a["organization_id"],
+                    a["trial_id"],
+                )
+                if not ceiling_context:
+                    logger.warning(
+                        "RECONCILE: Skipping cohort trial rebuild without active org ceiling: "
+                        "user:%s trial:%s org:%s",
+                        a["researcher_id"],
+                        a["trial_id"],
+                        a["organization_id"],
+                    )
+                    continue
+                success = await self.fga.write_conditional_tuples([{
                     "user": f"user:{a['researcher_id']}",
                     "relation": "assigned_researcher",
                     "object": f"clinical_trial:{a['trial_id']}",
+                    "condition_name": "check_fine_grained_access",
+                    "condition_context": build_delegation_context_from_ceiling(
+                        ceiling_context,
+                        delegated_valid_until=a["expires_at"],
+                    ),
                 }])
                 if success:
                     added += 1
@@ -256,12 +381,12 @@ class ReconciliationService:
             )
 
             if still_active == 0:
-                result = await self.fga.check(
+                exists = await self.fga.tuple_exists(
                     user=f"user:{a['researcher_id']}",
                     relation="assigned_researcher",
                     object=f"clinical_trial:{a['trial_id']}",
                 )
-                if result.allowed:
+                if exists:
                     logger.warning(
                         f"RECONCILE: Stale tuple user:{a['researcher_id']} "
                         f"→ assigned_researcher → trial:{a['trial_id']}"

@@ -20,6 +20,40 @@ const accessColors: Record<string, string> = {
     no_access: 'border-gray-200 bg-white',
 };
 
+const DEFAULT_PURPOSE_OPTIONS = [
+    'clinical_research',
+    'regulatory_submission',
+    'safety_monitoring',
+    'pharmacovigilance',
+];
+
+function formatFilterCriteria(criteria?: MarketplaceCollection['filter_criteria']): string[] {
+    if (!criteria) return [];
+
+    const parts: string[] = [];
+    const mappings: Array<[string, string[] | undefined]> = [
+        ['Areas', criteria.therapeutic_areas],
+        ['Phases', criteria.phases],
+        ['Study Types', criteria.study_types],
+        ['Regions', criteria.regions],
+        ['Countries', criteria.countries],
+        ['Statuses', criteria.overall_statuses],
+        ['Sponsors', criteria.lead_sponsors],
+    ];
+
+    for (const [label, values] of mappings) {
+        if (values && values.length > 0) {
+            parts.push(`${label}: ${values.join(', ')}`);
+        }
+    }
+
+    if (criteria.min_enrollment !== undefined) {
+        parts.push(`Min Enrollment: ${criteria.min_enrollment}`);
+    }
+
+    return parts;
+}
+
 export default function Marketplace({ user }: Props) {
     const [collections, setCollections] = useState<MarketplaceCollection[]>([]);
     const [filtered, setFiltered] = useState<MarketplaceCollection[]>([]);
@@ -35,9 +69,16 @@ export default function Marketplace({ user }: Props) {
     const [requesting, setRequesting] = useState<MarketplaceCollection | null>(null);
     const [justification, setJustification] = useState('');
     const [duration, setDuration] = useState(365);
+    const [purposeOptions, setPurposeOptions] = useState<string[]>(DEFAULT_PURPOSE_OPTIONS);
+    const [selectedPurpose, setSelectedPurpose] = useState('');
     const [submitting, setSubmitting] = useState(false);
 
     useEffect(() => { loadMarketplace(); }, []);
+    useEffect(() => {
+        if (!selectedPurpose && purposeOptions.length > 0) {
+            setSelectedPurpose(purposeOptions[0]);
+        }
+    }, [purposeOptions, selectedPurpose]);
     useEffect(() => {
         const q = search.toLowerCase();
         setFiltered(q ? collections.filter(c =>
@@ -72,17 +113,36 @@ export default function Marketplace({ user }: Props) {
         }
     }
 
+    async function openRequestModal(collection: MarketplaceCollection) {
+        setRequesting(collection);
+        try {
+            const options = await managerApi.getRequestOptions(collection.collection_id);
+            const keys = options.purposes.map(p => p.purpose_key).filter(Boolean);
+            const resolved = keys.length > 0 ? keys : DEFAULT_PURPOSE_OPTIONS;
+            setPurposeOptions(resolved);
+            setSelectedPurpose(resolved[0] || '');
+        } catch {
+            setPurposeOptions(DEFAULT_PURPOSE_OPTIONS);
+            setSelectedPurpose(DEFAULT_PURPOSE_OPTIONS[0]);
+        }
+    }
+
     async function handleRequest() {
-        if (!requesting || !justification.trim()) return;
+        if (!requesting || !justification.trim() || !selectedPurpose) return;
         setSubmitting(true);
         try {
             await managerApi.requestAccess({
                 collection_id: requesting.collection_id,
                 justification,
                 requested_duration_days: duration,
+                scope: {
+                    approved_purposes: [selectedPurpose],
+                },
             });
             setRequesting(null);
             setJustification('');
+            setPurposeOptions(DEFAULT_PURPOSE_OPTIONS);
+            setSelectedPurpose(DEFAULT_PURPOSE_OPTIONS[0] || '');
             loadMarketplace();
         } catch (e: unknown) {
             setError(e instanceof Error ? e.message : 'Request failed');
@@ -97,6 +157,7 @@ export default function Marketplace({ user }: Props) {
 
     // Detail view
     if (detail) {
+        const detailCriteria = formatFilterCriteria(detail.collection.filter_criteria);
         return (
             <div>
                 <button onClick={() => setDetail(null)} className="flex items-center text-sm text-gray-500 hover:text-gray-700 mb-4">
@@ -113,6 +174,18 @@ export default function Marketplace({ user }: Props) {
                     <div className="mt-4 p-3 bg-gray-50 rounded-lg">
                         <p className="text-sm font-medium">Your Access: {detail.access.granted_count}/{detail.access.total_count} trials granted</p>
                     </div>
+                    {detailCriteria.length > 0 && (
+                        <div className="mt-4 rounded-lg border border-gray-200 bg-white p-4">
+                            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Filter Criteria</p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                                {detailCriteria.map(item => (
+                                    <span key={item} className="rounded-full bg-blue-50 px-2.5 py-1 text-xs text-blue-700">
+                                        {item}
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                 </div>
                 <div className="bg-white rounded-lg shadow overflow-hidden">
                     <table className="min-w-full divide-y divide-gray-200">
@@ -168,13 +241,18 @@ export default function Marketplace({ user }: Props) {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {filtered.map(c => {
                     const Icon = c.therapeutic_areas?.[0] ? (areaIcons[c.therapeutic_areas[0]] || Package) : Package;
+                    const filterCriteria = formatFilterCriteria(c.filter_criteria);
                     return (
                         <div key={c.collection_id} className={`rounded-lg shadow border-l-4 overflow-hidden ${accessColors[c.access_status]}`}>
                             <div className="p-6">
                                 <div className="flex items-start justify-between mb-3">
                                     <div className="p-2 bg-white rounded-lg shadow-sm"><Icon className="h-6 w-6 text-indigo-600" /></div>
                                     <div className="flex items-center gap-2">
-                                        {c.is_dynamic && <Zap className="h-4 w-4 text-purple-500" title="Dynamic collection" />}
+                                        {c.is_dynamic && (
+                                            <span title="Dynamic collection">
+                                                <Zap className="h-4 w-4 text-purple-500" />
+                                            </span>
+                                        )}
                                         <StatusBadge status={c.sensitivity_level} />
                                     </div>
                                 </div>
@@ -189,20 +267,34 @@ export default function Marketplace({ user }: Props) {
                                     <span><Users className="h-3.5 w-3.5 inline mr-1" />{c.total_patients} patients</span>
                                     {c.regions?.length > 0 && <span><Globe className="h-3.5 w-3.5 inline mr-1" />{c.regions.join(', ')}</span>}
                                 </div>
+                                {filterCriteria.length > 0 && (
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                        {filterCriteria.slice(0, 4).map(item => (
+                                            <span key={item} className="rounded-full bg-white/80 px-2.5 py-1 text-xs text-gray-600 ring-1 ring-gray-200">
+                                                {item}
+                                            </span>
+                                        ))}
+                                        {filterCriteria.length > 4 && (
+                                            <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs text-gray-500">
+                                                +{filterCriteria.length - 4} more
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
                                 {c.drug_names?.length > 0 && (
                                     <p className="text-xs text-gray-400 mt-2">Drugs: {c.drug_names.slice(0, 5).join(', ')}{c.drug_names.length > 5 ? '...' : ''}</p>
                                 )}
                             </div>
                             <div className="px-6 py-3 bg-white/80 border-t border-gray-100 flex justify-between items-center">
                                 <button onClick={() => openDetail(c.collection_id)} className="text-xs text-indigo-600 hover:text-indigo-700 flex items-center">
-                                    View Details <ChevronRight className="h-3 w-3 ml-1" />
+                                    {loadingDetail && detail === null ? 'Loading...' : 'View Details'} <ChevronRight className="h-3 w-3 ml-1" />
                                 </button>
                                 {c.access_status === 'full_access' ? (
                                     <span className="flex items-center text-xs text-green-700 font-medium"><CheckCircle className="h-4 w-4 mr-1" />Full Access</span>
                                 ) : c.access_status === 'pending' ? (
                                     <span className="flex items-center text-xs text-blue-700 font-medium"><Clock className="h-4 w-4 mr-1" />Pending</span>
                                 ) : (
-                                    <button onClick={() => setRequesting(c)}
+                                    <button onClick={() => openRequestModal(c)}
                                         className="flex items-center space-x-1 px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium">
                                         <Lock className="h-3.5 w-3.5" /><span>Request Access</span>
                                     </button>
@@ -240,11 +332,33 @@ export default function Marketplace({ user }: Props) {
                                     <option value={730}>2 years</option>
                                 </select>
                             </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Purpose <span className="text-red-500">*</span>
+                                </label>
+                                <select
+                                    value={selectedPurpose}
+                                    onChange={e => setSelectedPurpose(e.target.value)}
+                                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                                >
+                                    {(purposeOptions.length ? purposeOptions : DEFAULT_PURPOSE_OPTIONS).map(p => (
+                                        <option key={p} value={p}>{p}</option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    This becomes scope.approved_purposes on the access request.
+                                </p>
+                            </div>
                         </div>
                         <div className="flex justify-end space-x-3 mt-6">
-                            <button onClick={() => { setRequesting(null); setJustification(''); }}
+                            <button onClick={() => {
+                                setRequesting(null);
+                                setJustification('');
+                                setPurposeOptions(DEFAULT_PURPOSE_OPTIONS);
+                                setSelectedPurpose(DEFAULT_PURPOSE_OPTIONS[0] || '');
+                            }}
                                 className="px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded-lg">Cancel</button>
-                            <button onClick={handleRequest} disabled={submitting || justification.length < 20}
+                            <button onClick={handleRequest} disabled={submitting || justification.length < 20 || !selectedPurpose}
                                 className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50">
                                 {submitting ? 'Submitting...' : 'Submit Request'}
                             </button>

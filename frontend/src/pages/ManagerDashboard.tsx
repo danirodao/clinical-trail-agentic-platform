@@ -1,15 +1,51 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { UserProfile } from '../keycloak';
 import { managerApi, AccessGrant, Cohort, Assignment } from '../api/client';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
 import {
-    ShoppingBag, Users, FlaskConical, Shield,
-    Plus, UserPlus, AlertTriangle
+    ShoppingBag, Users, FlaskConical,
+    UserPlus, AlertTriangle, Lock
 } from 'lucide-react';
 
 interface Props { user: UserProfile }
+
+type AssignmentScopeKey = 'region' | 'area' | 'phase' | 'purpose';
+type AssignmentScopeState = Record<AssignmentScopeKey, string[]>;
+type AssignmentScopeOptionConfig = Record<AssignmentScopeKey, {
+    options: string[];
+    constrained: boolean;
+    constrainedTrials: number;
+    totalTrials: number;
+}>;
+type TrialScopeEntry = {
+    raw: Record<string, unknown>;
+    effective: Record<string, unknown>;
+};
+
+const RESTRICTION_LABELS: Record<string, string> = {
+    permitted_regions: 'Regions',
+    regions: 'Regions',
+    region: 'Regions',
+    permitted_areas: 'Therapeutic Areas',
+    therapeutic_areas: 'Therapeutic Areas',
+    areas: 'Therapeutic Areas',
+    area: 'Therapeutic Areas',
+    permitted_phases: 'Phases',
+    phases: 'Phases',
+    phase: 'Phase',
+    approved_purposes: 'Purposes',
+    purposes: 'Purposes',
+    purpose: 'Purpose',
+    minimum_cohort_size: 'Min Cohort Size',
+    resource_classification: 'Classification',
+    age_min: 'Min Age',
+    age_max: 'Max Age',
+    sex: 'Sex',
+    ethnicity: 'Ethnicity',
+    country: 'Country',
+};
 
 export default function ManagerDashboard({ user }: Props) {
     const [grants, setGrants] = useState<AccessGrant[]>([]);
@@ -28,6 +64,17 @@ export default function ManagerDashboard({ user }: Props) {
         access_level: 'individual' as 'individual' | 'aggregate',
         duration_days: 180,
     });
+    const [assignmentScope, setAssignmentScope] = useState<AssignmentScopeState>({
+        region: [],
+        area: [],
+        phase: [],
+        purpose: [],
+    });
+    const [visiblePatientsBaseline, setVisiblePatientsBaseline] = useState<number | null>(null);
+    const [visiblePatientsCurrent, setVisiblePatientsCurrent] = useState<number | null>(null);
+    const [visiblePatientsTrialCount, setVisiblePatientsTrialCount] = useState<number>(0);
+    const [visiblePatientsLoading, setVisiblePatientsLoading] = useState(false);
+    const [visiblePatientsError, setVisiblePatientsError] = useState('');
 
     useEffect(() => { loadAll(); }, []);
 
@@ -51,6 +98,276 @@ export default function ManagerDashboard({ user }: Props) {
         return `Cohort ${shortId(cohortId)}`;
     };
 
+    const toTitle = (rawKey: string) =>
+        RESTRICTION_LABELS[rawKey]
+        ?? rawKey
+            .split('_')
+            .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+
+    const buildRestrictionTags = (source?: Record<string, unknown>) => {
+        if (!source) return [] as string[];
+        return Object.entries(source).flatMap(([key, value]) => {
+            if (value === null || value === undefined) return [];
+            if (Array.isArray(value)) {
+                const cleaned = value.map((v) => String(v).trim()).filter(Boolean);
+                if (cleaned.length === 0) return [];
+                return [`${toTitle(key)}: ${cleaned.join(', ')}`];
+            }
+            if (typeof value === 'boolean') {
+                return [`${toTitle(key)}: ${value ? 'Yes' : 'No'}`];
+            }
+            if (typeof value === 'string' || typeof value === 'number') {
+                const text = String(value).trim();
+                if (!text) return [];
+                return [`${toTitle(key)}: ${text}`];
+            }
+            return [];
+        });
+    };
+
+    const assignmentRestrictionTags = (assignment: Assignment) => {
+        const merged = new Set<string>([
+            ...buildRestrictionTags(assignment.assignment_scope),
+            ...buildRestrictionTags(assignment.trial_grant_scope),
+            ...buildRestrictionTags(assignment.cohort_grant_scope),
+            ...buildRestrictionTags(assignment.cohort_filter_criteria as Record<string, unknown> | undefined),
+        ]);
+        return Array.from(merged);
+    };
+
+    const getScopeValues = (scope: Record<string, unknown> | undefined, keys: string[]) => {
+        if (!scope) return [] as string[];
+        const values = new Set<string>();
+        keys.forEach((key) => {
+            const value = scope[key];
+            if (Array.isArray(value)) {
+                value
+                    .map((item) => String(item).trim())
+                    .filter(Boolean)
+                    .forEach((item) => values.add(item));
+                return;
+            }
+            if (typeof value === 'string' || typeof value === 'number') {
+                const text = String(value).trim();
+                if (text) values.add(text);
+            }
+        });
+        return Array.from(values).sort((a, b) => a.localeCompare(b));
+    };
+
+    const hasAnyScopeKey = (scope: Record<string, unknown> | undefined, keys: string[]) => {
+        if (!scope) return false;
+        return keys.some((key) => Object.prototype.hasOwnProperty.call(scope, key));
+    };
+
+    const intersectOptions = (all: string[][]) => {
+        if (all.length === 0) return [] as string[];
+        const sets = all.map((vals) => new Set(vals));
+        const first = all[0] ?? [];
+        return first.filter((item) => sets.every((s) => s.has(item))).sort((a, b) => a.localeCompare(b));
+    };
+
+    const buildDimensionOptionConfig = (
+        trialScopeEntries: TrialScopeEntry[],
+        keys: string[],
+    ) => {
+        const constrainedEntries = trialScopeEntries.filter((entry) => hasAnyScopeKey(entry.raw, keys));
+
+        if (constrainedEntries.length > 0) {
+            return {
+                options: intersectOptions(
+                    constrainedEntries
+                        .map((entry) => getScopeValues(entry.effective, keys))
+                        .filter((values) => values.length > 0),
+                ),
+                constrained: true,
+                constrainedTrials: constrainedEntries.length,
+                totalTrials: trialScopeEntries.length,
+            };
+        }
+
+        const unconstrainedOptions = intersectOptions(
+            trialScopeEntries
+                .map((entry) => getScopeValues(entry.effective, keys))
+                .filter((values) => values.length > 0),
+        );
+
+        if (trialScopeEntries.length === 0) {
+            return {
+                options: [] as string[],
+                constrained: false,
+                constrainedTrials: 0,
+                totalTrials: 0,
+            };
+        }
+
+        return {
+            options: unconstrainedOptions,
+            constrained: false,
+            constrainedTrials: 0,
+            totalTrials: trialScopeEntries.length,
+        };
+    };
+
+    const buildEffectiveScopeForGrant = (grant: AccessGrant): Record<string, unknown> => {
+        const scope: Record<string, unknown> = { ...(grant.scope || {}) };
+
+        if (!hasAnyScopeKey(scope, ['permitted_regions', 'regions', 'region']) && (grant.trial_regions?.length ?? 0) > 0) {
+            scope.regions = (grant.trial_regions || []).filter((v) => String(v).trim());
+        }
+
+        if (!hasAnyScopeKey(scope, ['permitted_phases', 'phases', 'phase']) && (grant.trial_phases?.length ?? 0) > 0) {
+            scope.phases = (grant.trial_phases || []).filter((v) => String(v).trim());
+        }
+
+        if (!hasAnyScopeKey(scope, ['permitted_areas', 'therapeutic_areas', 'areas', 'area']) && grant.trial_therapeutic_area) {
+            scope.therapeutic_areas = [grant.trial_therapeutic_area];
+        }
+
+        return scope;
+    };
+
+    const assignmentScopeOptions = useMemo<AssignmentScopeOptionConfig>(() => {
+        const trialScopeEntries: TrialScopeEntry[] = [];
+        if (assignForm.trial_id) {
+            const grant = grants.find((g) => g.trial_id === assignForm.trial_id && g.is_active);
+            if (grant) {
+                trialScopeEntries.push({
+                    raw: { ...(grant.scope || {}) },
+                    effective: buildEffectiveScopeForGrant(grant),
+                });
+            }
+        }
+        if (assignForm.cohort_id) {
+            const cohort = cohorts.find((c) => c.cohort_id === assignForm.cohort_id);
+            if (cohort) {
+                cohort.trial_ids.forEach((tid) => {
+                    const grant = grants.find((g) => g.trial_id === tid && g.is_active);
+                    if (grant) {
+                        trialScopeEntries.push({
+                            raw: { ...(grant.scope || {}) },
+                            effective: buildEffectiveScopeForGrant(grant),
+                        });
+                    }
+                });
+            }
+        }
+
+        return {
+            region: buildDimensionOptionConfig(trialScopeEntries, ['permitted_regions', 'regions', 'region']),
+            area: buildDimensionOptionConfig(trialScopeEntries, ['permitted_areas', 'therapeutic_areas', 'areas', 'area']),
+            phase: buildDimensionOptionConfig(trialScopeEntries, ['permitted_phases', 'phases', 'phase']),
+            purpose: buildDimensionOptionConfig(trialScopeEntries, ['approved_purposes', 'purposes', 'purpose']),
+        };
+    }, [assignForm.cohort_id, assignForm.trial_id, cohorts, grants]);
+
+    useEffect(() => {
+        setAssignmentScope((prev) => ({
+            region: assignmentScopeOptions.region.constrained
+                ? [...assignmentScopeOptions.region.options]
+                : prev.region.filter((v) => assignmentScopeOptions.region.options.includes(v)),
+            area: assignmentScopeOptions.area.constrained
+                ? [...assignmentScopeOptions.area.options]
+                : prev.area.filter((v) => assignmentScopeOptions.area.options.includes(v)),
+            phase: assignmentScopeOptions.phase.constrained
+                ? [...assignmentScopeOptions.phase.options]
+                : prev.phase.filter((v) => assignmentScopeOptions.phase.options.includes(v)),
+            purpose: assignmentScopeOptions.purpose.constrained
+                ? [...assignmentScopeOptions.purpose.options]
+                : prev.purpose.filter((v) => assignmentScopeOptions.purpose.options.includes(v)),
+        }));
+    }, [assignmentScopeOptions]);
+
+    const toggleScopeValue = (scopeKey: AssignmentScopeKey, value: string) => {
+        if (assignmentScopeOptions[scopeKey].constrained) {
+            return;
+        }
+        setAssignmentScope((prev) => {
+            const values = prev[scopeKey];
+            const exists = values.includes(value);
+            return {
+                ...prev,
+                [scopeKey]: exists
+                    ? values.filter((v) => v !== value)
+                    : [...values, value],
+            };
+        });
+    };
+
+    const buildAssignmentScopePayload = () => {
+        const assignmentScopePayload: Partial<AssignmentScopeState> = {};
+        (['region', 'area', 'phase', 'purpose'] as AssignmentScopeKey[]).forEach((key) => {
+            if (!assignmentScopeOptions[key].constrained && assignmentScope[key].length > 0) {
+                assignmentScopePayload[key] = assignmentScope[key];
+            }
+        });
+        const hasAssignmentScope = Object.values(assignmentScopePayload).some((v) => (v?.length ?? 0) > 0);
+        if (!hasAssignmentScope || assignForm.access_level !== 'individual') {
+            return undefined;
+        }
+        return {
+            region: assignmentScopePayload.region,
+            area: assignmentScopePayload.area,
+            phase: assignmentScopePayload.phase,
+            purpose: assignmentScopePayload.purpose,
+        };
+    };
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function loadVisiblePatientsPreview() {
+            if (!showAssign || (!assignForm.trial_id && !assignForm.cohort_id)) {
+                setVisiblePatientsBaseline(null);
+                setVisiblePatientsCurrent(null);
+                setVisiblePatientsTrialCount(0);
+                setVisiblePatientsError('');
+                return;
+            }
+
+            setVisiblePatientsLoading(true);
+            setVisiblePatientsError('');
+
+            try {
+                const basePayload = {
+                    trial_id: assignForm.trial_id || undefined,
+                    cohort_id: assignForm.cohort_id || undefined,
+                    duration_days: assignForm.duration_days,
+                };
+                const narrowedScopePayload = buildAssignmentScopePayload();
+
+                const [base, narrowed] = await Promise.all([
+                    managerApi.previewAssignmentVisiblePatients(basePayload),
+                    narrowedScopePayload
+                        ? managerApi.previewAssignmentVisiblePatients({ ...basePayload, assignment_scope: narrowedScopePayload })
+                        : Promise.resolve(null),
+                ]);
+
+                if (cancelled) return;
+                setVisiblePatientsBaseline(base.visible_patient_count ?? 0);
+                setVisiblePatientsCurrent(narrowed?.visible_patient_count ?? base.visible_patient_count ?? 0);
+                setVisiblePatientsTrialCount(base.trial_count ?? 0);
+            } catch (e: unknown) {
+                if (cancelled) return;
+                setVisiblePatientsBaseline(null);
+                setVisiblePatientsCurrent(null);
+                setVisiblePatientsTrialCount(0);
+                setVisiblePatientsError(e instanceof Error ? e.message : 'Unable to compute visible patients');
+            } finally {
+                if (!cancelled) {
+                    setVisiblePatientsLoading(false);
+                }
+            }
+        }
+
+        loadVisiblePatientsPreview();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [assignForm.access_level, assignForm.cohort_id, assignForm.duration_days, assignForm.trial_id, assignmentScope, assignmentScopeOptions, showAssign]);
+
     async function loadAll() {
         setLoading(true);
         try {
@@ -71,14 +388,21 @@ export default function ManagerDashboard({ user }: Props) {
 
     async function handleAssign() {
         try {
+            const narrowedScopePayload = buildAssignmentScopePayload();
             await managerApi.assignResearcher({
                 researcher_username: assignForm.researcher_username,
                 trial_id: assignForm.trial_id || undefined,
                 cohort_id: assignForm.cohort_id || undefined,
                 access_level: assignForm.access_level,
                 duration_days: assignForm.duration_days,
+                assignment_scope: narrowedScopePayload,
             });
             setShowAssign(false);
+            setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+            setVisiblePatientsBaseline(null);
+            setVisiblePatientsCurrent(null);
+            setVisiblePatientsTrialCount(0);
+            setVisiblePatientsError('');
             loadAll();
         } catch (e: unknown) {
             setError(e instanceof Error ? e.message : 'Assignment failed');
@@ -119,7 +443,10 @@ export default function ManagerDashboard({ user }: Props) {
                         <span>Build Cohort</span>
                     </Link>
                     <button
-                        onClick={() => setShowAssign(true)}
+                        onClick={() => {
+                            setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+                            setShowAssign(true);
+                        }}
                         className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
                     >
                         <UserPlus className="h-4 w-4" />
@@ -188,14 +515,33 @@ export default function ManagerDashboard({ user }: Props) {
                         />
                     ) : (
                         grants.map((g) => (
-                            <div key={g.grant_id} className="bg-white rounded-lg shadow p-6 flex justify-between items-center">
+                            <div key={g.grant_id} className="bg-white rounded-lg shadow p-6 flex justify-between items-start gap-6">
                                 <div>
-                                    <h3 className="font-medium text-gray-900">{g.asset_title}</h3>
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                        <h3 className="font-medium text-gray-900">{g.asset_title}</h3>
+                                        <span className="text-xs bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded-full">
+                                            {buildRestrictionTags(g.scope).length} restriction{buildRestrictionTags(g.scope).length !== 1 ? 's' : ''}
+                                        </span>
+                                    </div>
                                     <p className="text-sm text-gray-500">
                                         Granted: {new Date(g.granted_at).toLocaleDateString()}
                                         {' · Expires: '}
                                         {new Date(g.expires_at).toLocaleDateString()}
                                     </p>
+                                    <p className="text-sm text-gray-600 mt-1">
+                                        Visible Patients Under Grant Scope: <span className="font-semibold">{g.permitted_patient_count ?? 0}</span>
+                                    </p>
+                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                        {buildRestrictionTags(g.scope).length > 0 ? (
+                                            buildRestrictionTags(g.scope).map((tag) => (
+                                                <span key={`${g.grant_id}-${tag}`} className="text-xs bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100">
+                                                    {tag}
+                                                </span>
+                                            ))
+                                        ) : (
+                                            <span className="text-xs text-gray-500">No additional restrictions</span>
+                                        )}
+                                    </div>
                                 </div>
                                 <StatusBadge status={g.is_active ? 'active' : 'expired'} />
                             </div>
@@ -235,6 +581,23 @@ export default function ManagerDashboard({ user }: Props) {
                                             </span>
                                             <StatusBadge status={c.is_dynamic ? 'dynamic' : 'static'} />
                                         </div>
+                                        <div className="mt-3">
+                                            <p className="text-xs font-semibold text-gray-700 mb-1">Assigned Trials</p>
+                                            {c.trial_ids.length > 0 ? (
+                                                <div className="flex flex-wrap gap-1.5">
+                                                    {c.trial_ids.map((trialId) => (
+                                                        <span
+                                                            key={`${c.cohort_id}-trial-${trialId}`}
+                                                            className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded border border-blue-100"
+                                                        >
+                                                            {resolveTrialLabel(trialId)}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            ) : (
+                                                <p className="text-xs text-gray-500">No trials assigned</p>
+                                            )}
+                                        </div>
                                         {/* Filter Details */}
                                         <div className="mt-3 flex flex-wrap gap-2">
                                             {c.filter_criteria && Object.entries(c.filter_criteria).map(([key, value]) => {
@@ -268,6 +631,7 @@ export default function ManagerDashboard({ user }: Props) {
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Researcher</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Trial / Cohort</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Access Level</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Visible Patients</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expires</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                             </tr>
@@ -277,13 +641,34 @@ export default function ManagerDashboard({ user }: Props) {
                                 <tr key={a.assignment_id} className="hover:bg-gray-50">
                                     <td className="px-6 py-4 text-sm font-medium text-gray-900">{a.researcher_id}</td>
                                     <td className="px-6 py-4 text-sm text-gray-700">
-                                        {a.trial_id
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            <p>
+                                            {a.trial_id
                                             ? `Trial: ${resolveTrialLabel(a.trial_id)}`
                                             : `Cohort: ${resolveCohortLabel(a.cohort_id)}`}
+                                            </p>
+                                            <span className="text-xs bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded-full">
+                                                {assignmentRestrictionTags(a).length} restriction{assignmentRestrictionTags(a).length !== 1 ? 's' : ''}
+                                            </span>
+                                        </div>
+                                        <div className="mt-2 flex flex-wrap gap-1.5">
+                                            {assignmentRestrictionTags(a).length > 0 ? (
+                                                assignmentRestrictionTags(a).map((tag) => (
+                                                    <span key={`${a.assignment_id}-${tag}`} className="text-xs bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100">
+                                                        {tag}
+                                                    </span>
+                                                ))
+                                            ) : (
+                                                <span className="text-xs text-gray-500">No additional restrictions</span>
+                                            )}
+                                        </div>
                                     </td>
                                     <td className="px-6 py-4">
                                         <StatusBadge status={a.access_level === 'individual' ? 'sensitive' : 'standard'} />
                                         <span className="ml-2 text-sm text-gray-600">{a.access_level}</span>
+                                    </td>
+                                    <td className="px-6 py-4 text-sm text-gray-700 font-medium">
+                                        {a.visible_patient_count ?? 0}
                                     </td>
                                     <td className="px-6 py-4 text-sm text-gray-500">
                                         {new Date(a.expires_at).toLocaleDateString()}
@@ -327,7 +712,10 @@ export default function ManagerDashboard({ user }: Props) {
                                 </label>
                                 <div className="flex rounded-lg border border-gray-300 overflow-hidden">
                                     <button
-                                        onClick={() => setAssignForm({ ...assignForm, trial_id: '', cohort_id: '' })}
+                                        onClick={() => {
+                                            setAssignForm({ ...assignForm, trial_id: '', cohort_id: '' });
+                                            setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+                                        }}
                                         className={`flex-1 py-2 text-sm font-medium transition-colors ${!assignForm.cohort_id && !assignForm.trial_id || assignForm.trial_id
                                             ? 'bg-blue-600 text-white'
                                             : 'bg-white text-gray-700 hover:bg-gray-50'
@@ -336,7 +724,10 @@ export default function ManagerDashboard({ user }: Props) {
                                         🧪 Clinical Trial
                                     </button>
                                     <button
-                                        onClick={() => setAssignForm({ ...assignForm, trial_id: '', cohort_id: cohorts[0]?.cohort_id || '' })}
+                                        onClick={() => {
+                                            setAssignForm({ ...assignForm, trial_id: '', cohort_id: cohorts[0]?.cohort_id || '' });
+                                            setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+                                        }}
                                         className={`flex-1 py-2 text-sm font-medium transition-colors border-l border-gray-300 ${assignForm.cohort_id && !assignForm.trial_id
                                             ? 'bg-blue-600 text-white'
                                             : 'bg-white text-gray-700 hover:bg-gray-50'
@@ -360,7 +751,10 @@ export default function ManagerDashboard({ user }: Props) {
                                     ) : (
                                         <select
                                             value={assignForm.trial_id}
-                                            onChange={(e) => setAssignForm({ ...assignForm, trial_id: e.target.value, cohort_id: '' })}
+                                            onChange={(e) => {
+                                                setAssignForm({ ...assignForm, trial_id: e.target.value, cohort_id: '' });
+                                                setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+                                            }}
                                             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
                                         >
                                             <option value="">Select a trial...</option>
@@ -387,7 +781,10 @@ export default function ManagerDashboard({ user }: Props) {
                                     ) : (
                                         <select
                                             value={assignForm.cohort_id}
-                                            onChange={(e) => setAssignForm({ ...assignForm, cohort_id: e.target.value, trial_id: '' })}
+                                            onChange={(e) => {
+                                                setAssignForm({ ...assignForm, cohort_id: e.target.value, trial_id: '' });
+                                                setAssignmentScope({ region: [], area: [], phase: [], purpose: [] });
+                                            }}
                                             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
                                         >
                                             <option value="">Select a cohort...</option>
@@ -449,6 +846,100 @@ export default function ManagerDashboard({ user }: Props) {
                                 <strong>Individual</strong> — researcher can access patient-level records (names, labs, vitals).<br />
                                 <strong>Aggregate</strong> — researcher can only see counts and statistical summaries.
                             </p>
+
+                            {(assignForm.trial_id || assignForm.cohort_id) && (
+                                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+                                    {visiblePatientsLoading ? (
+                                        <p>Calculating visible patients...</p>
+                                    ) : visiblePatientsError ? (
+                                        <p className="text-amber-700">{visiblePatientsError}</p>
+                                    ) : (
+                                        <div className="space-y-1">
+                                            <p>
+                                                Visible under current org ceiling: <span className="font-semibold">{visiblePatientsBaseline ?? 0}</span>
+                                                {visiblePatientsTrialCount > 0 ? ` across ${visiblePatientsTrialCount} trial${visiblePatientsTrialCount !== 1 ? 's' : ''}` : ''}
+                                            </p>
+                                            <p>
+                                                Visible after assignment filters: <span className="font-semibold">{visiblePatientsCurrent ?? visiblePatientsBaseline ?? 0}</span>
+                                            </p>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {assignForm.access_level === 'individual' && (assignForm.trial_id || assignForm.cohort_id) && (
+                                <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3 space-y-3">
+                                    <div>
+                                        <p className="text-sm font-medium text-indigo-900">Optional Assignment Scope (subset of org ceiling)</p>
+                                        <p className="text-xs text-indigo-700">
+                                            Ceiling-defined values are preselected and locked. For unconstrained dimensions, you can pick stricter values.
+                                        </p>
+                                        <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                            <span className="inline-flex items-center gap-1 rounded border border-slate-300 bg-slate-200 px-2 py-0.5 text-slate-700">
+                                                <Lock className="h-3 w-3" /> Ceiling locked
+                                            </span>
+                                            <span className="inline-flex items-center gap-1 rounded border border-indigo-300 bg-white px-2 py-0.5 text-indigo-700">
+                                                Manager selectable
+                                            </span>
+                                        </div>
+                                    </div>
+                                    {([
+                                        ['region', 'Regions'],
+                                        ['area', 'Therapeutic Areas'],
+                                        ['phase', 'Phases'],
+                                        ['purpose', 'Purposes'],
+                                    ] as Array<[AssignmentScopeKey, string]>).map(([key, label]) => (
+                                        <div key={key}>
+                                            <p className="text-xs font-semibold text-indigo-800 mb-1">{label}</p>
+                                            {assignmentScopeOptions[key].totalTrials > 0 && (
+                                                <p className="text-xs text-indigo-700 mb-1">
+                                                    Derived from {assignmentScopeOptions[key].constrainedTrials} constrained trial{assignmentScopeOptions[key].constrainedTrials !== 1 ? 's' : ''}
+                                                    {assignmentScopeOptions[key].totalTrials > assignmentScopeOptions[key].constrainedTrials
+                                                        ? ` (${assignmentScopeOptions[key].totalTrials - assignmentScopeOptions[key].constrainedTrials} unconstrained)`
+                                                        : ''}
+                                                </p>
+                                            )}
+                                            {assignmentScopeOptions[key].options.length === 0 ? (
+                                                <p className="text-xs text-indigo-600">No options available for this dimension</p>
+                                            ) : (
+                                                <div className="flex flex-wrap gap-2">
+                                                    {assignmentScopeOptions[key].options.map((value) => {
+                                                        const selected = assignmentScope[key].includes(value);
+                                                        const isLocked = assignmentScopeOptions[key].constrained;
+                                                        return (
+                                                            <button
+                                                                key={`${key}-${value}`}
+                                                                type="button"
+                                                                onClick={() => toggleScopeValue(key, value)}
+                                                                disabled={isLocked}
+                                                                className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded border ${isLocked
+                                                                    ? 'bg-slate-200 text-slate-700 border-slate-300 cursor-not-allowed'
+                                                                    : selected
+                                                                        ? 'bg-indigo-600 text-white border-indigo-600'
+                                                                        : 'bg-white text-indigo-700 border-indigo-300 hover:bg-indigo-100'
+                                                                    }`}
+                                                            >
+                                                                {isLocked && <Lock className="h-3 w-3" />}
+                                                                {value}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                            {assignmentScopeOptions[key].constrained && assignmentScopeOptions[key].options.length > 0 && (
+                                                <p className="mt-1 text-xs text-indigo-700">
+                                                    Predefined by org ceiling: locked by default and cannot be removed.
+                                                </p>
+                                            )}
+                                        </div>
+                                    ))}
+                                    <div className="text-xs text-indigo-700">
+                                        Selected scope: {Object.entries(assignmentScope)
+                                            .flatMap(([k, v]) => (v.length > 0 ? [`${k}=${v.join(', ')}`] : []))
+                                            .join(' · ') || 'Full org-granted scope'}
+                                    </div>
+                                </div>
+                            )}
                         </div>
 
                         <div className="flex justify-end space-x-3 mt-6">

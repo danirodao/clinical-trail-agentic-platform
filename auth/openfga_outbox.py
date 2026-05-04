@@ -35,6 +35,8 @@ async def ensure_outbox_schema(db_pool: asyncpg.Pool) -> None:
             tuple_user TEXT NOT NULL,
             tuple_relation TEXT NOT NULL,
             tuple_object TEXT NOT NULL,
+            condition_name TEXT,
+            condition_context JSONB,
             status VARCHAR(20) NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'processing', 'failed', 'applied', 'dead')),
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -60,15 +62,48 @@ async def ensure_outbox_schema(db_pool: asyncpg.Pool) -> None:
         ON openfga_tuple_outbox (correlation_id)
         """
     )
+    await db_pool.execute(
+        """
+        ALTER TABLE openfga_tuple_outbox
+        ADD COLUMN IF NOT EXISTS condition_name TEXT
+        """
+    )
+    await db_pool.execute(
+        """
+        ALTER TABLE openfga_tuple_outbox
+        ADD COLUMN IF NOT EXISTS condition_context JSONB
+        """
+    )
+    await db_pool.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_openfga_outbox_conditional
+        ON openfga_tuple_outbox (condition_name)
+        """
+    )
 
 
-def _validate_tuple(t: dict) -> tuple[str, str, str]:
+def _validate_tuple(t: dict) -> tuple[str, str, str, Optional[str], Optional[dict]]:
     user = t.get("user")
     relation = t.get("relation")
     obj = t.get("object")
     if not user or not relation or not obj:
         raise ValueError(f"Invalid tuple payload: {t}")
-    return str(user), str(relation), str(obj)
+    condition_name = t.get("condition_name")
+    condition_context = t.get("condition_context")
+
+    if condition_name is not None and not isinstance(condition_name, str):
+        raise ValueError("condition_name must be a string when provided")
+
+    if condition_context is not None and not isinstance(condition_context, dict):
+        raise ValueError("condition_context must be a dict when provided")
+
+    return (
+        str(user),
+        str(relation),
+        str(obj),
+        str(condition_name).strip() if isinstance(condition_name, str) and condition_name.strip() else None,
+        condition_context,
+    )
 
 
 async def enqueue_tuples(
@@ -86,14 +121,34 @@ async def enqueue_tuples(
 
     rows = []
     for t in tuples:
-        user, relation, obj = _validate_tuple(t)
-        rows.append((operation, user, relation, obj, source, correlation_id))
+        user, relation, obj, condition_name, condition_context = _validate_tuple(t)
+        rows.append(
+            (
+                operation,
+                user,
+                relation,
+                obj,
+                condition_name,
+                condition_context,
+                source,
+                correlation_id,
+            )
+        )
 
     await conn.executemany(
         """
         INSERT INTO openfga_tuple_outbox
-            (operation, tuple_user, tuple_relation, tuple_object, source, correlation_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (
+                operation,
+                tuple_user,
+                tuple_relation,
+                tuple_object,
+                condition_name,
+                condition_context,
+                source,
+                correlation_id
+            )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """,
         rows,
     )
@@ -157,7 +212,8 @@ class OpenFGAOutboxRelay:
             FROM picked
             WHERE o.id = picked.id
             RETURNING o.id, o.operation, o.tuple_user, o.tuple_relation,
-                      o.tuple_object, o.attempts
+                      o.tuple_object, o.condition_name, o.condition_context,
+                      o.attempts
             """,
             self.batch_size,
         )
@@ -179,7 +235,12 @@ class OpenFGAOutboxRelay:
                     f"(attempt {row['attempts']}/{self.max_attempts})"
                 )
                 if row["operation"] == "write":
-                    success = await self.fga.write_tuples([tuple_payload])
+                    if row["condition_name"]:
+                        tuple_payload["condition_name"] = row["condition_name"]
+                        tuple_payload["condition_context"] = row["condition_context"] or {}
+                        success = await self.fga.write_conditional_tuples([tuple_payload])
+                    else:
+                        success = await self.fga.write_tuples([tuple_payload])
                 else:
                     success = await self.fga.delete_tuples([tuple_payload])
 

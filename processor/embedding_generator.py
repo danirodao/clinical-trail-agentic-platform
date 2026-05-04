@@ -68,6 +68,8 @@ class ClinicalTrialEmbeddingGenerator:
             metadata={
                 "trial_id": trial_id,
                 "nct_id": nct_id,
+                "phase": trial_data.get("phase", ""),
+                "therapeutic_area": trial_data.get("therapeutic_area", ""),
                 "section": "design"
             }
         )
@@ -87,6 +89,8 @@ class ClinicalTrialEmbeddingGenerator:
                 metadata={
                     "trial_id": trial_id,
                     "nct_id": nct_id,
+                    "phase": trial_data.get("phase", ""),
+                    "therapeutic_area": trial_data.get("therapeutic_area", ""),
                     "criteria_type": crit.get("criteria_type", ""),
                     "section": "eligibility",
                     "criterion_index": i
@@ -103,6 +107,8 @@ class ClinicalTrialEmbeddingGenerator:
                 metadata={
                     "trial_id": trial_id,
                     "nct_id": nct_id,
+                    "phase": trial_data.get("phase", ""),
+                    "therapeutic_area": trial_data.get("therapeutic_area", ""),
                     "drug_name": interv.get("name", ""),
                     "rxnorm_code": interv.get("rxnorm_code", ""),
                     "section": "intervention"
@@ -118,6 +124,8 @@ class ClinicalTrialEmbeddingGenerator:
             metadata={
                 "trial_id": trial_id,
                 "nct_id": nct_id,
+                "phase": trial_data.get("phase", ""),
+                "therapeutic_area": trial_data.get("therapeutic_area", ""),
                 "section": "outcomes"
             }
         )
@@ -145,6 +153,8 @@ class ClinicalTrialEmbeddingGenerator:
                 "nct_id": nct_id,
                 "age": patient_data.get("age"),
                 "sex": patient_data.get("sex"),
+                "country": patient_data.get("country"),
+                "region": patient_data.get("region"),
                 "arm": patient_data.get("arm_assigned", ""),
                 "section": "patient_narrative"
             }
@@ -318,6 +328,14 @@ class ClinicalTrialEmbeddingGenerator:
             f"Arm: {patient_data.get('arm_assigned', 'N/A')}.",
             f"Status: {patient_data.get('disposition_status', 'N/A')}.",
         ]
+
+        country = patient_data.get('country')
+        region = patient_data.get('region')
+        if country or region:
+            geo = f"{country}" if country else ""
+            if region:
+                geo = f"{geo} ({region})" if geo else region
+            parts.append(f"Location: {geo}.")
 
         conditions = patient_data.get('conditions', [])
         if conditions:

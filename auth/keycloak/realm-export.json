@@ -176,6 +176,21 @@
                     }
                 },
                 {
+                    "name": "clearance-level-mapper",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-attribute-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "userinfo.token.claim": "true",
+                        "user.attribute": "clearance_level",
+                        "id.token.claim": "true",
+                        "access.token.claim": "true",
+                        "claim.name": "clearance_level",
+                        "jsonType.label": "int",
+                        "multivalued": "false"
+                    }
+                },
+                {
                     "name": "realm-roles-mapper",
                     "protocol": "openid-connect",
                     "protocolMapper": "oidc-usermodel-realm-role-mapper",
@@ -335,6 +350,9 @@
                 ],
                 "organization_name": [
                     "Clinical Trial Platform"
+                ],
+                "clearance_level": [
+                    "5"
                 ]
             }
         },
@@ -360,6 +378,9 @@
                 ],
                 "organization_name": [
                     "PharmaCorp Research"
+                ],
+                "clearance_level": [
+                    "4"
                 ]
             }
         },
@@ -385,6 +406,9 @@
                 ],
                 "organization_name": [
                     "PharmaCorp Research"
+                ],
+                "clearance_level": [
+                    "3"
                 ]
             }
         },
@@ -410,6 +434,9 @@
                 ],
                 "organization_name": [
                     "PharmaCorp Research"
+                ],
+                "clearance_level": [
+                    "3"
                 ]
             }
         },
@@ -435,6 +462,9 @@
                 ],
                 "organization_name": [
                     "BioTech Inc"
+                ],
+                "clearance_level": [
+                    "4"
                 ]
             }
         },
@@ -460,6 +490,9 @@
                 ],
                 "organization_name": [
                     "BioTech Inc"
+                ],
+                "clearance_level": [
+                    "3"
                 ]
             }
         }

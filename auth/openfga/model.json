@@ -1,5 +1,53 @@
 {
     "schema_version": "1.1",
+    "conditions": {
+        "check_fine_grained_access": {
+            "name": "check_fine_grained_access",
+            "expression": "current_time >= valid_from && current_time <= valid_until && requested_region in permitted_regions && requested_area in permitted_areas && requested_phase in permitted_phases && stated_purpose in approved_purposes && user_clearance_level >= resource_classification && actual_cohort_size >= minimum_cohort_size",
+            "parameters": {
+                "valid_from":              { "type_name": "TYPE_NAME_TIMESTAMP" },
+                "valid_until":             { "type_name": "TYPE_NAME_TIMESTAMP" },
+                "permitted_regions":       { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "permitted_areas":         { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "permitted_phases":        { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "approved_purposes":       { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "resource_classification": { "type_name": "TYPE_NAME_INT" },
+                "minimum_cohort_size":     { "type_name": "TYPE_NAME_INT" },
+                "current_time":            { "type_name": "TYPE_NAME_TIMESTAMP" },
+                "requested_region":        { "type_name": "TYPE_NAME_STRING" },
+                "requested_area":          { "type_name": "TYPE_NAME_STRING" },
+                "requested_phase":         { "type_name": "TYPE_NAME_STRING" },
+                "stated_purpose":          { "type_name": "TYPE_NAME_STRING" },
+                "user_clearance_level":    { "type_name": "TYPE_NAME_INT" },
+                "actual_cohort_size":      { "type_name": "TYPE_NAME_INT" }
+            }
+        },
+        "is_within_valid_period": {
+            "name": "is_within_valid_period",
+            "expression": "current_time >= valid_from && current_time <= valid_until",
+            "parameters": {
+                "valid_from":   { "type_name": "TYPE_NAME_TIMESTAMP" },
+                "valid_until":  { "type_name": "TYPE_NAME_TIMESTAMP" },
+                "current_time": { "type_name": "TYPE_NAME_TIMESTAMP" }
+            }
+        },
+        "is_permitted_region": {
+            "name": "is_permitted_region",
+            "expression": "requested_region in permitted_regions",
+            "parameters": {
+                "permitted_regions": { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "requested_region":  { "type_name": "TYPE_NAME_STRING" }
+            }
+        },
+        "is_approved_purpose": {
+            "name": "is_approved_purpose",
+            "expression": "stated_purpose in approved_purposes",
+            "parameters": {
+                "approved_purposes": { "type_name": "TYPE_NAME_LIST", "generic_types": [{ "type_name": "TYPE_NAME_STRING" }] },
+                "stated_purpose":    { "type_name": "TYPE_NAME_STRING" }
+            }
+        }
+    },
     "type_definitions": [
         {
             "type": "user"
@@ -7,88 +55,42 @@
         {
             "type": "organization",
             "relations": {
-                "member": {
-                    "this": {}
-                },
+                "member": { "this": {} },
                 "manager": {
                     "intersection": {
                         "child": [
-                            {
-                                "this": {}
-                            },
-                            {
-                                "computedUserset": {
-                                    "relation": "member"
-                                }
-                            }
+                            { "this": {} },
+                            { "computedUserset": { "relation": "member" } }
                         ]
                     }
                 },
-                "domain_owner": {
-                    "this": {}
-                }
+                "domain_owner": { "this": {} }
             },
             "metadata": {
                 "relations": {
-                    "member": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
-                    },
-                    "manager": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
-                    },
-                    "domain_owner": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
-                    }
+                    "member":       { "directly_related_user_types": [{ "type": "user" }] },
+                    "manager":      { "directly_related_user_types": [{ "type": "user" }] },
+                    "domain_owner": { "directly_related_user_types": [{ "type": "user" }] }
                 }
             }
         },
         {
             "type": "clinical_trial",
             "relations": {
-                "owner": {
-                    "this": {}
-                },
-                "granted_org": {
-                    "this": {}
-                },
-                "assigned_researcher": {
-                    "this": {}
-                },
+                "owner":               { "this": {} },
+                "granted_org":         { "this": {} },
+                "assigned_researcher": { "this": {} },
                 "can_view_aggregate": {
                     "tupleToUserset": {
-                        "tupleset": {
-                            "relation": "granted_org"
-                        },
-                        "computedUserset": {
-                            "relation": "member"
-                        }
+                        "tupleset":        { "relation": "granted_org" },
+                        "computedUserset": { "relation": "member" }
                     }
                 },
                 "can_view_individual": {
                     "union": {
                         "child": [
-                            {
-                                "computedUserset": {
-                                    "relation": "assigned_researcher"
-                                }
-                            },
-                            {
-                                "computedUserset": {
-                                    "relation": "owner"
-                                }
-                            }
+                            { "computedUserset": { "relation": "assigned_researcher" } },
+                            { "computedUserset": { "relation": "owner" } }
                         ]
                     }
                 }
@@ -96,165 +98,85 @@
             "metadata": {
                 "relations": {
                     "owner": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
+                        "directly_related_user_types": [{ "type": "user" }]
                     },
                     "granted_org": {
                         "directly_related_user_types": [
-                            {
-                                "type": "organization"
-                            }
+                            { "type": "organization", "condition": "check_fine_grained_access" }
                         ]
                     },
                     "assigned_researcher": {
                         "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
+                            { "type": "user", "condition": "check_fine_grained_access" }
                         ]
                     },
-                    "can_view_aggregate": {
-                        "directly_related_user_types": []
-                    },
-                    "can_view_individual": {
-                        "directly_related_user_types": []
-                    }
+                    "can_view_aggregate":  { "directly_related_user_types": [] },
+                    "can_view_individual": { "directly_related_user_types": [] }
                 }
             }
         },
         {
             "type": "patient",
             "relations": {
-                "enrolled_in_trial": {
-                    "this": {}
-                },
+                "enrolled_in_trial": { "this": {} },
                 "can_view_individual": {
                     "tupleToUserset": {
-                        "tupleset": {
-                            "relation": "enrolled_in_trial"
-                        },
-                        "computedUserset": {
-                            "relation": "can_view_individual"
-                        }
+                        "tupleset":        { "relation": "enrolled_in_trial" },
+                        "computedUserset": { "relation": "can_view_individual" }
                     }
                 }
             },
             "metadata": {
                 "relations": {
-                    "enrolled_in_trial": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "clinical_trial"
-                            }
-                        ]
-                    },
-                    "can_view_individual": {
-                        "directly_related_user_types": []
-                    }
+                    "enrolled_in_trial":   { "directly_related_user_types": [{ "type": "clinical_trial" }] },
+                    "can_view_individual": { "directly_related_user_types": [] }
                 }
             }
         },
         {
             "type": "cohort",
             "relations": {
-                "creator": {
-                    "this": {}
-                },
-                "owning_org": {
-                    "this": {}
-                },
-                "assigned_researcher": {
-                    "this": {}
-                },
-                "includes_trial": {
-                    "this": {}
-                },
+                "creator":             { "this": {} },
+                "owning_org":          { "this": {} },
+                "assigned_researcher": { "this": {} },
+                "includes_trial":      { "this": {} },
                 "can_access": {
                     "union": {
                         "child": [
-                            {
-                                "computedUserset": {
-                                    "relation": "assigned_researcher"
-                                }
-                            },
-                            {
-                                "computedUserset": {
-                                    "relation": "creator"
-                                }
-                            }
+                            { "computedUserset": { "relation": "assigned_researcher" } },
+                            { "computedUserset": { "relation": "creator" } }
                         ]
                     }
                 }
             },
             "metadata": {
                 "relations": {
-                    "creator": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
-                    },
-                    "owning_org": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "organization"
-                            }
-                        ]
-                    },
+                    "creator":    { "directly_related_user_types": [{ "type": "user" }] },
+                    "owning_org": { "directly_related_user_types": [{ "type": "organization" }] },
                     "assigned_researcher": {
                         "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
+                            { "type": "user", "condition": "check_fine_grained_access" }
                         ]
                     },
-                    "includes_trial": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "clinical_trial"
-                            }
-                        ]
-                    },
-                    "can_access": {
-                        "directly_related_user_types": []
-                    }
+                    "includes_trial": { "directly_related_user_types": [{ "type": "clinical_trial" }] },
+                    "can_access":     { "directly_related_user_types": [] }
                 }
             }
         },
         {
             "type": "data_asset",
             "relations": {
-                "owner": {
-                    "this": {}
-                },
-                "granted_org": {
-                    "this": {}
-                },
-                "can_manage": {
-                    "computedUserset": {
-                        "relation": "owner"
-                    }
-                },
+                "owner":      { "this": {} },
+                "granted_org": { "this": {} },
+                "can_manage": { "computedUserset": { "relation": "owner" } },
                 "can_view": {
                     "union": {
                         "child": [
-                            {
-                                "computedUserset": {
-                                    "relation": "owner"
-                                }
-                            },
+                            { "computedUserset": { "relation": "owner" } },
                             {
                                 "tupleToUserset": {
-                                    "tupleset": {
-                                        "relation": "granted_org"
-                                    },
-                                    "computedUserset": {
-                                        "relation": "member"
-                                    }
+                                    "tupleset":        { "relation": "granted_org" },
+                                    "computedUserset": { "relation": "member" }
                                 }
                             }
                         ]
@@ -263,26 +185,48 @@
             },
             "metadata": {
                 "relations": {
-                    "owner": {
-                        "directly_related_user_types": [
-                            {
-                                "type": "user"
-                            }
-                        ]
-                    },
+                    "owner": { "directly_related_user_types": [{ "type": "user" }] },
                     "granted_org": {
                         "directly_related_user_types": [
-                            {
-                                "type": "organization"
-                            }
+                            { "type": "organization", "condition": "check_fine_grained_access" }
                         ]
                     },
-                    "can_manage": {
-                        "directly_related_user_types": []
-                    },
-                    "can_view": {
-                        "directly_related_user_types": []
+                    "can_manage": { "directly_related_user_types": [] },
+                    "can_view":   { "directly_related_user_types": [] }
+                }
+            }
+        },
+        {
+            "type": "data_product",
+            "relations": {
+                "owner":               { "this": {} },
+                "approved_consumer":   { "this": {} },
+                "delegated_consumer":  { "this": {} },
+                "can_access": {
+                    "union": {
+                        "child": [
+                            { "computedUserset": { "relation": "approved_consumer" } },
+                            { "computedUserset": { "relation": "delegated_consumer" } },
+                            { "computedUserset": { "relation": "owner" } }
+                        ]
                     }
+                }
+            },
+            "metadata": {
+                "relations": {
+                    "owner": { "directly_related_user_types": [{ "type": "user" }] },
+                    "approved_consumer": {
+                        "directly_related_user_types": [
+                            { "type": "user",         "condition": "check_fine_grained_access" },
+                            { "type": "organization", "condition": "check_fine_grained_access" }
+                        ]
+                    },
+                    "delegated_consumer": {
+                        "directly_related_user_types": [
+                            { "type": "user", "condition": "check_fine_grained_access" }
+                        ]
+                    },
+                    "can_access": { "directly_related_user_types": [] }
                 }
             }
         }

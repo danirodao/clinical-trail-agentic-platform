@@ -31,6 +31,67 @@ docker exec keycloak /opt/keycloak/bin/kcadm.sh update realms/master -s sslRequi
 docker exec keycloak /opt/keycloak/bin/kcadm.sh update realms/clinical-trials -s sslRequired=NONE > /dev/null 2>&1
 echo "  ✓ SSL disabled for Dev environment"
 
+# Ensure clearance_level mapper exists for API client
+echo "  Ensuring clearance_level claim mapper..."
+API_CLIENT_UUID=$(docker exec keycloak /opt/keycloak/bin/kcadm.sh get clients -r clinical-trials -q clientId=research-platform-api | jq -r '.[0].id // empty')
+if [ -z "$API_CLIENT_UUID" ]; then
+    echo "  ✘ Could not resolve Keycloak client UUID for research-platform-api"
+    exit 1
+fi
+
+CLEARANCE_MAPPER_ID=$(docker exec keycloak /opt/keycloak/bin/kcadm.sh get "clients/$API_CLIENT_UUID/protocol-mappers/models" -r clinical-trials | jq -r '.[] | select(.name=="clearance-level-mapper") | .id' | head -n1)
+if [ -z "$CLEARANCE_MAPPER_ID" ]; then
+    docker exec keycloak /opt/keycloak/bin/kcadm.sh create "clients/$API_CLIENT_UUID/protocol-mappers/models" -r clinical-trials \
+        -s name=clearance-level-mapper \
+        -s protocol=openid-connect \
+        -s protocolMapper=oidc-usermodel-attribute-mapper \
+        -s 'config."user.attribute"=clearance_level' \
+        -s 'config."claim.name"=clearance_level' \
+        -s 'config."jsonType.label"=int' \
+        -s 'config."id.token.claim"=true' \
+        -s 'config."access.token.claim"=true' \
+        -s 'config."userinfo.token.claim"=true' \
+        -s 'config."multivalued"=false' > /dev/null
+    echo "  ✓ Added mapper clearance-level-mapper"
+else
+    echo "  ✓ Mapper clearance-level-mapper already exists"
+fi
+
+# Ensure custom user attribute is declared in Keycloak User Profile
+echo "  Ensuring clearance_level is defined in User Profile..."
+USER_PROFILE_JSON=$(docker exec keycloak /opt/keycloak/bin/kcadm.sh get realms/clinical-trials/users/profile)
+HAS_CLEARANCE_PROFILE_ATTR=$(echo "$USER_PROFILE_JSON" | jq -r 'any(.attributes[]?; .name == "clearance_level")')
+if [ "$HAS_CLEARANCE_PROFILE_ATTR" != "true" ]; then
+    UPDATED_PROFILE_JSON=$(echo "$USER_PROFILE_JSON" | jq '
+        .attributes += [{
+            "name":"clearance_level",
+            "displayName":"Clearance Level",
+            "permissions":{"view":["admin"],"edit":["admin"]},
+            "validations":{"pattern":{"pattern":"^[1-5]$","error-message":"Must be an integer between 1 and 5"}}
+        }]
+    ')
+    docker exec -i keycloak /opt/keycloak/bin/kcadm.sh update realms/clinical-trials/users/profile -f - > /dev/null <<< "$UPDATED_PROFILE_JSON"
+    echo "  ✓ Added clearance_level to User Profile"
+else
+    echo "  ✓ User Profile already includes clearance_level"
+fi
+
+# Seed a safe default clearance level for users that don't have it yet
+echo "  Seeding missing clearance_level user attributes..."
+for USERNAME in data-admin pharma-manager researcher-jane researcher-dani biotech-manager researcher-bob; do
+    USER_ID=$(docker exec keycloak /opt/keycloak/bin/kcadm.sh get users -r clinical-trials -q username="$USERNAME" | jq -r '.[0].id // empty')
+    if [ -z "$USER_ID" ]; then
+        continue
+    fi
+
+    CURRENT_LEVEL=$(docker exec keycloak /opt/keycloak/bin/kcadm.sh get "users/$USER_ID" -r clinical-trials | jq -r '.attributes.clearance_level[0] // empty')
+    if [ -z "$CURRENT_LEVEL" ]; then
+        docker exec keycloak /opt/keycloak/bin/kcadm.sh update "users/$USER_ID" -r clinical-trials -s 'attributes.clearance_level=["1"]' > /dev/null
+        echo "    - $USERNAME: clearance_level set to 1"
+    fi
+done
+echo "  ✓ clearance_level user attributes are configured"
+
 # Get Keycloak admin token
 echo "[2/4] Getting Keycloak admin token..."
 ADMIN_RESPONSE=$(curl -s -X POST \

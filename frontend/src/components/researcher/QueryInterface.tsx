@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useStreamingQuery } from '../../hooks/useStreamingQuery';
-import { TrialAccess, researcherApi } from '../../api/client';
-import { Search, Loader2, Wrench, ShieldAlert, CheckCircle2, XCircle, MessageSquarePlus, Clock } from 'lucide-react';
+import { TrialAccess, researcherApi, QueryScopeParams, GovernanceOptions } from '../../api/client';
+import { Search, Loader2, Wrench, ShieldAlert, CheckCircle2, XCircle, MessageSquarePlus, Clock, SlidersHorizontal } from 'lucide-react';
 import { RichAgentMessage } from './RichAgentMessage';
 
 interface QueryInterfaceProps {
@@ -13,6 +13,11 @@ interface ChatMessage {
     content: string;
 }
 
+const DEFAULT_REGION_OPTIONS  = ['EU', 'NA', 'APAC', 'LATAM', 'MEA'];
+const DEFAULT_AREA_OPTIONS    = ['oncology', 'cardiology', 'neurology', 'immunology', 'infectious_disease', 'rare_disease', 'metabolic'];
+const DEFAULT_PHASE_OPTIONS   = ['I', 'I/II', 'II', 'II/III', 'III', 'IV'];
+const DEFAULT_PURPOSE_OPTIONS = ['study_ONCO_2026', 'study_CARD_2026', 'regulatory_submission', 'safety_monitoring', 'pharmacovigilance'];
+
 export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials }) => {
     // Session & History State
     const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
@@ -22,12 +27,27 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
     // Existing Query State
     const [queryInput, setQueryInput] = useState('');
     const [selectedTrialIds, setSelectedTrialIds] = useState<string[]>([]);
+
+    // Governance scope — only purpose is required from the user.
+    // Region, area and phase are extracted automatically from the query prompt
+    // and trial context by the agent.
+    const [governanceOptions, setGovernanceOptions] = useState<GovernanceOptions>({
+        regions: DEFAULT_REGION_OPTIONS,
+        areas: DEFAULT_AREA_OPTIONS,
+        phases: DEFAULT_PHASE_OPTIONS,
+        purposes: DEFAULT_PURPOSE_OPTIONS,
+        purpose_mismatch_mode: 'block',
+    });
+    const [scopePurpose, setScopePurpose] = useState('');
+
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const {
         sendQuery, isQuerying, statusMessage, answerText,
-        activeTools, finalResponse, error, resetState
+        activeTools, finalResponse, error, governanceError, governanceWarning, resetState
     } = useStreamingQuery();
+
+    const purposeMismatchMode = String(governanceOptions.purpose_mismatch_mode || 'block').toLowerCase();
 
     // Load recent sessions from local storage on mount
     useEffect(() => {
@@ -35,13 +55,56 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
         if (stored) setRecentSessions(JSON.parse(stored));
     }, []);
 
+    useEffect(() => {
+        let mounted = true;
+        researcherApi.getGovernanceOptions()
+            .then((opts: GovernanceOptions) => {
+                if (!mounted) return;
+                setGovernanceOptions(opts);
+
+                // Auto-select purpose when only one option is available.
+                if (opts.purposes?.length === 1 && !scopePurpose) {
+                    setScopePurpose(opts.purposes[0]);
+                }
+                if (opts.purposes?.length && scopePurpose && !opts.purposes.includes(scopePurpose)) {
+                    setScopePurpose(opts.purposes[0]);
+                }
+            })
+            .catch((e) => {
+                console.warn('Failed to load governance options, using defaults', e);
+            });
+
+        return () => {
+            mounted = false;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     // Auto-scroll to bottom of messages
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [chatHistory, answerText, isQuerying]);
 
+    // When the backend returns a purpose mismatch or missing purpose, auto-select
+    // the inferred purpose so the user can retry without extra steps.
+    useEffect(() => {
+        if (
+            purposeMismatchMode === 'block'
+            && governanceError?.purposeMismatch
+            && governanceError?.inferredPurpose
+        ) {
+            setScopePurpose(governanceError.inferredPurpose);
+        } else if (
+            governanceError?.missingScopeFields?.includes('purpose')
+            && !scopePurpose
+        ) {
+            setScopePurpose(governanceOptions.purposes?.[0] || DEFAULT_PURPOSE_OPTIONS[0]);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [governanceError]);
+
     const handleSend = () => {
-        if (!queryInput.trim() || isQuerying) return;
+        if (!queryInput.trim() || isQuerying || !scopePurpose) return;
 
         const currentQuery = queryInput;
         setQueryInput(''); // Clear input box instantly
@@ -66,11 +129,18 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
             localStorage.setItem('recent_sessions', JSON.stringify(updatedSessions));
         }
 
-        // Fire the API call
+        // Purpose is the only governance field required from the user.
+        // Region, area, and phase are auto-derived by the agent from the query.
+        // Clearance level is NEVER sent — the server reads it from the JWT.
+        const scopeParams: QueryScopeParams | undefined = scopePurpose
+            ? { purpose: scopePurpose }
+            : undefined;
+
         sendQuery({
             query: currentQuery,
             trial_ids: selectedTrialIds.length > 0 ? selectedTrialIds : undefined,
-            session_id: sessionId // Pass session ID!
+            session_id: sessionId,
+            scope_params: scopeParams,
         });
     };
 
@@ -172,6 +242,40 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                                 </label>
                             ))}
                         </div>
+
+                        {/* Purpose declaration — required governance field */}
+                        <div className="mt-4 border-t border-gray-200 pt-3">
+                            <div className="flex items-center gap-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+                                <SlidersHorizontal className="w-3 h-3" />
+                                Query Purpose
+                            </div>
+                            <p className="text-[10px] text-gray-400 mb-2">
+                                Declare the purpose of this query. Trial, area, and region are extracted automatically from your prompt.
+                            </p>
+                            <select
+                                value={scopePurpose}
+                                onChange={e => setScopePurpose(e.target.value)}
+                                className={`w-full text-xs border rounded px-2 py-1.5 focus:ring-1 focus:ring-blue-400 bg-white ${
+                                    scopePurpose ? 'border-green-400 text-gray-800' : 'border-amber-400 text-gray-500'
+                                }`}
+                            >
+                                <option value="">— select purpose —</option>
+                                {(governanceOptions.purposes || DEFAULT_PURPOSE_OPTIONS).map(p => (
+                                    <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>
+                                ))}
+                            </select>
+                            {scopePurpose ? (
+                                <p className="text-[10px] text-green-600 flex items-center gap-1 mt-1">
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    Purpose declared.
+                                </p>
+                            ) : (
+                                <p className="text-[10px] text-amber-600 flex items-center gap-1 mt-1">
+                                    <ShieldAlert className="w-3 h-3" />
+                                    Purpose required to query.
+                                </p>
+                            )}
+                        </div>
                     </div>
                 </div>
 
@@ -226,6 +330,54 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                                     <div>
                                         <h4 className="text-sm font-medium text-red-800">Query Failed</h4>
                                         <p className="text-sm text-red-600 mt-1">{error}</p>
+
+                                        {(governanceError?.missingScopeFields?.length || governanceError?.purposeMismatch) ? (
+                                            <div className="mt-3 p-3 rounded border border-amber-200 bg-amber-50">
+                                                <p className="text-xs font-semibold text-amber-800 uppercase tracking-wide">
+                                                    {governanceError?.purposeMismatch
+                                                        ? (purposeMismatchMode === 'block'
+                                                            ? 'Purpose Mismatch Blocked By Policy'
+                                                            : 'Purpose Mismatch')
+                                                        : 'Governance Scope Required'}
+                                                </p>
+                                                {governanceError?.missingScopeFields?.length ? (
+                                                    <p className="text-xs text-amber-700 mt-1">
+                                                        Missing fields: {governanceError.missingScopeFields.join(', ')}
+                                                    </p>
+                                                ) : null}
+
+                                                {governanceError?.purposeMismatch ? (
+                                                    <div className="mt-2 text-xs text-amber-800">
+                                                        <p>
+                                                            Declared purpose: <span className="font-semibold">{governanceError.declaredPurpose || 'unknown'}</span>
+                                                        </p>
+                                                        <p>
+                                                            Prompt suggests: <span className="font-semibold">{governanceError.inferredPurpose || 'unknown'}</span>
+                                                        </p>
+                                                        {governanceError.inferredPurpose && purposeMismatchMode === 'block' ? (
+                                                            <button
+                                                                onClick={() => {
+                                                                    setScopeEnabled(true);
+                                                                    setScopePurpose(governanceError.inferredPurpose || '');
+                                                                }}
+                                                                className="mt-2 inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 text-amber-900 hover:bg-amber-200 transition"
+                                                            >
+                                                                <CheckCircle2 className="w-3 h-3" />
+                                                                Use Suggested Purpose
+                                                            </button>
+                                                        ) : null}
+                                                    </div>
+                                                ) : null}
+
+                                                <button
+                                                    onClick={openGovernanceScopeWithDefaults}
+                                                    className="mt-2 inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 text-amber-900 hover:bg-amber-200 transition"
+                                                >
+                                                    <SlidersHorizontal className="w-3 h-3" />
+                                                    Open Governance Scope
+                                                </button>
+                                            </div>
+                                        ) : null}
                                     </div>
                                 </div>
                             )}
@@ -244,6 +396,15 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                                                 <div className="flex items-center text-xs text-gray-500 font-medium">
                                                     <Loader2 className="w-3 h-3 mr-2 animate-spin" />
                                                     {statusMessage}
+                                                </div>
+                                            )}
+
+                                            {governanceWarning?.purposeMismatch && purposeMismatchMode === 'warn' && (
+                                                <div className="bg-amber-50 border border-amber-200 rounded-md p-2 text-xs text-amber-800">
+                                                    <p className="font-semibold">Purpose mismatch warning (allowed by policy)</p>
+                                                    <p className="mt-0.5">
+                                                        Declared: {governanceWarning.declaredPurpose || 'unknown'} | Inferred: {governanceWarning.inferredPurpose || 'unknown'}
+                                                    </p>
                                                 </div>
                                             )}
 
@@ -323,7 +484,8 @@ export const QueryInterface: React.FC<QueryInterfaceProps> = ({ accessibleTrials
                             />
                             <button
                                 onClick={handleSend}
-                                disabled={!queryInput.trim() || isQuerying}
+                                disabled={!queryInput.trim() || isQuerying || !scopePurpose}
+                                title={!scopePurpose ? 'Select a purpose before querying' : ''}
                                 className="absolute right-2 bottom-2 p-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                             >
                                 <Search className="w-4 h-4" />

@@ -176,6 +176,44 @@ graph TD
 
 ---
 
+## 📈 ABAC Fallback Monitoring
+
+The agent now emits `agent_abac_context_fallback_total`, which counts cases where
+`AgentService` had to derive partial ABAC context because router-provided
+`abac_context` was missing.
+
+### PromQL Snippets
+
+- Fallback events in last hour:
+
+```promql
+increase(agent_abac_context_fallback_total[1h])
+```
+
+- Fallback rate per minute:
+
+```promql
+rate(agent_abac_context_fallback_total[5m]) * 60
+```
+
+- Share of queries impacted (10m window):
+
+```promql
+increase(agent_abac_context_fallback_total[10m])
+/
+clamp_min(increase(agent_query_total[10m]), 1)
+```
+
+### Recommended Alert Thresholds
+
+- `warning`: any fallback detected over 10 minutes (`> 0`)
+- `critical`: sustained fallback burst over 30 minutes (`>= 5`)
+
+These alerts are provisioned in:
+`observability/prometheus/alerts/agent-alerts.yml`
+
+---
+
 ## 🧩 Architecture Patterns & Best Practices
 
 ### Data Mesh
@@ -413,9 +451,9 @@ type organization
 
 type clinical_trial
   relations
-    define owner: [user]                              # Domain owner who published
-    define granted_org: [organization]                 # Org-level access ceiling
-    define assigned_researcher: [user]                 # Direct individual assignment
+    define owner: [user]                               # Domain owner who published
+    define granted_org: [organization with check_fine_grained_access]
+    define assigned_researcher: [user with check_fine_grained_access]
     define can_view_aggregate: member from granted_org  # COMPUTED
     define can_view_individual: assigned_researcher or owner  # COMPUTED
 
@@ -426,10 +464,47 @@ type patient
 
 type cohort
   relations
-    define assigned_researcher: [user]
+    define assigned_researcher: [user with check_fine_grained_access]
     define includes_trial: [clinical_trial]
     define can_access: assigned_researcher or creator
 ```
+
+### Conditional Tuple Semantics
+
+The current implementation uses conditional tuples for both org-level ceilings
+and researcher-level delegations.
+
+- `granted_org` stores Tier 1 governance constraints such as validity window,
+  region, therapeutic area, phase, purpose, clearance tier, and minimum cohort
+  size.
+- `assigned_researcher` stores a narrower Tier 2 delegation derived from the
+  organization's active ceiling.
+- Runtime request attributes are supplied at OpenFGA `/check` time; they are
+  not persisted on tuples.
+
+### Write Path and Drift Repair
+
+OpenFGA tuple persistence is mediated through a PostgreSQL transactional outbox.
+
+- Request approval, collection grants, manager assignments, and dynamic
+  collection refresh enqueue OpenFGA writes in `openfga_tuple_outbox`.
+- Outbox rows may carry `condition_name` and `condition_context`; the relay
+  writes them with `write_conditional_tuples` when present.
+- Tuple existence checks use OpenFGA `/read` semantics rather than `/check`
+  because conditional tuples may require runtime context to evaluate.
+- Reconciliation rebuilds missing tuples from PostgreSQL grant scope and expiry
+  so repair does not widen access by reintroducing plain tuples.
+
+### Dynamic Collection Propagation Rule
+
+When a dynamic collection gains a new trial:
+
+- each active organization grant on the collection is propagated to that trial
+  as a conditional `granted_org` tuple;
+- auto-assigned researcher tuples are generated only for researcher assignments
+  in the same organization as the propagated org grant;
+- delegated researcher conditions are capped by the organization's active ceiling
+  and the researcher's own assignment expiry.
 
 ### How Access Is Evaluated
 
@@ -511,6 +586,145 @@ The following production fixes were applied to prevent access drift, schema mism
   - `cohort_outcome_snapshot` now references `patient` table columns (`p.arm_assigned`, `p.disposition_status`) instead of invalid aliases.
 
 Operational impact: researcher queries now maintain strict cohort-boundary enforcement while avoiding prior false negatives and runtime SQL failures.
+
+### Per-Trial Governance & Permission Model (May 2026)
+
+A second wave of authorization changes introduces **strict per-trial governance** so that direct trial assignments, cohort assignments, and ABAC scope (region/area/phase) are evaluated **independently per trial** and never silently widened across trials.
+
+#### New Permission Model — Three Composable Layers
+
+Every patient-scoped query is now governed by three layers that are evaluated **per trial** and combined as an `AND`:
+
+| Layer | Source | Scope | Effect |
+|:---|:---|:---|:---|
+| **L1 — Trial-Level Access** | OpenFGA `granted_org` + `assigned_researcher` tuples | Trial UUID | Decides if user sees the trial at all and whether at `aggregate` or `individual` level |
+| **L2 — ABAC Governance Ceiling** | Conditional tuple context: `permitted_regions`, `permitted_areas`, `permitted_phases`, `approved_purposes` | Per-trial envelope | Mandatory upper bound — never widened, never overridden |
+| **L3 — Cohort Patient Filter** | `cohort.filter_criteria` (JSONB) on assigned cohorts | Per-trial cohort | Narrows L2 (e.g. age range, sex, ethnicity, condition, disposition, arm) — must remain inside L2 ceiling |
+
+Invariant: **manager-selected cohort filters are always applied on top of the inherited L2 ceiling restrictions** and may never widen them. The UI and backend both present L2 as a mandatory base layer.
+
+#### OpenFGA Changes — Per-Trial Conditional Tuple Envelope
+
+The grant envelope loader (`api/routers/researcher.py::_load_grant_envelope`) was updated to emit a **per-trial map** of permitted regions, not just a flattened union:
+
+```text
+envelope = {
+  "regions":  set(...),                      # union across all trials (legacy)
+  "areas":    set(...),
+  "phases":   set(...),
+  "purposes": set(...),
+  "trial_regions": {                         # NEW — per-trial
+    "<trial-uuid-1>": {"EU"},
+    "<trial-uuid-2>": {"NA", "APAC"},
+    ...
+  }
+}
+```
+
+This per-trial map is now embedded into the ABAC context that is forwarded to MCP tools:
+
+```json
+{
+  "requested_region": "EU",
+  "allowed_regions":  ["APAC", "EU", "LATAM", "MEA", "NA"],
+  "per_trial_allowed_regions": {
+    "1e69a93a-...": ["EU"],
+    "eff04751-...": ["EU","NA","APAC","LATAM","MEA"]
+  }
+}
+```
+
+Why this matters:
+- Previously, the **union of all permitted regions** was applied as a single SQL filter, which could leak rows from a trial with broader regional scope into queries that targeted a strictly EU-only trial.
+- Now, every patient-scoped query joins to `patient_trial_enrollment` and applies **the trial's own region envelope** — so an EU-only trial yields only EU patients, even when it's queried alongside a broader-scoped trial.
+
+Implementation: `mcp_server/access_control.py::_build_patient_region_guard(trial_id=...)` resolves region precedence as:
+
+1. `requested_region` (explicit user scope, validated against the envelope)
+2. `per_trial_allowed_regions[trial_id]` (per-trial conditional grant)
+3. `allowed_regions` (org-wide governance ceiling — last resort)
+
+If the resolved set covers all five canonical regions (`EU`, `NA`, `APAC`, `LATAM`, `MEA`) **and** no explicit region was requested, the region clause is omitted entirely — preventing misleading huge `ANY(...)` arrays from appearing in audit logs.
+
+#### Active Patient Filter Display — Per-Trial
+
+The `filters_applied` field returned to the frontend is now produced **one entry per trial** instead of a single global aggregation. This makes the effective scope unambiguous:
+
+```text
+trial 1e69a93a-9c78-450d-a270-a9df52ed72b1: region: EU; age ≥ 10; age ≤ 60
+trial eff04751-bf29-4c14-b61f-3aa61861dbe6: region: EU, NA; age ≥ 10; age ≤ 60
+response sources: knowledge graph, database
+```
+
+Display precedence in `api/agent/access_context.py::describe_filters` mirrors the SQL guard precedence in `_build_patient_region_guard`:
+
+1. Region values explicitly set in the cohort `filter_criteria`
+2. `requested_region` from ABAC context
+3. `per_trial_allowed_regions[trial_id]` from the grant envelope
+4. Global `allowed_regions` (only when nothing else is available)
+
+This eliminates the previous misleading display of broad regions for trials whose actual SQL enforcement was narrower.
+
+#### Response Provenance — Source System Reporting
+
+Each query response now includes an explicit `response_sources` field on `QueryResponse` so end users can see which backing systems were consulted:
+
+```json
+{
+  "answer": "...",
+  "response_sources": ["knowledge graph", "database", "vector db"],
+  "filters_applied": [
+    "trial 1e69...: region: EU; age ≥ 10; age ≤ 60",
+    "response sources: knowledge graph, database, vector db"
+  ]
+}
+```
+
+The synthesizer (`api/agent/nodes/synthesizer.py::_infer_response_sources`) classifies each executed tool by backing store:
+
+- **knowledge graph** — semantic ontology tools (`get_semantic_cognitive_frame`, `resolve_semantic_term`, `find_drug_condition_relationships`, ...)
+- **database** — patient analytics, clinical analysis, composite tools backed by PostgreSQL
+- **vector db** — `search_documents`, `search_trials` (Qdrant)
+
+A line summarising sources is also injected into `filters_applied` so it surfaces in audit logs and UI without schema changes.
+
+#### Authorization Filter Audit Logging
+
+Every patient SQL filter built by `AccessContext.build_authorized_patient_filter()` now emits a structured `AUTH_FILTER_BUILT` log line containing:
+
+- `requested_trials` — UUIDs as requested by the tool
+- `where` — final composed SQL (with `$n` placeholders)
+- `params` — the bound parameters in order
+- `trace` — per-trial diagnostic record:
+  - `access_level` (`individual` / `aggregate`)
+  - `mode` (`cohort` / `trial-only`)
+  - `patient_level_cohort_count`, `trial_only_cohort_count`
+  - `cohort_clause_applied`
+
+Adverse-event tools additionally emit `AE_FILTER_DEBUG` lines so any zero-result regressions can be diagnosed by replaying the exact SQL against PostgreSQL.
+
+#### MCP ABAC Fallback Scoping Fix
+
+`build_abac_sql_filters()` now accepts `skip_allowed_fallbacks=True`. All patient-scoped clinical analysis tools (adverse events, labs, vitals, concomitant meds, treatment-arm comparison) pass this flag because trial-level authorization is already enforced by `build_authorized_patient_filter()`. Layering the broad governance fallback on top of explicit individual trial grants was previously zeroing out otherwise-valid AE results.
+
+#### Summary of Changed Files (May 2026)
+
+| File | Change |
+|:---|:---|
+| [`api/routers/researcher.py`](api/routers/researcher.py) | `_load_grant_envelope` returns `trial_regions`; ABAC context embeds `per_trial_allowed_regions`; no widening with trial metadata |
+| [`mcp_server/access_control.py`](mcp_server/access_control.py) | Per-trial `_build_patient_region_guard`; cohort vs trial-only branch logged; full-canonical region set treated as unbounded |
+| [`mcp_server/tools/clinical_analysis.py`](mcp_server/tools/clinical_analysis.py) | `skip_allowed_fallbacks=True` on ABAC layering; AE summary SQL `WHERE` restored; placeholder-stable fallback rewrite; `AE_FILTER_DEBUG` logs |
+| [`api/agent/access_context.py`](api/agent/access_context.py) | Per-trial `describe_filters`; region precedence mirrors MCP guard |
+| [`api/agent/models.py`](api/agent/models.py) | New `response_sources: list[str]` on `QueryResponse` |
+| [`api/agent/nodes/synthesizer.py`](api/agent/nodes/synthesizer.py) | `_infer_response_sources` classifies executed tools into knowledge graph / database / vector db |
+| [`api/agent/service.py`](api/agent/service.py) | `_serialize_profile` accepts and persists `abac_context` for downstream nodes |
+| [`api/agent/nodes/tool_node.py`](api/agent/nodes/tool_node.py) | Semantic preflight loop guard with bounded budget |
+
+Operational impact:
+- No cross-trial region leakage — EU-only trials remain EU-only even in multi-trial queries.
+- Active Patient Filters display is now a faithful, per-trial representation of what is actually enforced in SQL.
+- Adverse-event queries no longer return spurious zeroes due to over-restrictive ABAC fallback.
+- Every response carries explicit provenance of the systems consulted.
 
 ---
 

@@ -1,0 +1,32 @@
+groups:
+  - name: agent-abac-governance
+    interval: 30s
+    rules:
+      - alert: AgentAbacContextFallbackDetected
+        expr: increase(agent_abac_context_fallback_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+          component: agent
+        annotations:
+          summary: "Agent ABAC context fallback detected"
+          description: |
+            AgentService derived ABAC context from fallback scope params because
+            router-provided ABAC context was missing.
+            This can indicate a propagation regression and should be investigated.
+          runbook: "Check agent logs for 'abac_context_missing_router_fallback' and verify researcher router sets body.abac_context in sync/stream endpoints."
+
+      - alert: AgentAbacContextFallbackHighRate
+        expr: increase(agent_abac_context_fallback_total[30m]) >= 5
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+          component: agent
+        annotations:
+          summary: "High ABAC context fallback rate"
+          description: |
+            Agent ABAC fallback happened at least 5 times in the last 30 minutes.
+            This strongly suggests router -> agent ABAC propagation is degraded.
+          runbook: "Roll back recent auth/router changes and validate QueryRequest.abac_context propagation path."

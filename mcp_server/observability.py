@@ -8,6 +8,7 @@ that Prometheus scrapes independently of the API container.
 
 from __future__ import annotations
 
+import json
 import inspect
 import time
 import functools
@@ -76,6 +77,15 @@ def instrument_tool(tool_name: str):
                 # Treat empty results as a distinct status for alerting
                 if isinstance(result, dict) and result.get("status") == "empty":
                     status = "empty"
+                elif isinstance(result, str):
+                    try:
+                        payload = json.loads(result)
+                        if payload.get("status") == "error":
+                            status = "error"
+                        elif payload.get("status") == "empty":
+                            status = "empty"
+                    except (TypeError, json.JSONDecodeError):
+                        pass
                 return result
             except PermissionError:
                 status = "unauthorized"

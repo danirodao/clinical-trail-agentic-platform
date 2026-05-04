@@ -219,6 +219,35 @@ CREATE INDEX IF NOT EXISTS idx_audit_action ON auth_audit_log (action);
 
 CREATE INDEX IF NOT EXISTS idx_audit_created ON auth_audit_log (created_at);
 
+-- Governance purpose catalog (global + owner-defined)
+CREATE TABLE IF NOT EXISTS governance_purpose (
+    purpose_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id VARCHAR(255), -- NULL means global purpose
+    purpose_key VARCHAR(120) NOT NULL,
+    label VARCHAR(255) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (owner_id, purpose_key)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_governance_purpose_global_key
+ON governance_purpose (purpose_key)
+WHERE owner_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_governance_purpose_owner
+ON governance_purpose (owner_id, is_active);
+
+INSERT INTO governance_purpose (owner_id, purpose_key, label, description, created_by)
+VALUES
+    (NULL, 'clinical_research', 'Clinical Research', 'General clinical research purpose', 'system'),
+    (NULL, 'regulatory_submission', 'Regulatory Submission', 'Regulatory dossier preparation and submission', 'system'),
+    (NULL, 'safety_monitoring', 'Safety Monitoring', 'Ongoing safety monitoring and surveillance', 'system'),
+    (NULL, 'pharmacovigilance', 'Pharmacovigilance', 'Drug safety signal detection and risk management', 'system')
+ON CONFLICT DO NOTHING;
+
 -- OpenFGA tuple outbox for reliable async sync (replaces direct dual-write)
 CREATE TABLE IF NOT EXISTS openfga_tuple_outbox (
     id BIGSERIAL PRIMARY KEY,
@@ -226,6 +255,8 @@ CREATE TABLE IF NOT EXISTS openfga_tuple_outbox (
     tuple_user TEXT NOT NULL,
     tuple_relation TEXT NOT NULL,
     tuple_object TEXT NOT NULL,
+    condition_name TEXT,
+    condition_context JSONB,
     status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (
         status IN ('pending', 'processing', 'failed', 'applied', 'dead')
     ),
@@ -244,3 +275,6 @@ ON openfga_tuple_outbox (status, available_at, id);
 
 CREATE INDEX IF NOT EXISTS idx_openfga_outbox_correlation
 ON openfga_tuple_outbox (correlation_id);
+
+CREATE INDEX IF NOT EXISTS idx_openfga_outbox_conditional
+ON openfga_tuple_outbox (condition_name);

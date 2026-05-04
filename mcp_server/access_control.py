@@ -5,10 +5,14 @@ Fixed: Added ID resolution (NCT vs UUID) and corrected enforcement logic.
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, Dict
 
 logger = logging.getLogger(__name__)
+
+# Toggle detailed authorization filter traces in MCP logs.
+LOG_AUTH_FILTERS = os.getenv("LOG_AUTH_FILTERS", "true").lower() == "true"
 
 @dataclass
 class CohortFilter:
@@ -21,6 +25,8 @@ class TrialAccess:
     trial_id: str
     nct_id: str # Added to help with ID resolution
     access_level: str  # "individual" or "aggregate"
+    therapeutic_area: str = ""
+    phase: str = ""
     cohort_filters: list[CohortFilter] = field(default_factory=list)
 
     @property
@@ -47,6 +53,13 @@ class AccessContext:
     allowed_trial_ids: list[str]
     trial_access: dict[str, TrialAccess] = field(default_factory=dict)
 
+    # ABAC dynamic context forwarded from OpenFGAContextBuilder.
+    # Present only when the caller provided scope_params in the query request.
+    # MCP tools use this to call OpenFGA check_with_context() for fine-grained
+    # enforcement of region / area / phase / purpose / clearance conditions.
+    # None = no conditional tuples need checking for this request.
+    abac_context: Optional[dict] = None
+
     @classmethod
     def from_json(cls, json_str: str) -> "AccessContext":
         try:
@@ -67,6 +80,8 @@ class AccessContext:
             
             # Extract NCT ID from metadata if available
             nct_id = trial_metadata.get(tid, {}).get("nct_id", "")
+            therapeutic_area = trial_metadata.get(tid, {}).get("therapeutic_area", "")
+            phase = trial_metadata.get(tid, {}).get("phase", "")
 
             cohort_filters = []
             for cf_data in patient_filters_raw.get(tid, []):
@@ -79,6 +94,8 @@ class AccessContext:
             trial_access[tid] = TrialAccess(
                 trial_id=tid,
                 nct_id=nct_id,
+                therapeutic_area=therapeutic_area,
+                phase=phase,
                 access_level=level,
                 cohort_filters=cohort_filters,
             )
@@ -89,22 +106,11 @@ class AccessContext:
             organization_id=data.get("organization_id", ""),
             allowed_trial_ids=allowed_ids,
             trial_access=trial_access,
+            # Deserialize ABAC context if the agent forwarded it.
+            # This was built by OpenFGAContextBuilder in the router and
+            # embedded by serialize_access_profile() — it is safe to trust here.
+            abac_context=data.get("abac_context"),
         )
-    
-        def get_effective_access_level(self, trial_ids: List[str]) -> str:
-            """
-            Ceiling principle: if ANY of the requested trials is aggregate-only,
-            the entire query becomes aggregate-only.
-            """
-            if not trial_ids:
-                return "aggregate"  # safe default
-
-            for raw_tid in trial_ids:
-                info = self._resolve_trial_info(raw_tid)
-                if not info or info.is_aggregate:
-                    return "aggregate"
-            
-            return "individual"
 
     def _resolve_trial_info(self, tid_or_nct: str) -> Optional[TrialAccess]:
         """More forgiving trial ID resolution."""
@@ -145,8 +151,7 @@ class AccessContext:
             # Detect clearly invalid inputs from LLM hallucination
             if len(rid) < 8:
                 # Too short to be a UUID or NCT ID — LLM passed an index number
-                import logging
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     f"Ignoring invalid trial_id '{rid}' (too short — likely an index). "
                     f"Falling back to all {len(self.allowed_trial_ids)} authorized trials."
                 )
@@ -158,7 +163,7 @@ class AccessContext:
 
         # If nothing resolved, fall back to all authorized trials
         if not resolved_uuids:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 f"None of the requested trial_ids {requested_ids} could be resolved. "
                 f"Falling back to all {len(self.allowed_trial_ids)} authorized trials."
             )
@@ -198,13 +203,29 @@ class AccessContext:
         """
         Builds the SQL filter. 
         Fixed: Now correctly resolves IDs and prevents invalid UUID casting in SQL.
+
+          Permission invariants:
+          1) Access is evaluated PER TRIAL. Filters from trial A never apply to trial B.
+          2) Direct assignment (no cohort filters) => unrestricted patient scope for
+              that trial only.
+          3) Cohort assignment => patient scope restricted by that trial's cohort
+              criteria only.
+          4) If a trial has mixed cohort criteria (patient-level + trial-level-only),
+              patient-level criteria remain authoritative.
         """
         if not trial_ids:
+            if LOG_AUTH_FILTERS:
+                logger.info(
+                    "AUTH_FILTER_BUILT user=%s org=%s reason=no_trial_ids where=1=0 params=[]",
+                    self.user_id,
+                    self.organization_id,
+                )
             return "1=0", [], param_offset
 
         trial_clauses: list[str] = []
         all_params: list[Any] = []
         idx = param_offset
+        trace_rows: list[dict[str, Any]] = []
 
         for raw_id in trial_ids:
             info = self._resolve_trial_info(raw_id)
@@ -212,38 +233,252 @@ class AccessContext:
                 continue # Skip trials user isn't authorized for
 
             real_uuid = info.trial_id
-            
-            # Base condition: Must be enrolled in this specific trial
-            trial_cond = f"{enrollment_alias}.trial_id = ${idx}::uuid"
-            all_params.append(real_uuid)
-            idx += 1
+
+            # Reserve parameter positions, but only commit them if we actually
+            # emit a SQL clause for this trial (prevents unused placeholders).
+            trial_param_idx = idx
+            next_idx = trial_param_idx + 1
+            trial_cond = f"{enrollment_alias}.trial_id = ${trial_param_idx}::uuid"
+            trial_region_sql, trial_region_params, next_idx = self._build_patient_region_guard(
+                param_offset=next_idx,
+                patient_alias=patient_alias,
+                trial_id=info.trial_id,
+            )
+
+            base_trial_clause = trial_cond
+            if trial_region_sql:
+                base_trial_clause = f"({trial_cond} AND ({trial_region_sql}))"
 
             if info.has_patient_filter:
                 cohort_clauses: list[str] = []
+                cohort_params: list[Any] = []
+                cohort_idx = next_idx
+                saw_trial_only_applicable_cohort = False
+                patient_level_cohort_count = 0
+                trial_only_cohort_count = 0
+
                 for cohort in info.cohort_filters:
-                    cohort_sql, cohort_params, idx = self._build_single_cohort_filter(
-                        cohort.criteria, idx, patient_alias
+                    if not self._cohort_applies_to_trial(cohort.criteria, info):
+                        continue
+
+                    cohort_sql, single_cohort_params, cohort_idx = self._build_single_cohort_filter(
+                        cohort.criteria, cohort_idx, patient_alias
                     )
                     if cohort_sql:
                         cohort_clauses.append(f"({cohort_sql})")
-                        all_params.extend(cohort_params)
+                        cohort_params.extend(single_cohort_params)
+                        patient_level_cohort_count += 1
+                    elif cohort.criteria:
+                        # Criteria contains only trial-level constraints (e.g.
+                        # trial_ids/therapeutic_areas/phases). Track this and
+                        # apply a neutral fallback ONLY if no patient-level
+                        # cohort filters exist for this trial.
+                        saw_trial_only_applicable_cohort = True
+                        trial_only_cohort_count += 1
+
+                if not cohort_clauses and saw_trial_only_applicable_cohort:
+                    cohort_clauses.append("(1=1)")
 
                 if cohort_clauses:
                     cohort_combined = " OR ".join(cohort_clauses)
-                    trial_clauses.append(f"({trial_cond} AND ({cohort_combined}))")
+                    trial_clauses.append(f"({base_trial_clause} AND ({cohort_combined}))")
+                    all_params.append(real_uuid)
+                    all_params.extend(trial_region_params)
+                    all_params.extend(cohort_params)
+                    idx = cohort_idx
+                    trace_rows.append({
+                        "trial_id": info.trial_id,
+                        "access_level": info.access_level,
+                        "mode": "cohort",
+                        "patient_level_cohort_count": patient_level_cohort_count,
+                        "trial_only_cohort_count": trial_only_cohort_count,
+                        "cohort_clause_applied": True,
+                    })
                 else:
                     logger.warning(f"User '{self.user_id}' has no valid cohort filters for trial '{info.trial_id}'. Access denied for this cohort path.")
-                    # By doing nothing (pass), we prevent the data leak.
-                    pass 
+                    # No valid cohort clauses => do not consume parameter indexes.
+                    trace_rows.append({
+                        "trial_id": info.trial_id,
+                        "access_level": info.access_level,
+                        "mode": "cohort",
+                        "patient_level_cohort_count": patient_level_cohort_count,
+                        "trial_only_cohort_count": trial_only_cohort_count,
+                        "cohort_clause_applied": False,
+                    })
             else:
-                # Unrestricted individual access
-                trial_clauses.append(f"({trial_cond})")
+                # Direct assignment path (or assignment with no patient criteria)
+                # for THIS trial only.
+                trial_clauses.append(f"({base_trial_clause})")
+                all_params.append(real_uuid)
+                all_params.extend(trial_region_params)
+                idx = next_idx
+                trace_rows.append({
+                    "trial_id": info.trial_id,
+                    "access_level": info.access_level,
+                    "mode": "direct_or_unrestricted",
+                })
 
         if not trial_clauses:
+            if LOG_AUTH_FILTERS:
+                logger.info(
+                    "AUTH_FILTER_BUILT user=%s org=%s where=1=0 params=[] requested_trials=%s trace=%s",
+                    self.user_id,
+                    self.organization_id,
+                    trial_ids,
+                    trace_rows,
+                )
             return "1=0", [], param_offset
 
         where_clause = " OR ".join(trial_clauses)
+
+        if LOG_AUTH_FILTERS:
+            logger.info(
+                "AUTH_FILTER_BUILT user=%s org=%s requested_trials=%s where=%s params=%s trace=%s",
+                self.user_id,
+                self.organization_id,
+                trial_ids,
+                where_clause,
+                all_params,
+                trace_rows,
+            )
+
         return f"({where_clause})", all_params, idx
+
+    def _build_patient_region_guard(
+        self,
+        param_offset: int,
+        patient_alias: str,
+        trial_id: str | None = None,
+    ) -> Tuple[str, List[Any], int]:
+        """
+        Build a patient-level region guard from ABAC context.
+
+        Region source precedence:
+          1) requested_region
+          2) allowed_regions
+
+        Patient region is resolved from patient.region when present; otherwise
+        country_region lookup by patient.country is used.
+        """
+        if not self.abac_context:
+            return "", [], param_offset
+
+        _REGION_SYNONYMS: Dict[str, list[str]] = {
+            "EU": ["EU", "Europe", "European Union", "EEA"],
+            "NA": ["NA", "North America", "United States", "US", "Canada"],
+            "APAC": ["APAC", "Asia Pacific", "Asia-Pacific", "Asia"],
+            "LATAM": ["LATAM", "Latin America", "South America"],
+            "MEA": ["MEA", "Middle East", "Africa", "Middle East and Africa"],
+        }
+        _CANONICAL_REGIONS = set(_REGION_SYNONYMS.keys())
+
+        def _canonical_region(raw: str) -> str | None:
+            token = str(raw or "").strip()
+            if not token:
+                return None
+            upper = token.upper()
+            if upper in _CANONICAL_REGIONS:
+                return upper
+            low = token.lower()
+            for canonical, synonyms in _REGION_SYNONYMS.items():
+                if low in {s.lower() for s in synonyms}:
+                    return canonical
+            return None
+
+        requested_region = str(self.abac_context.get("requested_region") or "").strip()
+        if requested_region:
+            raw_regions = [requested_region]
+        else:
+            per_trial = self.abac_context.get("per_trial_allowed_regions") or {}
+            per_trial_regions = []
+            if trial_id and isinstance(per_trial, dict):
+                per_trial_regions = per_trial.get(trial_id) or []
+
+            if per_trial_regions:
+                raw_regions = [
+                    str(v).strip()
+                    for v in per_trial_regions
+                    if str(v).strip()
+                ]
+            else:
+                raw_regions = [
+                    str(v).strip()
+                    for v in (self.abac_context.get("allowed_regions") or [])
+                    if str(v).strip()
+                ]
+
+        if not raw_regions:
+            return "", [], param_offset
+
+        # If scope covers all canonical regions (and no explicit requested_region
+        # was provided), region guard is effectively unbounded and should not be
+        # applied as a SQL filter.
+        if not requested_region:
+            canonical_regions = {
+                c for c in (_canonical_region(r) for r in raw_regions) if c
+            }
+            if canonical_regions == _CANONICAL_REGIONS:
+                return "", [], param_offset
+
+        synonyms: list[str] = []
+        for reg in raw_regions:
+            synonyms.extend(_REGION_SYNONYMS.get(reg, [reg]))
+
+        normalized_regions = sorted({s.strip().upper() for s in synonyms if s.strip()})
+        if not normalized_regions:
+            return "", [], param_offset
+
+        idx = param_offset
+        placeholders = ", ".join(f"${idx + i}" for i in range(len(normalized_regions)))
+        region_expr = (
+            f"COALESCE(NULLIF(TRIM({patient_alias}.region), ''), "
+            f"(SELECT cr.region FROM country_region cr "
+            f"WHERE LOWER(cr.country) = LOWER({patient_alias}.country) LIMIT 1))"
+        )
+        sql = f"UPPER({region_expr}) = ANY(ARRAY[{placeholders}]::text[])"
+
+        return sql, normalized_regions, idx + len(normalized_regions)
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def _normalize_phase(cls, value: Any) -> str:
+        phase = cls._normalize_text(value)
+        if phase.startswith("phase "):
+            phase = phase[6:].strip()
+        return phase
+
+    def _cohort_applies_to_trial(self, criteria: dict[str, Any], info: TrialAccess) -> bool:
+        """
+        Return True when trial-level criteria in a cohort allow this trial.
+
+        These checks prevent accidental trial exclusion when criteria include
+        non-patient dimensions (trial_ids, therapeutic_areas, phases).
+        """
+        if not criteria:
+            return True
+
+        trial_ids = criteria.get("trial_ids")
+        if isinstance(trial_ids, list) and trial_ids:
+            normalized_trial_ids = {self._normalize_text(v) for v in trial_ids}
+            if self._normalize_text(info.trial_id) not in normalized_trial_ids:
+                return False
+
+        therapeutic_areas = criteria.get("therapeutic_areas")
+        if isinstance(therapeutic_areas, list) and therapeutic_areas:
+            normalized_areas = {self._normalize_text(v) for v in therapeutic_areas}
+            if self._normalize_text(info.therapeutic_area) not in normalized_areas:
+                return False
+
+        phases = criteria.get("phases")
+        if isinstance(phases, list) and phases:
+            normalized_phases = {self._normalize_phase(v) for v in phases}
+            if self._normalize_phase(info.phase) not in normalized_phases:
+                return False
+
+        return True
 
     def _build_single_cohort_filter(
         self, criteria: dict[str, Any], param_offset: int, patient_alias: str

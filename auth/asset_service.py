@@ -12,7 +12,7 @@ get OpenFGA tuples for all granted organizations.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 import asyncpg
@@ -20,8 +20,42 @@ import asyncpg
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
 from auth.openfga_outbox import enqueue_delete_tuples, enqueue_write_tuples
+from auth.openfga.condition_payload import (
+    build_condition_context_from_scope,
+    build_delegation_context_from_ceiling,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _as_non_empty_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return []
+
+
+def _merge_scope_with_collection_filter(
+    scope: Optional[dict[str, Any]],
+    filter_criteria: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Enforce collection-level constraints onto the grant scope (fail-closed narrowing)."""
+    merged: dict[str, Any] = dict(scope or {})
+    criteria = filter_criteria or {}
+
+    areas = _as_non_empty_list(criteria.get("therapeutic_areas"))
+    regions = _as_non_empty_list(criteria.get("regions"))
+    phases = _as_non_empty_list(criteria.get("phases"))
+
+    if areas:
+        merged["permitted_areas"] = areas
+    if regions:
+        merged["permitted_regions"] = regions
+    if phases:
+        merged["permitted_phases"] = phases
+
+    return merged
 
 
 class AssetService:
@@ -87,12 +121,46 @@ class AssetService:
 
         return " AND ".join(conditions), params
 
+    def _build_patient_count_subquery(
+        self,
+        filters: dict,
+        trial_ref: str,
+        start_idx: int = 1,
+    ) -> tuple[str, list, int]:
+        """Build a correlated subquery that counts only patients visible to the filter."""
+        conditions = [f"pte.trial_id = {trial_ref}"]
+        params: list = []
+        idx = start_idx
+
+        if filters.get("regions"):
+            conditions.append(f"p.region = ANY(${idx}::text[])")
+            params.append(filters["regions"])
+            idx += 1
+
+        if filters.get("countries"):
+            conditions.append(f"p.country = ANY(${idx}::text[])")
+            params.append(filters["countries"])
+            idx += 1
+
+        sql = f"""
+            SELECT COUNT(DISTINCT pte.patient_id)
+            FROM patient_trial_enrollment pte
+            JOIN patient p ON p.patient_id = pte.patient_id
+            WHERE {' AND '.join(conditions)}
+        """
+        return sql, params, idx
+
     async def discover_trials(self, filters: dict) -> list[dict]:
         """
         Find trials matching filter criteria.
         Returns full metadata for preview before publishing.
         """
         where_clause, params = self._build_trial_query(filters)
+        patient_count_sql, patient_count_params, _ = self._build_patient_count_subquery(
+            filters,
+            "ct.trial_id",
+            start_idx=len(params) + 1,
+        )
 
         rows = await self.db.fetch(
             f"""
@@ -107,9 +175,7 @@ class AssetService:
                     WHERE da.reference_id = ct.trial_id
                     AND da.asset_type = 'clinical_trial'
                 ) AS already_published,
-                (SELECT COUNT(*)
-                 FROM patient_trial_enrollment pte
-                 WHERE pte.trial_id = ct.trial_id) AS patient_count,
+                ({patient_count_sql}) AS patient_count,
                 (SELECT array_agg(DISTINCT i.name)
                  FROM intervention i
                  WHERE i.trial_id = ct.trial_id) AS drug_names,
@@ -122,6 +188,7 @@ class AssetService:
             ORDER BY ct.therapeutic_area, ct.phase, ct.title
             """,
             *params,
+            *patient_count_params,
         )
 
         return [dict(r) for r in rows]
@@ -249,7 +316,7 @@ class AssetService:
                     # OpenFGA ownership (only for newly published)
                     if not trial["already_published"]:
                         fga_tuples.append({
-                            "user": f"user:{user.user_id}",
+                            "user": f"user:{user.username}",
                             "relation": "owner",
                             "object": f"clinical_trial:{trial['trial_id']}",
                         })
@@ -379,10 +446,12 @@ class AssetService:
 
                         # Auto-grant: find orgs with active grants on this collection
                         active_grants = await conn.fetch(
-                            """SELECT DISTINCT ag.organization_id, ag.expires_at, ag.granted_by
+                            """SELECT DISTINCT ON (ag.organization_id)
+                                      ag.organization_id, ag.scope, ag.expires_at, ag.granted_by
                                FROM access_grant ag
                                JOIN collection_asset ca ON ag.asset_id = ca.asset_id
-                               WHERE ca.collection_id = $1 AND ag.is_active = TRUE""",
+                               WHERE ca.collection_id = $1 AND ag.is_active = TRUE
+                               ORDER BY ag.organization_id, ag.expires_at DESC""",
                             coll_id,
                         )
 
@@ -390,28 +459,40 @@ class AssetService:
                             # Create grant for the new trial
                             await conn.execute(
                                 """INSERT INTO access_grant
-                                   (asset_id, collection_id, organization_id,
+                                   (asset_id, collection_id, organization_id, scope,
                                     granted_by, expires_at)
-                                   VALUES ($1, $2, $3, $4, $5)
+                                   VALUES ($1, $2, $3, $4, $5, $6)
                                    ON CONFLICT DO NOTHING""",
                                 asset["asset_id"], coll_id,
                                 grant["organization_id"],
+                                grant["scope"] or {},
                                 grant["granted_by"],
                                 grant["expires_at"],
+                            )
+
+                            org_condition_context = build_condition_context_from_scope(
+                                grant["scope"] or {},
+                                valid_until=grant["expires_at"],
                             )
 
                             fga_grant_tuples.append({
                                 "user": f"organization:{grant['organization_id']}",
                                 "relation": "granted_org",
                                 "object": f"clinical_trial:{trial['trial_id']}",
+                                "condition_name": "check_fine_grained_access",
+                                "condition_context": org_condition_context,
                             })
                             researcher_tuples = await self._auto_assign_researchers_for_new_trial(
-                            conn, trial["trial_id"], coll_id,
-                        )
-                        fga_grant_tuples.extend(researcher_tuples)
+                                conn,
+                                trial["trial_id"],
+                                coll_id,
+                                grant["organization_id"],
+                                org_condition_context,
+                            )
+                            fga_grant_tuples.extend(researcher_tuples)
 
                     # Update collection summary
-                    await self._update_collection_summary(conn, coll_id)
+                    await self._update_collection_summary(conn, coll_id, filters)
 
                     all_tuples = fga_owner_tuples + fga_grant_tuples
                     await enqueue_write_tuples(
@@ -438,6 +519,8 @@ class AssetService:
         conn: asyncpg.Connection,
         trial_id: UUID,
         collection_id: UUID,
+        organization_id: str,
+        ceiling_context: dict,
     ) -> list[dict]:
         """
         When a new trial is added to a dynamic collection, check if any
@@ -450,16 +533,18 @@ class AssetService:
         # AND have active researcher assignments with individual access
         researchers = await conn.fetch(
             """
-            SELECT DISTINCT ra.researcher_id, ra.access_level
+            SELECT DISTINCT ra.researcher_id, ra.access_level, ra.expires_at
             FROM researcher_assignment ra
             JOIN cohort_trial ct_link ON ra.cohort_id = ct_link.cohort_id
             JOIN collection_asset ca ON ct_link.trial_id = ca.trial_id
             WHERE ca.collection_id = $1
+            AND ra.organization_id = $2
             AND ra.access_level = 'individual'
             AND ra.revoked_at IS NULL
             AND ra.expires_at > NOW()
             """,
             collection_id,
+            organization_id,
         )
 
         for r in researchers:
@@ -467,6 +552,11 @@ class AssetService:
                 "user": f"user:{r['researcher_id']}",
                 "relation": "assigned_researcher",
                 "object": f"clinical_trial:{trial_id}",
+                "condition_name": "check_fine_grained_access",
+                "condition_context": build_delegation_context_from_ceiling(
+                    ceiling_context,
+                    delegated_valid_until=r["expires_at"],
+                ),
             })
 
         return fga_tuples
@@ -481,6 +571,7 @@ class AssetService:
         granted_by: str,
         request_id: UUID,
         expires_at: datetime,
+        scope: Optional[dict] = None,
     ) -> dict:
         """
         Grant an organization access to all trials in a collection.
@@ -488,6 +579,18 @@ class AssetService:
         """
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                collection = await conn.fetchrow(
+                    "SELECT filter_criteria FROM data_asset_collection WHERE collection_id = $1",
+                    collection_id,
+                )
+                if not collection:
+                    raise ValueError("Collection not found")
+
+                effective_scope = _merge_scope_with_collection_filter(
+                    scope,
+                    collection["filter_criteria"],
+                )
+
                 assets = await conn.fetch(
                     """SELECT da.asset_id, da.reference_id as trial_id
                        FROM data_asset da
@@ -503,22 +606,34 @@ class AssetService:
                 fga_tuples = []
 
                 for asset in assets:
-                    # Idempotent: skip if grant already exists
+                    # Idempotent: reuse existing active grant, but ensure collection_id
+                    # and scope are set so revocation can find it later.
                     existing = await conn.fetchrow(
                         """SELECT grant_id FROM access_grant
-                           WHERE asset_id = $1 AND organization_id = $2 AND is_active = TRUE""",
+                           WHERE asset_id = $1 AND organization_id = $2
+                           AND revoked_at IS NULL AND expires_at > NOW()""",
                         asset["asset_id"],
                         org_id,
                     )
                     if existing:
+                        await conn.execute(
+                            """UPDATE access_grant
+                               SET collection_id = COALESCE(collection_id, $1),
+                                   scope = CASE WHEN scope = '{}'::jsonb AND $2::jsonb != '{}'::jsonb
+                                               THEN $2 ELSE scope END
+                               WHERE grant_id = $3""",
+                            collection_id,
+                            effective_scope,
+                            existing["grant_id"],
+                        )
                         grant_ids.append(existing["grant_id"])
                         continue
 
                     row = await conn.fetchrow(
                         """INSERT INTO access_grant
                            (request_id, asset_id, collection_id, organization_id,
-                            granted_by, expires_at)
-                           VALUES ($1, $2, $3, $4, $5, $6)
+                            granted_by, expires_at, scope)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7)
                            RETURNING grant_id""",
                         request_id,
                         asset["asset_id"],
@@ -526,13 +641,21 @@ class AssetService:
                         org_id,
                         granted_by,
                         expires_at,
+                        effective_scope,
                     )
                     grant_ids.append(row["grant_id"])
+
+                    condition_context = build_condition_context_from_scope(
+                        effective_scope,
+                        valid_until=expires_at,
+                    )
 
                     fga_tuples.append({
                         "user": f"organization:{org_id}",
                         "relation": "granted_org",
                         "object": f"clinical_trial:{asset['trial_id']}",
+                        "condition_name": "check_fine_grained_access",
+                        "condition_context": condition_context,
                     })
 
                 await enqueue_write_tuples(
@@ -555,21 +678,38 @@ class AssetService:
         revoked_by: str,
         reason: str,
     ) -> dict:
-        """Revoke all grants for an org on a collection."""
+        """Revoke all grants for an org on a collection + cascade researcher assignments."""
         async with self.db.acquire() as conn:
+            # Ownership check — only the collection owner may revoke grants
+            collection = await conn.fetchrow(
+                "SELECT owner_id FROM data_asset_collection WHERE collection_id = $1",
+                collection_id,
+            )
+            if not collection:
+                raise ValueError(f"Collection {collection_id} not found")
+            if collection["owner_id"] != revoked_by:
+                raise PermissionError("Only the collection owner can revoke grants")
+
             async with conn.transaction():
+                # Use collection_asset JOIN so we find grants regardless of whether
+                # collection_id was set on the access_grant row (idempotent-path grants
+                # created from pre-existing rows may have collection_id = NULL).
                 grants = await conn.fetch(
-                    """SELECT ag.grant_id, da.reference_id as trial_id
+                    """SELECT DISTINCT ag.grant_id, da.reference_id as trial_id
                        FROM access_grant ag
                        JOIN data_asset da ON ag.asset_id = da.asset_id
-                       WHERE ag.collection_id = $1
+                       JOIN collection_asset ca ON ca.asset_id = ag.asset_id
+                       WHERE ca.collection_id = $1
                        AND ag.organization_id = $2
-                       AND ag.is_active = TRUE""",
+                       AND ag.revoked_at IS NULL
+                       AND ag.expires_at > NOW()""",
                     collection_id,
                     org_id,
                 )
 
                 fga_deletes = []
+                researcher_revoke_count = 0
+
                 for g in grants:
                     await conn.execute(
                         """UPDATE access_grant
@@ -585,6 +725,32 @@ class AssetService:
                         "object": f"clinical_trial:{g['trial_id']}",
                     })
 
+                    # Cascade: revoke direct researcher assignments for this
+                    # org on this trial and queue FGA tuple deletions.
+                    ra_rows = await conn.fetch(
+                        """SELECT assignment_id, researcher_id
+                           FROM researcher_assignment
+                           WHERE organization_id = $1
+                           AND trial_id = $2
+                           AND revoked_at IS NULL""",
+                        org_id,
+                        g["trial_id"],
+                    )
+                    for ra in ra_rows:
+                        await conn.execute(
+                            """UPDATE researcher_assignment
+                               SET revoked_at = NOW(), revoked_by = $1
+                               WHERE assignment_id = $2""",
+                            revoked_by,
+                            ra["assignment_id"],
+                        )
+                        fga_deletes.append({
+                            "user": f"user:{ra['researcher_id']}",
+                            "relation": "assigned_researcher",
+                            "object": f"clinical_trial:{g['trial_id']}",
+                        })
+                        researcher_revoke_count += 1
+
                 await enqueue_delete_tuples(
                     conn,
                     fga_deletes,
@@ -592,7 +758,10 @@ class AssetService:
                     correlation_id=str(collection_id),
                 )
 
-        return {"revoked_count": len(grants)}
+        return {
+            "revoked_count": len(grants),
+            "researcher_assignments_revoked": researcher_revoke_count,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # MARKETPLACE VIEW
@@ -667,10 +836,20 @@ class AssetService:
     # HELPERS
     # ═══════════════════════════════════════════════════════════
 
-    async def _update_collection_summary(self, conn: asyncpg.Connection, collection_id: UUID):
+    async def _update_collection_summary(
+        self,
+        conn: asyncpg.Connection,
+        collection_id: UUID,
+        filter_criteria: dict,
+    ):
         """Recompute denormalized summary fields for a collection."""
+        patient_count_sql, patient_count_params, _ = self._build_patient_count_subquery(
+            filter_criteria or {},
+            "ca.trial_id",
+            start_idx=2,
+        )
         await conn.execute(
-            """
+            f"""
             UPDATE data_asset_collection dac SET
                 trial_count = sub.trial_count,
                 total_patients = sub.total_patients,
@@ -682,10 +861,7 @@ class AssetService:
                 SELECT
                     ca.collection_id,
                     COUNT(DISTINCT ca.trial_id) as trial_count,
-                    COALESCE(SUM(
-                        (SELECT COUNT(*) FROM patient_trial_enrollment pte
-                         WHERE pte.trial_id = ca.trial_id)
-                    ), 0) as total_patients,
+                    COALESCE(SUM(({patient_count_sql})), 0) as total_patients,
                     COALESCE(SUM(ct.enrollment_count), 0) as total_enrollment,
                     array_agg(DISTINCT ct.therapeutic_area)
                         FILTER (WHERE ct.therapeutic_area IS NOT NULL) as therapeutic_areas,
@@ -700,6 +876,7 @@ class AssetService:
             AND dac.collection_id = $1
             """,
             collection_id,
+            *patient_count_params,
         )
 
     async def _audit(self, **kwargs):

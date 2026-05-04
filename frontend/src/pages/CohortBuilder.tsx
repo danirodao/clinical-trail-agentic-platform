@@ -3,13 +3,77 @@ import { useNavigate } from 'react-router-dom';
 import { UserProfile } from '../keycloak';
 import { managerApi, AccessGrant, CohortFilter, CohortPreview, FilterOptionsResponse } from '../api/client';
 import {
-    FlaskConical, Users, AlertTriangle, CheckCircle,
+    AlertTriangle, CheckCircle,
     Eye, Save, ArrowLeft
 } from 'lucide-react';
 
 interface Props { user: UserProfile }
 
-export default function CohortBuilder({ user }: Props) {
+const RESTRICTION_LABELS: Record<string, string> = {
+    permitted_regions: 'Regions',
+    regions: 'Regions',
+    region: 'Regions',
+    permitted_countries: 'Countries',
+    countries: 'Countries',
+    country: 'Country',
+    permitted_areas: 'Therapeutic Areas',
+    therapeutic_areas: 'Therapeutic Areas',
+    areas: 'Therapeutic Areas',
+    area: 'Therapeutic Area',
+    permitted_phases: 'Phases',
+    phases: 'Phases',
+    phase: 'Phase',
+    approved_purposes: 'Purposes',
+    purposes: 'Purposes',
+    purpose: 'Purpose',
+    minimum_cohort_size: 'Min Cohort Size',
+    resource_classification: 'Classification',
+};
+
+function formatInheritedRestrictions(scope?: Record<string, unknown>): string[] {
+    if (!scope) return [];
+    return Object.entries(scope).flatMap(([key, value]) => {
+        if (value === null || value === undefined) return [];
+        const label = RESTRICTION_LABELS[key]
+            ?? key.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+        if (Array.isArray(value)) {
+            const cleaned = value.map((v) => String(v).trim()).filter(Boolean);
+            if (!cleaned.length) return [];
+            return [`${label}: ${cleaned.join(', ')}`];
+        }
+
+        if (typeof value === 'boolean') {
+            return [`${label}: ${value ? 'Yes' : 'No'}`];
+        }
+
+        if (typeof value === 'string' || typeof value === 'number') {
+            const text = String(value).trim();
+            if (!text) return [];
+            return [`${label}: ${text}`];
+        }
+        return [];
+    });
+}
+
+function formatPatientFilterSummary(filter: CohortFilter): string[] {
+    const out: string[] = [];
+
+    if (filter.age_min !== undefined || filter.age_max !== undefined) {
+        out.push(`Age: ${filter.age_min ?? 0}-${filter.age_max ?? 120}`);
+    }
+    if (filter.sex?.length) out.push(`Sex: ${filter.sex.join(', ')}`);
+    if (filter.conditions?.length) out.push(`Conditions: ${filter.conditions.join(', ')}`);
+    if (filter.phases?.length) out.push(`Phases: ${filter.phases.join(', ')}`);
+    if (filter.country?.length) out.push(`Countries: ${filter.country.join(', ')}`);
+    if (filter.ethnicity?.length) out.push(`Ethnicity: ${filter.ethnicity.join(', ')}`);
+    if (filter.disposition_status?.length) out.push(`Status: ${filter.disposition_status.join(', ')}`);
+    if (filter.arm_assigned?.length) out.push(`Arm: ${filter.arm_assigned.join(', ')}`);
+
+    return out;
+}
+
+export default function CohortBuilder(_: Props) {
     const navigate = useNavigate();
     const [grants, setGrants] = useState<AccessGrant[]>([]);
     const [loading, setLoading] = useState(true);
@@ -114,6 +178,20 @@ export default function CohortBuilder({ user }: Props) {
             </div>
         );
     }
+
+    const selectedGrants = grants.filter((g) => filter.trial_ids?.includes(g.trial_id));
+    const patientSummary = formatPatientFilterSummary(filter);
+    const perTrialEffectiveSummary = selectedGrants.map((grant) => {
+        const inherited = formatInheritedRestrictions(grant.scope);
+        const combined = Array.from(new Set([...inherited, ...patientSummary]));
+        return {
+            grantId: grant.grant_id,
+            title: grant.asset_title,
+            inherited,
+            patient: patientSummary,
+            combined,
+        };
+    });
 
     return (
         <div>
@@ -226,13 +304,50 @@ export default function CohortBuilder({ user }: Props) {
                                             className="h-4 w-4 text-blue-600 rounded"
                                         />
                                         <div className="flex-1">
-                                            <p className="text-sm font-medium text-gray-900">{g.asset_title}</p>
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <p className="text-sm font-medium text-gray-900">{g.asset_title}</p>
+                                                <span className="text-xs bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded-full">
+                                                    {formatInheritedRestrictions(g.scope).length} inherited restriction{formatInheritedRestrictions(g.scope).length !== 1 ? 's' : ''}
+                                                </span>
+                                            </div>
                                             <p className="text-xs text-gray-500">
                                                 Expires: {new Date(g.expires_at).toLocaleDateString()}
                                             </p>
                                         </div>
                                     </label>
                                 ))}
+                            </div>
+                        )}
+
+                        {selectedGrants.length > 0 && (
+                            <div className="mt-4 rounded-lg border border-indigo-200 bg-indigo-50 p-4">
+                                <p className="text-xs font-semibold uppercase tracking-wide text-indigo-800 mb-2">
+                                    Inherited Trial Restrictions
+                                </p>
+                                <p className="text-xs text-indigo-700 mb-3">
+                                    These are enforced from your org ceiling. Patient filters below are applied on top.
+                                </p>
+                                <div className="space-y-3">
+                                    {selectedGrants.map((g) => {
+                                        const tags = formatInheritedRestrictions(g.scope);
+                                        return (
+                                            <div key={`inherited-${g.grant_id}`}>
+                                                <p className="text-sm font-medium text-indigo-900">{g.asset_title}</p>
+                                                <div className="mt-1 flex flex-wrap gap-1.5">
+                                                    {tags.length > 0 ? (
+                                                        tags.map((tag) => (
+                                                            <span key={`${g.grant_id}-${tag}`} className="text-xs bg-white text-indigo-700 px-2 py-0.5 rounded border border-indigo-200">
+                                                                {tag}
+                                                            </span>
+                                                        ))
+                                                    ) : (
+                                                        <span className="text-xs text-indigo-700">No additional inherited restrictions</span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
                             </div>
                         )}
                     </div>
@@ -242,6 +357,11 @@ export default function CohortBuilder({ user }: Props) {
                         <h2 className="text-sm font-semibold text-gray-900 uppercase tracking-wider mb-4">
                             Patient Filters
                         </h2>
+                        <div className="mb-4 rounded-lg border border-blue-200 bg-blue-50 p-3">
+                            <p className="text-xs text-blue-800">
+                                Selected patient filters are applied on top of inherited trial restrictions (ceiling), never instead of them.
+                            </p>
+                        </div>
                         <div className="grid grid-cols-2 gap-6">
                             {/* Age range */}
                             <div>
@@ -426,6 +546,69 @@ export default function CohortBuilder({ user }: Props) {
                         {/* Preview results */}
                         {preview && (
                             <div className="mt-6 space-y-4">
+                                {/* Effective final filter summary */}
+                                <div className="rounded-lg border border-blue-200 bg-blue-50 p-3">
+                                    <p className="text-xs font-semibold text-blue-900 uppercase tracking-wide mb-2">
+                                        Effective Final Filters Per Trial (AND)
+                                    </p>
+                                    <p className="text-[11px] text-blue-800 mb-3">
+                                        Cohort filters are always applied on top of inherited ceiling restrictions and can never override them.
+                                    </p>
+
+                                    <div className="space-y-3">
+                                        {perTrialEffectiveSummary.map((item) => (
+                                            <div key={`effective-${item.grantId}`} className="rounded border border-blue-200 bg-white p-2.5">
+                                                <p className="text-xs font-medium text-blue-900">{item.title}</p>
+
+                                                <div className="mt-2">
+                                                    <p className="text-[11px] font-medium text-blue-800">Inherited</p>
+                                                    <div className="mt-1 flex flex-wrap gap-1.5">
+                                                        {item.inherited.length > 0 ? (
+                                                            item.inherited.map((tag) => (
+                                                                <span key={`inh-${item.grantId}-${tag}`} className="text-[11px] bg-blue-50 text-blue-800 px-2 py-0.5 rounded border border-blue-200">
+                                                                    {tag}
+                                                                </span>
+                                                            ))
+                                                        ) : (
+                                                            <span className="text-[11px] text-blue-700">None</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                <div className="mt-2">
+                                                    <p className="text-[11px] font-medium text-blue-800">Patient</p>
+                                                    <div className="mt-1 flex flex-wrap gap-1.5">
+                                                        {item.patient.length > 0 ? (
+                                                            item.patient.map((tag) => (
+                                                                <span key={`pat-${item.grantId}-${tag}`} className="text-[11px] bg-blue-50 text-blue-800 px-2 py-0.5 rounded border border-blue-200">
+                                                                    {tag}
+                                                                </span>
+                                                            ))
+                                                        ) : (
+                                                            <span className="text-[11px] text-blue-700">None</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                <div className="mt-2">
+                                                    <p className="text-[11px] font-medium text-blue-800">Combined Result</p>
+                                                    <div className="mt-1 flex flex-wrap gap-1.5">
+                                                        {item.combined.length > 0 ? (
+                                                            item.combined.map((tag) => (
+                                                                <span key={`eff-${item.grantId}-${tag}`} className="text-[11px] bg-blue-100 text-blue-900 px-2 py-0.5 rounded border border-blue-300">
+                                                                    {tag}
+                                                                </span>
+                                                            ))
+                                                        ) : (
+                                                            <span className="text-[11px] text-blue-700">No extra filters (trial selection only)</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
                                 {/* Ceiling check */}
                                 {preview.within_ceiling ? (
                                     <div className="flex items-center space-x-2 p-3 bg-green-50 rounded-lg">

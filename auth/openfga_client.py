@@ -28,6 +28,9 @@ class CheckResult:
     allowed: bool
     resolution_metadata: Optional[dict] = None
     error: Optional[str] = None
+    # True when OpenFGA could not evaluate a condition due to missing context.
+    # The caller MUST treat this as DENY — never as ALLOW.
+    context_incomplete: bool = False
 
 
 class OpenFGAClient:
@@ -95,7 +98,7 @@ class OpenFGAClient:
         use_cache: bool = True,
     ) -> CheckResult:
         """
-        Check if a user has a relation to an object.
+        Check if a user has a relation to an object (plain ReBAC — no context).
         Returns CheckResult with .allowed boolean.
         FAIL CLOSED: Returns denied if OpenFGA is unreachable.
         """
@@ -135,6 +138,104 @@ class OpenFGAClient:
 
         except httpx.HTTPStatusError as e:
             logger.error(f"OpenFGA check failed: {e.response.status_code} {e.response.text}")
+            return CheckResult(allowed=False, error=str(e))
+
+    async def check_with_context(
+        self,
+        user: str,
+        relation: str,
+        object: str,
+        context: dict,
+    ) -> CheckResult:
+        """
+        ABAC/PBAC check — evaluates conditional tuples by passing dynamic
+        attributes in the /check "context" payload.
+
+        Context must contain all DYNAMIC attributes assembled by
+        OpenFGAContextBuilder:
+          current_time, requested_region, requested_area, requested_phase,
+          stated_purpose, user_clearance_level, actual_cohort_size
+
+        Security rules enforced here:
+          - Results are NEVER cached: context attributes are per-request
+            runtime values; caching would leak one user's context to another.
+          - CONDITIONAL_RESULT (missing context) is treated as DENY.
+          - Any error returns DENY (fail closed).
+
+        Use check() for plain ReBAC relations without conditions.
+        """
+        if not context:
+            # Refuse to call OpenFGA with an empty context — the condition
+            # would evaluate to false anyway, but logging makes the bug visible.
+            logger.error(
+                "check_with_context called with empty context for "
+                f"{user}|{relation}|{object} — treating as DENY"
+            )
+            return CheckResult(
+                allowed=False,
+                error="Empty context passed to check_with_context",
+                context_incomplete=True,
+            )
+
+        try:
+            client = await self._get_client()
+            resp = await client.post(
+                "/check",
+                json={
+                    "tuple_key": {
+                        "user": user,
+                        "relation": relation,
+                        "object": object,
+                    },
+                    # Dynamic ABAC/PBAC attributes evaluated against the
+                    # condition expression stored in the authorization model.
+                    "context": context,
+                }
+            )
+
+            # OpenFGA returns 400 with "missing_parameters" when context
+            # keys required by the condition are absent.  Treat as DENY.
+            if resp.status_code == 400:
+                body = resp.json()
+                code = body.get("code", "")
+                msg  = body.get("message", "")
+                logger.warning(
+                    f"OpenFGA check returned 400 (possible missing context) "
+                    f"for {user}|{relation}|{object}: [{code}] {msg}"
+                )
+                return CheckResult(
+                    allowed=False,
+                    error=msg,
+                    context_incomplete=("missing" in msg.lower() or "parameter" in msg.lower()),
+                )
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Detect CONDITIONAL_RESULT: OpenFGA resolved to a conditional node
+            # but could not evaluate it (missing context field in the payload).
+            # The API currently signals this via resolution_metadata; treat DENY.
+            resolution = data.get("resolution_metadata", {})
+            if resolution.get("cycle_detected") or resolution.get("datastore_query_count", 0) == 0:
+                # Sanity sentinel: zero DB queries usually means short-circuit deny
+                pass  # allowed=False is the right outcome; fall through
+
+            result = CheckResult(
+                allowed=data.get("allowed", False),
+                resolution_metadata=resolution,
+            )
+            return result
+
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.error(f"OpenFGA unreachable during context check: {e}")
+            # FAIL CLOSED — a connectivity issue must never grant access
+            return CheckResult(allowed=False, error=f"Service unavailable: {e}")
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"OpenFGA context check failed: "
+                f"{e.response.status_code} {e.response.text}"
+            )
             return CheckResult(allowed=False, error=str(e))
 
     async def check_can_view_individual(self, user_id: str, trial_id: str) -> bool:
@@ -208,6 +309,22 @@ class OpenFGAClient:
             if FAIL_CLOSED:
                 return []
             raise
+        except httpx.HTTPStatusError as e:
+            # Fail-closed for API-level validation errors as well, and log
+            # enough detail to diagnose malformed tuple keys or model mismatch.
+            status = e.response.status_code if e.response is not None else "unknown"
+            body = e.response.text if e.response is not None else ""
+            logger.error(
+                "OpenFGA list-objects returned HTTP error: user=%s relation=%s type=%s status=%s body=%s",
+                user,
+                relation,
+                object_type,
+                status,
+                body,
+            )
+            if FAIL_CLOSED:
+                return []
+            raise
 
     async def get_accessible_trial_ids(
         self, user_id: str, access_level: str = "aggregate"
@@ -271,6 +388,133 @@ class OpenFGAClient:
             logger.error(f"Tuple write error: {e}")
             return False
 
+    async def write_conditional_tuples(self, tuples: list[dict]) -> bool:
+        """
+        Write conditional relationship tuples that carry ABAC/PBAC attributes.
+
+        Each entry must be a dict with:
+          - user:     str   e.g. "organization:org-pharma-corp"
+          - relation: str   e.g. "granted_org"
+          - object:   str   e.g. "clinical_trial:ct-uuid"
+          - condition_name: str  e.g. "check_fine_grained_access"
+          - condition_context: dict  all STATIC attribute values, e.g.:
+              {
+                "valid_from":              "2026-01-01T00:00:00Z",
+                "valid_until":             "2026-12-31T23:59:59Z",
+                "permitted_regions":       ["EU", "NA"],
+                "permitted_areas":         ["oncology"],
+                "permitted_phases":        ["II", "III"],
+                "approved_purposes":       ["study_ONCO_2026"],
+                "resource_classification": 3,
+                "minimum_cohort_size":     5,
+              }
+
+        The condition_context is stored on the tuple at write time (STATIC).
+        Dynamic attributes are NEVER stored here — they are passed at /check time.
+
+        Idempotent: Treats "already exists" as success.
+        """
+        tuple_keys = []
+        for t in tuples:
+            entry: dict = {
+                "user":     t["user"],
+                "relation": t["relation"],
+                "object":   t["object"],
+            }
+            if "condition_name" in t:
+                entry["condition"] = {
+                    "name":    t["condition_name"],
+                    # context here holds only STATIC attributes set by the
+                    # governance approver at write time — never dynamic values
+                    "context": t.get("condition_context", {}),
+                }
+            tuple_keys.append(entry)
+
+        try:
+            client = await self._get_client()
+            resp = await client.post(
+                "/write",
+                json={"writes": {"tuple_keys": tuple_keys}}
+            )
+            if resp.status_code == 200:
+                logger.info(f"Wrote {len(tuples)} conditional tuples to OpenFGA")
+                await self.clear_cache()
+                return True
+            elif resp.status_code == 400:
+                try:
+                    error_resp = resp.json()
+                    error_msg = error_resp.get("message", "")
+                    if "already exists" in error_msg.lower():
+                        logger.info(
+                            f"Conditional tuple already exists (idempotent): {error_msg}"
+                        )
+                        await self.clear_cache()
+                        return True
+                except Exception:
+                    pass
+                logger.error(
+                    f"Conditional tuple write failed: {resp.status_code} {resp.text}"
+                )
+                return False
+            else:
+                logger.error(
+                    f"Conditional tuple write failed: {resp.status_code} {resp.text}"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Conditional tuple write error: {e}")
+            return False
+
+    async def read_tuple_conditions(
+        self,
+        user: str,
+        relation: str,
+        object: str,
+    ) -> Optional[dict]:
+        """
+        Read the condition context (STATIC attributes) stored on a specific tuple.
+
+        Returns the condition dict:
+          {
+            "name":    "check_fine_grained_access",
+            "context": { ...static attributes... }
+          }
+        or None if the tuple does not exist or carries no condition.
+
+        Used by CeilingValidator to fetch Tier 1 (ceiling) attributes before
+        writing a Tier 2 (delegation) tuple.
+        """
+        try:
+            client = await self._get_client()
+            resp = await client.post(
+                "/read",
+                json={
+                    "tuple_key": {
+                        "user":     user,
+                        "relation": relation,
+                        "object":   object,
+                    }
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tuples = data.get("tuples", [])
+            if not tuples:
+                return None
+            # Return the condition from the first matching tuple
+            key = tuples[0].get("key", {})
+            return key.get("condition")  # None if no condition on this tuple
+
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.error(f"OpenFGA read failed (tuple conditions): {e}")
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"OpenFGA read failed: {e.response.status_code} {e.response.text}"
+            )
+            return None
+
     async def delete_tuples(self, tuples: list[dict]) -> bool:
         """Delete relationship tuples (for revocation).
         
@@ -298,18 +542,27 @@ class OpenFGAClient:
                 await self.clear_cache()
                 return True
             elif resp.status_code == 400:
-                # Check if error is "tuple not found" (idempotent)
+                # OpenFGA returns 400 when a tuple to delete did not exist.
+                # That is an idempotent success — the end state is identical.
                 try:
                     error_resp = resp.json()
                     error_msg = error_resp.get("message", "")
-                    if ("did not exist" in error_msg.lower() or 
-                        "not found" in error_msg.lower()):
-                        logger.info(f"Tuple not found (idempotent): {error_msg}")
+                    # Match only the specific "did not exist" variant; avoid
+                    # the overly broad "not found" phrase which also appears in
+                    # unrelated OpenFGA errors (e.g. store not found).
+                    if "did not exist" in error_msg.lower():
+                        logger.debug(
+                            "OpenFGA delete skipped — tuple already absent (idempotent). "
+                            "tuples=%d",
+                            len(tuples),
+                        )
                         await self.clear_cache()
-                        return True  # Treat as success
-                except:
+                        return True
+                except Exception:
                     pass
-                logger.error(f"Tuple delete failed: {resp.status_code} {resp.text}")
+                logger.error(
+                    "Tuple delete failed: status=%s body=%s", resp.status_code, resp.text
+                )
                 return False
             else:
                 logger.error(f"Tuple delete failed: {resp.status_code} {resp.text}")
@@ -321,11 +574,30 @@ class OpenFGAClient:
 
     async def tuple_exists(self, user: str, relation: str, object: str) -> bool:
         """
-        Check if a tuple exists in OpenFGA.
-        Uses the check API to verify if a user has a relation to an object.
+        Check if a tuple key exists in OpenFGA (conditional or plain).
+
+        Uses /read on the exact tuple key instead of /check, because /check
+        requires dynamic context for conditional tuples and can return false
+        even when the tuple is present.
         """
-        result = await self.check(user, relation, object, use_cache=False)
-        return result.allowed
+        try:
+            client = await self._get_client()
+            resp = await client.post(
+                "/read",
+                json={
+                    "tuple_key": {
+                        "user": user,
+                        "relation": relation,
+                        "object": object,
+                    }
+                },
+            )
+            resp.raise_for_status()
+            tuples = resp.json().get("tuples", [])
+            return len(tuples) > 0
+        except Exception as e:
+            logger.error(f"Tuple existence read failed: {e}")
+            return False
 
     # ─── Convenience: Grant org access to trial ───────────────
 

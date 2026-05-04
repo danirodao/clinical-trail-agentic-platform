@@ -13,6 +13,7 @@ import asyncpg
 from auth.middleware import UserContext
 from auth.openfga_client import OpenFGAClient, get_openfga_client
 from auth.openfga_outbox import enqueue_delete_tuples, enqueue_write_tuples
+from auth.openfga.condition_payload import build_condition_context_from_scope
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +148,18 @@ class AccessRequestService:
                 if request["asset_type"] == "clinical_trial":
                     trial_id = str(request["reference_id"])
                     org_id = request["requesting_org_id"]
+                    condition_context = build_condition_context_from_scope(
+                        scope or request.get("scope", {}),
+                        valid_until=expires_at,
+                    )
                     await enqueue_write_tuples(
                         conn,
                         [{
                             "user": f"organization:{org_id}",
                             "relation": "granted_org",
                             "object": f"clinical_trial:{trial_id}",
+                            "condition_name": "check_fine_grained_access",
+                            "condition_context": condition_context,
                         }],
                         source="access_request.approve",
                         correlation_id=str(grant["grant_id"]),

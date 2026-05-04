@@ -61,6 +61,7 @@ from .models import (
     ToolResultEvent,
 )
 from .observability import (
+    AGENT_ABAC_CONTEXT_FALLBACK_TOTAL,
     ACTIVE_QUERIES,
     QUERY_COUNT,
     QUERY_DURATION,
@@ -437,13 +438,49 @@ class AgentService:
         """
         Convert the request + AccessProfile into the initial LangGraph state.
 
-        access_context_json  — compact representation consumed by MCP tools
+        access_context_json  — compact representation consumed by MCP tools.
+                               Includes the ABAC context built in the router
+                               via OpenFGAContextBuilder (if scope_params were
+                               provided) so tools can call check_with_context().
         access_profile_dict  — full serialisation stored in the checkpoint
-                               and read by guardrails / synthesizer nodes
+                               and read by guardrails / synthesizer nodes.
         """
-        access_context_dict = serialize_access_profile(access_profile)
+        # Prefer explicit ABAC context propagated by the router.
+        # abac_context is internal-only (exclude=True) and never leaves the API.
+        abac_context: dict | None = request.abac_context
+
+        # Backward-compatible fallback: derive only non-sensitive scope fields.
+        # We intentionally do NOT rebuild from JWT here: router-generated
+        # abac_context is the source of truth for provenance-sensitive values
+        # like user_clearance_level and current_time.
+        if not abac_context and request.scope_params:
+            logger.warning(
+                "abac_context_missing_router_fallback",
+                user=getattr(access_profile, "user_id", "?"),
+            )
+            AGENT_ABAC_CONTEXT_FALLBACK_TOTAL.inc()
+            partial: dict[str, Any] = {}
+            for key, out_key in (
+                ("region", "requested_region"),
+                ("area", "requested_area"),
+                ("phase", "requested_phase"),
+                ("purpose", "stated_purpose"),
+            ):
+                val = request.scope_params.get(key)
+                if isinstance(val, str) and val.strip():
+                    partial[out_key] = val.strip()
+
+            for key in ("allowed_regions", "allowed_areas", "allowed_phases"):
+                val = request.scope_params.get(key)
+                if isinstance(val, list) and val:
+                    partial[key] = [str(v) for v in val if str(v).strip()]
+
+            if partial:
+                abac_context = partial
+
+        access_context_dict = serialize_access_profile(access_profile, abac_context)
         access_context_json = json.dumps(access_context_dict)
-        profile_dict = _serialize_profile(access_profile)
+        profile_dict = _serialize_profile(access_profile, abac_context)
 
         return AgentState(
             messages=[HumanMessage(content=request.query)],
@@ -689,7 +726,7 @@ class AgentService:
 # Module-level serialisation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _serialize_profile(access_profile: Any) -> dict:
+def _serialize_profile(access_profile: Any, abac_context: dict | None = None) -> dict:
     """
     Convert an AccessProfile dataclass to a plain JSON-serialisable dict.
 
@@ -727,7 +764,7 @@ def _serialize_profile(access_profile: Any) -> dict:
         if nct_id or title:
             trial_metadata[trial_id] = {"nct_id": nct_id, "title": title}
 
-    return {
+    payload = {
         "user_id": access_profile.user_id,
         "role": access_profile.role,
         "organization_id": access_profile.organization_id,
@@ -740,6 +777,11 @@ def _serialize_profile(access_profile: Any) -> dict:
         "trial_scopes": trial_scopes,
         "trial_metadata": trial_metadata,
     }
+
+    if abac_context:
+        payload["abac_context"] = abac_context
+
+    return payload
 
 
 def _access_profile_snapshot(access_profile: Any) -> dict:

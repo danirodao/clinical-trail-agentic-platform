@@ -49,6 +49,12 @@ class RevokeAction(BaseModel):
     reason: str = Field(..., min_length=5)
 
 
+class GovernancePurposeCreate(BaseModel):
+    purpose_key: str = Field(..., min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_:-]+$")
+    label: str = Field(..., min_length=3, max_length=255)
+    description: Optional[str] = None
+
+
 # ─── Filter Options (for publish wizard dropdowns) ────────────
 
 @router.get("/assets/filter-options", dependencies=[Depends(require_role("domain_owner"))])
@@ -59,6 +65,72 @@ async def get_filter_options(
     """Get available filter values for the publishing wizard."""
     service = AssetService(db_pool)
     return await service.get_filter_options()
+
+
+@router.get("/governance/purposes", dependencies=[Depends(require_role("domain_owner"))])
+async def list_governance_purposes(
+    user: CurrentUser,
+    db_pool=Depends(get_db_pool),
+):
+    rows = await db_pool.fetch(
+        """
+        SELECT purpose_key, label, description, owner_id, is_active, created_at
+        FROM governance_purpose
+        WHERE is_active = TRUE
+          AND (owner_id IS NULL OR owner_id = $1)
+        ORDER BY owner_id NULLS FIRST, purpose_key
+        """,
+        user.user_id,
+    )
+    return {"purposes": [dict(r) for r in rows]}
+
+
+@router.post("/governance/purposes", dependencies=[Depends(require_role("domain_owner"))])
+async def create_governance_purpose(
+    body: GovernancePurposeCreate,
+    user: CurrentUser,
+    db_pool=Depends(get_db_pool),
+):
+    try:
+        row = await db_pool.fetchrow(
+            """
+            INSERT INTO governance_purpose (owner_id, purpose_key, label, description, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING purpose_key, label, description, owner_id, is_active, created_at
+            """,
+            user.user_id,
+            body.purpose_key,
+            body.label,
+            body.description,
+            user.user_id,
+        )
+    except Exception as exc:
+        raise HTTPException(409, f"Purpose key already exists: {body.purpose_key}") from exc
+
+    return {"purpose": dict(row)}
+
+
+@router.delete("/governance/purposes/{purpose_key}", dependencies=[Depends(require_role("domain_owner"))])
+async def deactivate_governance_purpose(
+    purpose_key: str,
+    user: CurrentUser,
+    db_pool=Depends(get_db_pool),
+):
+    updated = await db_pool.execute(
+        """
+        UPDATE governance_purpose
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE purpose_key = $1
+          AND owner_id = $2
+          AND is_active = TRUE
+        """,
+        purpose_key,
+        user.user_id,
+    )
+    if updated.endswith("0"):
+        raise HTTPException(404, "Purpose not found for this domain owner")
+
+    return {"status": "deactivated", "purpose_key": purpose_key}
 
 
 # ─── Discovery & Preview ─────────────────────────────────────
@@ -146,7 +218,8 @@ async def list_my_assets(
                FROM access_grant ag
                JOIN collection_asset ca ON ag.asset_id = ca.asset_id
                WHERE ca.collection_id = dac.collection_id
-               AND ag.is_active = TRUE) as organizations_with_access,
+               AND ag.revoked_at IS NULL
+               AND ag.expires_at > NOW()) as organizations_with_access,
               (SELECT COUNT(*)
                FROM access_request ar
                WHERE ar.collection_id = dac.collection_id
@@ -241,6 +314,7 @@ async def review_request(
         granted_by=user.user_id,
         request_id=request_id,
         expires_at=expires_at,
+        scope=request.get("scope", {}),
     )
 
     await db_pool.execute(
@@ -267,20 +341,61 @@ async def list_grants(
 ):
     """List grants grouped by collection + org."""
     rows = await db_pool.fetch(
-        """SELECT
-              dac.collection_id, dac.name as collection_name,
-              ag.organization_id,
-              COUNT(ag.grant_id) as trial_count,
-              MIN(ag.granted_at) as first_granted,
-              MIN(ag.expires_at) as earliest_expiry,
-              bool_and(ag.is_active) as all_active
-           FROM access_grant ag
-           JOIN data_asset da ON ag.asset_id = da.asset_id
-           JOIN collection_asset ca ON da.asset_id = ca.asset_id
-           JOIN data_asset_collection dac ON ca.collection_id = dac.collection_id
-           WHERE dac.owner_id = $1
-           GROUP BY dac.collection_id, dac.name, ag.organization_id
-           ORDER BY dac.name, ag.organization_id""",
+                """WITH grant_rows AS (
+                             -- Canonical path: grants created from approved collection requests.
+                             SELECT
+                                     ag.grant_id,
+                                     ar.collection_id,
+                                     ag.organization_id,
+                                     ag.granted_at,
+                                     ag.expires_at,
+                                     (ag.revoked_at IS NULL AND ag.expires_at > NOW()) AS is_active
+                             FROM access_grant ag
+                             JOIN access_request ar ON ar.request_id = ag.request_id
+                             JOIN data_asset_collection dac ON dac.collection_id = ar.collection_id
+                             WHERE dac.owner_id = $1
+                                 AND ag.revoked_at IS NULL
+                                 AND ag.expires_at > NOW()
+
+                             UNION ALL
+
+                             -- Legacy/direct path: grants without request_id.
+                             SELECT
+                                     ag.grant_id,
+                                     COALESCE(ag.collection_id, ca_fallback.collection_id) AS collection_id,
+                                     ag.organization_id,
+                                     ag.granted_at,
+                                     ag.expires_at,
+                                     (ag.revoked_at IS NULL AND ag.expires_at > NOW()) AS is_active
+                             FROM access_grant ag
+                             LEFT JOIN LATERAL (
+                                     SELECT ca.collection_id
+                                     FROM collection_asset ca
+                                     JOIN data_asset_collection dac2 ON dac2.collection_id = ca.collection_id
+                                     WHERE ca.asset_id = ag.asset_id
+                                         AND dac2.owner_id = $1
+                                     ORDER BY ca.collection_id
+                                     LIMIT 1
+                             ) ca_fallback ON TRUE
+                             WHERE ag.request_id IS NULL
+                                 AND ag.revoked_at IS NULL
+                                 AND ag.expires_at > NOW()
+                                 AND (ag.collection_id IS NOT NULL OR ca_fallback.collection_id IS NOT NULL)
+                     )
+                     SELECT
+                             dac.collection_id,
+                             dac.name AS collection_name,
+                             dac.filter_criteria,
+                             gr.organization_id,
+                             COUNT(DISTINCT gr.grant_id) AS trial_count,
+                             MIN(gr.granted_at) AS first_granted,
+                             MIN(gr.expires_at) AS earliest_expiry,
+                             bool_and(gr.is_active) AS all_active
+                     FROM grant_rows gr
+                     JOIN data_asset_collection dac ON dac.collection_id = gr.collection_id
+                     WHERE dac.owner_id = $1
+                         GROUP BY dac.collection_id, dac.name, dac.filter_criteria, gr.organization_id
+                     ORDER BY dac.name, gr.organization_id""",
         user.user_id,
     )
     return {"grants": [dict(r) for r in rows]}
@@ -297,9 +412,14 @@ async def revoke_collection_grant(
 ):
     """Revoke all grants for an org on a collection."""
     service = AssetService(db_pool)
-    result = await service.revoke_collection_access(
-        collection_id, org_id, user.user_id, body.reason
-    )
+    try:
+        result = await service.revoke_collection_access(
+            collection_id, org_id, user.user_id, body.reason
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     return result
 
 
@@ -329,7 +449,9 @@ async def get_dashboard_stats(
         """SELECT COUNT(DISTINCT ag.organization_id)
            FROM access_grant ag
            JOIN data_asset da ON ag.asset_id = da.asset_id
-           WHERE da.owner_id = $1 AND ag.is_active = TRUE""",
+           WHERE da.owner_id = $1
+           AND ag.revoked_at IS NULL
+           AND ag.expires_at > NOW()""",
         user.user_id,
     )
 

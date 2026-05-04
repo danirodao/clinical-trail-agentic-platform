@@ -29,6 +29,13 @@ class UserContext(BaseModel):
     organization_id: str        # Custom claim from Keycloak attribute mapper
     organization_name: Optional[str] = None
     realm_roles: list[str] = []  # All realm roles
+    # ABAC additions — extracted from Keycloak token claims
+    # clearance_level maps to the OpenFGA condition parameter of the same name.
+    # It is set via a Keycloak attribute mapper on the user/group and must
+    # never originate from any user-supplied input.
+    clearance_level: int = 1           # data sensitivity clearance (1–5)
+    raw_token: str = ""                # original Bearer token, forwarded to
+                                        # OpenFGAContextBuilder; never logged
 
 
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:8180")
@@ -119,6 +126,16 @@ async def verify_token(credentials: HTTPAuthorizationCredentials) -> UserContext
                 detail="Invalid token: missing 'sub' claim. Request an OpenID Connect user access token."
             )
 
+        # Extract clearance_level — MUST come from the IdP-issued token.
+        # Default to 1 (PUBLIC) if the claim is absent so the system fails
+        # closed (low clearance) rather than granting over-broad access.
+        try:
+            clearance_level = int(payload.get("clearance_level", 1))
+            if not (1 <= clearance_level <= 5):
+                clearance_level = 1
+        except (TypeError, ValueError):
+            clearance_level = 1
+
         return UserContext(
             user_id=subject,
             username=payload.get("preferred_username", "unknown"),
@@ -127,6 +144,8 @@ async def verify_token(credentials: HTTPAuthorizationCredentials) -> UserContext
             organization_id=organization_id,
             organization_name=payload.get("organization_name"),
             realm_roles=realm_roles,
+            clearance_level=clearance_level,
+            raw_token=token,  # passed to OpenFGAContextBuilder; never logged
         )
 
     except JWTError as e:

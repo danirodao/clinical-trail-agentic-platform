@@ -125,6 +125,11 @@ AGENT_CEILING_APPLIED_TOTAL = Counter(
     "Times the aggregate ceiling was applied in multi-trial queries",
 )
 
+AGENT_ABAC_CONTEXT_FALLBACK_TOTAL = Counter(
+    "agent_abac_context_fallback_total",
+    "Times AgentService had to derive ABAC context because router-provided context was missing",
+)
+
 # ── Reasoning Saturatuation ──────────────────────────────────────────────────
 
 AGENT_MAX_ITERATIONS_REACHED_TOTAL = Counter(
@@ -222,6 +227,7 @@ def setup_observability(
         # Global counts
         AGENT_QUERY_TOTAL.labels(model="any", status="success", complexity="simple").inc(0)
         AGENT_CEILING_APPLIED_TOTAL.inc(0)
+        AGENT_ABAC_CONTEXT_FALLBACK_TOTAL.inc(0)
         
         # Reasoning Saturation (New Premium Metric)
         for model in ["gpt-4o", "gpt-4o-mini"]:

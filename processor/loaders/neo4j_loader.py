@@ -108,6 +108,7 @@ class Neo4jGraphLoader:
                     p.sex = $sex,
                     p.race = $race,
                     p.country = $country,
+                    p.region = $region,
                     p.disposition = $disposition
             """, {
                 'patient_id': patient_id,
@@ -116,6 +117,7 @@ class Neo4jGraphLoader:
                 'sex': patient_data.get('sex', 'U'),
                 'race': patient_data.get('race'),
                 'country': patient_data.get('country'),
+                'region': patient_data.get('region'),
                 'disposition': patient_data.get('disposition_status', '')
             })
 

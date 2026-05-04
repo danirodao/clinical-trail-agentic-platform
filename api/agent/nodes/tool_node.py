@@ -38,6 +38,22 @@ from ..models import AgentState, Timer, ToolCallRecord
 logger = logging.getLogger(__name__)
 tracer = get_tracer()
 
+# Prevent semantic-only planning loops from exhausting max_iterations.
+# If too many semantic calls happen before any data tool call, force a pivot.
+MAX_SEMANTIC_PREFLIGHT_CALLS = 8
+
+SEMANTIC_TOOL_NAMES = {
+    "get_semantic_cognitive_frame",
+    "resolve_semantic_term",
+    "get_concept_definition",
+    "list_ontology_concepts",
+    "get_field_concept_map",
+    "map_code_to_concept",
+    "map_concept_to_codes",
+    "semantic_compatibility_check",
+    "explain_metric_semantics",
+}
+
 
 async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> dict:
     """
@@ -57,10 +73,53 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
     tool_messages: list[ToolMessage] = []
     new_records: list[dict] = []
 
+    prior_records = state.get("tool_call_records", [])
+    semantic_calls_so_far = sum(
+        1 for rec in prior_records if _is_semantic_tool(str(rec.get("tool", "")))
+    )
+    data_calls_so_far = sum(
+        1 for rec in prior_records if not _is_semantic_tool(str(rec.get("tool", "")))
+    )
+
     for tool_call in last_message.tool_calls:
         tool_name: str = tool_call["name"]
         tool_args: dict = tool_call.get("args", {})
         tool_call_id: str = tool_call["id"]
+
+        if (
+            _is_semantic_tool(tool_name)
+            and data_calls_so_far == 0
+            and semantic_calls_so_far >= MAX_SEMANTIC_PREFLIGHT_CALLS
+        ):
+            result_content = json.dumps({
+                "warning": "semantic_preflight_budget_reached",
+                "message": (
+                    "Too many ontology/semantic calls before querying clinical data. "
+                    "Proceed with a domain data tool now (for example: "
+                    "get_adverse_events, cross_trial_safety_summary, or cohort_outcome_snapshot)."
+                ),
+                "semantic_calls_so_far": semantic_calls_so_far,
+            })
+
+            tool_messages.append(
+                ToolMessage(
+                    content=result_content,
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+            )
+            new_records.append(
+                ToolCallRecord(
+                    tool=tool_name,
+                    args=_sanitize_args(tool_args),
+                    result_summary="Semantic preflight budget reached; pivot requested",
+                    duration_ms=0,
+                    status="success",
+                    error_message=None,
+                ).model_dump()
+            )
+            semantic_calls_so_far += 1
+            continue
 
         # ── Wrap the entire tool execution in an OTel span ────────────────
         with tracer.start_as_current_span(f"tool.{tool_name}") as span:
@@ -185,6 +244,11 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
                 ).model_dump()
             )
 
+            if _is_semantic_tool(tool_name):
+                semantic_calls_so_far += 1
+            else:
+                data_calls_so_far += 1
+
     return {
         "messages": tool_messages,
         "tool_call_records": state.get("tool_call_records", []) + new_records,
@@ -274,6 +338,12 @@ def _sanitize_args(args: dict) -> dict:
     by the LLM), but this is defense-in-depth.
     """
     return {k: v for k, v in args.items() if k != "access_context"}
+
+
+def _is_semantic_tool(tool_name: str) -> bool:
+    if tool_name in SEMANTIC_TOOL_NAMES:
+        return True
+    return tool_name.startswith("semantic_")
 
 
 def _distill_result(result: Any, tool_name: str) -> Any:

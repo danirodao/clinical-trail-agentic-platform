@@ -37,6 +37,11 @@ interface Props {
     user: UserProfile;
 }
 
+function getEffectiveRestrictions(trial: TrialAccess): TrialCohortFilter[] {
+    const value = trial.effective_restrictions ?? trial.cohort_filters;
+    return Array.isArray(value) ? value : [];
+}
+
 export default function ResearcherDashboard({ user }: Props) {
     const [access, setAccess] = useState<AccessSummary | null>(null);
     const [loading, setLoading] = useState(true);
@@ -184,7 +189,7 @@ export default function ResearcherDashboard({ user }: Props) {
                                 />
                                 <StatCard
                                     label="Cohort Filters"
-                                    value={trialAccess.reduce((s, t) => s + t.cohort_filters.length, 0)}
+                                    value={trialAccess.reduce((s, t) => s + getEffectiveRestrictions(t).length, 0)}
                                     sub="applied across trials"
                                     icon={<Filter className="h-8 w-8 text-purple-500" />}
                                     border="border-purple-500"
@@ -385,7 +390,8 @@ function IndividualTrialRow({
 }: {
     trial: TrialAccess; isExpanded: boolean; onToggle: () => void;
 }) {
-    const hasFilters = trial.cohort_filters.length > 0;
+    const effectiveRestrictions = getEffectiveRestrictions(trial);
+    const hasFilters = effectiveRestrictions.length > 0;
 
     return (
         <div>
@@ -394,13 +400,11 @@ function IndividualTrialRow({
                 className="w-full px-6 py-4 flex items-center justify-between hover:bg-gray-50 transition-colors text-left"
             >
                 <div className="flex items-center space-x-3 min-w-0">
-                    {hasFilters ? (
+                    {
                         isExpanded
                             ? <ChevronDown className="h-4 w-4 text-gray-400 flex-shrink-0" />
                             : <ChevronRight className="h-4 w-4 text-gray-400 flex-shrink-0" />
-                    ) : (
-                        <div className="w-4" />
-                    )}
+                    }
                     <div className="min-w-0">
                         <div className="flex items-center space-x-2 flex-wrap">
                             <span className="text-sm font-semibold text-blue-700">{trial.nct_id}</span>
@@ -416,16 +420,46 @@ function IndividualTrialRow({
                 </div>
                 {hasFilters && (
                     <span className="text-xs text-gray-500 flex-shrink-0 ml-4">
-                        {trial.cohort_filters.length} cohort{trial.cohort_filters.length !== 1 ? 's' : ''}
+                        {effectiveRestrictions.length} restriction{effectiveRestrictions.length !== 1 ? 's' : ''}
                     </span>
                 )}
             </button>
 
-            {isExpanded && hasFilters && (
+            {isExpanded && (
                 <div className="px-6 pb-4 ml-7 space-y-3">
-                    {trial.cohort_filters.map((c) => (
-                        <CohortCard key={c.cohort_id} cohort={c} />
-                    ))}
+                    <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+                        <p className="text-xs font-medium text-gray-700 mb-2">Trial Details</p>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            {trial.phase && (
+                                <DetailItem icon={<FlaskConical className="h-3 w-3 text-indigo-500" />} label="Phase" value={trial.phase} />
+                            )}
+                            {trial.therapeutic_area && (
+                                <DetailItem icon={<Tag className="h-3 w-3 text-teal-500" />} label="Therapeutic Area" value={trial.therapeutic_area} />
+                            )}
+                            {trial.overall_status && (
+                                <DetailItem icon={<Activity className="h-3 w-3 text-green-500" />} label="Status" value={trial.overall_status} />
+                            )}
+                            <DetailItem icon={<Users className="h-3 w-3 text-blue-500" />} label="Visible Patients" value={trial.patient_count.toString()} />
+                        </div>
+                    </div>
+
+                    {hasFilters ? (
+                        <>
+                            <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">
+                                {trial.effective_restrictions_label || 'Effective Restrictions'}
+                            </p>
+                            {effectiveRestrictions.map((c) => (
+                                <CohortCard key={c.cohort_id} cohort={c} />
+                            ))}
+                        </>
+                    ) : (
+                        <div className="bg-green-50 rounded-lg p-3 border border-green-200">
+                            <p className="text-xs text-green-800">
+                                <strong>No additional restrictions.</strong> This trial is available under your
+                                individual access scope.
+                            </p>
+                        </div>
+                    )}
                 </div>
             )}
         </div>
@@ -532,7 +566,8 @@ function AggregateTrialRow({
 }: {
     trial: TrialAccess; isExpanded: boolean; onToggle: () => void;
 }) {
-    const hasFilters = trial.cohort_filters.length > 0;
+    const effectiveRestrictions = getEffectiveRestrictions(trial);
+    const hasFilters = effectiveRestrictions.length > 0;
 
     return (
         <div>
@@ -564,11 +599,9 @@ function AggregateTrialRow({
                 </div>
 
                 <div className="flex items-center space-x-3 flex-shrink-0 ml-4">
-                    {trial.patient_count > 0 && (
-                        <span className="text-xs text-gray-500">
-                            {trial.patient_count} patients
-                        </span>
-                    )}
+                    <span className="text-xs text-gray-500">
+                        {trial.patient_count} patients
+                    </span>
                 </div>
             </button>
 
@@ -587,9 +620,7 @@ function AggregateTrialRow({
                             {trial.overall_status && (
                                 <DetailItem icon={<Activity className="h-3 w-3 text-green-500" />} label="Status" value={trial.overall_status} />
                             )}
-                            {trial.patient_count > 0 && (
-                                <DetailItem icon={<Users className="h-3 w-3 text-blue-500" />} label="Patients" value={trial.patient_count.toString()} />
-                            )}
+                            <DetailItem icon={<Users className="h-3 w-3 text-blue-500" />} label="Patients" value={trial.patient_count.toString()} />
                         </div>
                     </div>
 
@@ -615,9 +646,16 @@ function AggregateTrialRow({
                     </div>
 
                     {/* Cohort filters if any */}
-                    {hasFilters && trial.cohort_filters.map((c) => (
-                        <CohortCard key={c.cohort_id} cohort={c} />
-                    ))}
+                    {hasFilters && (
+                        <>
+                            <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">
+                                {trial.effective_restrictions_label || 'Effective Restrictions'}
+                            </p>
+                            {effectiveRestrictions.map((c) => (
+                                <CohortCard key={c.cohort_id} cohort={c} />
+                            ))}
+                        </>
+                    )}
 
                     {/* Restriction notice */}
                     <div className="flex items-start space-x-2 p-3 bg-yellow-50 rounded-lg border border-yellow-200">
@@ -670,7 +708,7 @@ function DetailItem({ icon, label, value }: { icon: React.ReactNode; label: stri
 /* ── Cohort Card ───────────────────────────────────────────── */
 
 function CohortCard({ cohort }: { cohort: TrialCohortFilter }) {
-    const tags = buildFilterTags(cohort.filter_criteria);
+    const tags = buildFilterTags(cohort.filter_criteria ?? {});
 
     return (
         <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
@@ -702,36 +740,86 @@ function CohortCard({ cohort }: { cohort: TrialCohortFilter }) {
 
 interface FilterTag { icon: React.ReactNode; label: string }
 
-function buildFilterTags(c: CohortFilterCriteria): FilterTag[] {
+const REGION_CANONICAL_LABELS: Record<string, string> = {
+    EU: 'Europe',
+    NA: 'North America',
+    APAC: 'Asia-Pacific',
+    LATAM: 'Latin America',
+    MEA: 'Middle East and Africa',
+};
+
+const REGION_ALIASES: Record<string, string> = {
+    eu: 'EU',
+    europe: 'EU',
+    na: 'NA',
+    'north_america': 'NA',
+    'north america': 'NA',
+    apac: 'APAC',
+    'asia_pacific': 'APAC',
+    'asia pacific': 'APAC',
+    'asia-pacific': 'APAC',
+    latam: 'LATAM',
+    'latin_america': 'LATAM',
+    'latin america': 'LATAM',
+    mea: 'MEA',
+    'middle_east_and_africa': 'MEA',
+    'middle east and africa': 'MEA',
+};
+
+function normalizeRegionLabel(value: string): string {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const key = raw.toLowerCase().replace(/-/g, ' ');
+    const normalizedKey = key.replace(/\s+/g, ' ').replace(/ /g, '_');
+    const canonical = REGION_ALIASES[key] || REGION_ALIASES[normalizedKey] || raw.toUpperCase();
+    return REGION_CANONICAL_LABELS[canonical] || raw;
+}
+
+function buildFilterTags(c: CohortFilterCriteria | Record<string, never>): FilterTag[] {
+    const criteria = c as CohortFilterCriteria;
     const tags: FilterTag[] = [];
 
-    const hasMin = c.age_min !== undefined && c.age_min > 0;
-    const hasMax = c.age_max !== undefined && c.age_max < 100;
+    const hasMin = criteria.age_min !== undefined && criteria.age_min > 0;
+    const hasMax = criteria.age_max !== undefined && criteria.age_max < 100;
     if (hasMin || hasMax) {
-        tags.push({ icon: <Calendar className="h-3 w-3 text-blue-500" />, label: `Age ${c.age_min ?? 0}–${c.age_max ?? 100}` });
+        tags.push({ icon: <Calendar className="h-3 w-3 text-blue-500" />, label: `Age ${criteria.age_min ?? 0}–${criteria.age_max ?? 100}` });
     }
-    if (c.sex?.length) {
-        tags.push({ icon: <Users className="h-3 w-3 text-pink-500" />, label: `Sex: ${c.sex.join(', ')}` });
+    if (criteria.sex?.length) {
+        tags.push({ icon: <Users className="h-3 w-3 text-pink-500" />, label: `Sex: ${criteria.sex.join(', ')}` });
     }
-    c.ethnicity?.forEach((e) =>
+    criteria.ethnicity?.forEach((e) =>
         tags.push({ icon: <Users className="h-3 w-3 text-orange-500" />, label: e })
     );
-    c.conditions?.forEach((cond) =>
+    criteria.conditions?.forEach((cond) =>
         tags.push({ icon: <Heart className="h-3 w-3 text-red-500" />, label: cond })
     );
-    if (c.phases?.length) {
-        tags.push({ icon: <FlaskConical className="h-3 w-3 text-indigo-500" />, label: c.phases.join(', ') });
+    if (criteria.phases?.length) {
+        tags.push({ icon: <FlaskConical className="h-3 w-3 text-indigo-500" />, label: criteria.phases.join(', ') });
     }
-    c.country?.forEach((co) =>
+    criteria.country?.forEach((co) =>
         tags.push({ icon: <MapPin className="h-3 w-3 text-green-500" />, label: co })
     );
-    c.therapeutic_areas?.forEach((a) =>
+    const regionValues = [
+        ...(criteria.region ?? []),
+        ...(criteria.regions ?? []),
+    ];
+    const normalizedRegions: string[] = [];
+    for (const value of regionValues) {
+        const normalized = normalizeRegionLabel(value);
+        if (normalized && !normalizedRegions.includes(normalized)) {
+            normalizedRegions.push(normalized);
+        }
+    }
+    normalizedRegions.forEach((r) =>
+        tags.push({ icon: <MapPin className="h-3 w-3 text-sky-500" />, label: `Region: ${r}` })
+    );
+    criteria.therapeutic_areas?.forEach((a) =>
         tags.push({ icon: <Tag className="h-3 w-3 text-teal-500" />, label: a })
     );
-    if (c.disposition_status?.length) {
-        tags.push({ icon: <Shield className="h-3 w-3 text-gray-500" />, label: `Status: ${c.disposition_status.join(', ')}` });
+    if (criteria.disposition_status?.length) {
+        tags.push({ icon: <Shield className="h-3 w-3 text-gray-500" />, label: `Status: ${criteria.disposition_status.join(', ')}` });
     }
-    c.arm_assigned?.forEach((arm) =>
+    criteria.arm_assigned?.forEach((arm) =>
         tags.push({ icon: <Database className="h-3 w-3 text-cyan-500" />, label: arm })
     );
 

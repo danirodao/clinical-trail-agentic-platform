@@ -51,22 +51,22 @@ def _append_demographic_filters(
                 pass
 
     if ethnicity and ethnicity.strip():
-        extra.append(f"LOWER({patient_alias}.ethnicity) LIKE LOWER(${idx})")
+        extra.append(f"LOWER({patient_alias}.ethnicity) LIKE LOWER(${idx}::text)")
         params.append(f"%{ethnicity.strip()}%")
         idx += 1
     
     if country and country.strip():
-        extra.append(f"LOWER({patient_alias}.country) LIKE LOWER(${idx})")
+        extra.append(f"LOWER({patient_alias}.country) LIKE LOWER(${idx}::text)")
         params.append(f"%{country.strip()}%")
         idx += 1
     
     if arm_assigned and arm_assigned.strip():
-        extra.append(f"LOWER({patient_alias}.arm_assigned) LIKE LOWER(${idx})")
+        extra.append(f"LOWER({patient_alias}.arm_assigned) LIKE LOWER(${idx}::text)")
         params.append(f"%{arm_assigned.strip()}%")
         idx += 1
     
     if disposition_status and disposition_status.strip():
-        extra.append(f"LOWER({patient_alias}.disposition_status) LIKE LOWER(${idx})")
+        extra.append(f"LOWER({patient_alias}.disposition_status) LIKE LOWER(${idx}::text)")
         params.append(f"%{disposition_status.strip()}%")
         idx += 1
         
@@ -161,3 +161,182 @@ def success_response(data: Any, metadata: dict | None = None) -> str:
 
 def error_response(message: str, code: str = "ERROR") -> str:
     return make_tool_response("error", error=message, code=code)
+
+
+def build_abac_sql_filters(
+    abac_context: dict | None,
+    table_alias: str = "ct",
+    param_offset: int = 1,
+    skip_allowed_fallbacks: bool = False,
+) -> tuple[list[str], list[Any], int]:
+    """
+    Build SQL WHERE clauses that enforce ABAC scope attributes against the
+    real columns that exist in the clinical_trial table.
+
+    Column mapping (DB ↔ ABAC context key):
+      clinical_trial.therapeutic_area  ↔  requested_area
+      clinical_trial.regions TEXT[]    ↔  requested_region
+      clinical_trial.phase             ↔  requested_phase
+
+    resource_classification and minimum_cohort_size do NOT map to DB columns -
+    they are enforced at the OpenFGA /check level (in CEL conditions) and by
+    the per-query cohort size enforcement in the tools. Do not add SQL filters
+    for them here.
+
+    skip_allowed_fallbacks: when True, the allowed_areas / allowed_regions /
+    allowed_phases governance-ceiling fallbacks are NOT applied as SQL filters.
+    Use this in patient analytics tools where trial authorization is already
+    enforced by build_authorized_patient_filter - applying governance ceilings
+    on top of explicit individual trial grants incorrectly blocks access.
+
+    Returns (conditions, params, next_param_index).
+    """
+    if not abac_context:
+        return [], [], param_offset
+
+    conditions: list[str] = []
+    params: list[Any] = []
+    idx = param_offset
+
+    # requested_area -> clinical_trial.therapeutic_area (case-insensitive exact)
+    area = abac_context.get("requested_area", "").strip()
+    if area:
+        conditions.append(f"LOWER({table_alias}.therapeutic_area) = LOWER(${idx})")
+        params.append(area)
+        idx += 1
+    elif not skip_allowed_fallbacks:
+        allowed_areas = [
+            str(v).strip() for v in (abac_context.get("allowed_areas") or [])
+            if str(v).strip()
+        ]
+        if allowed_areas:
+            placeholders = ", ".join(f"${idx + i}" for i in range(len(allowed_areas)))
+            conditions.append(
+                f"LOWER({table_alias}.therapeutic_area) = ANY(ARRAY[{placeholders}]::text[])"
+            )
+            params.extend([v.lower() for v in allowed_areas])
+            idx += len(allowed_areas)
+
+    # requested_region -> clinical_trial.regions TEXT[] (ANY match).
+    # The DB stores freeform PDF-extracted strings; map ABAC tokens to all
+    # known synonyms so the filter hits existing data.
+    _REGION_SYNONYMS: dict[str, list[str]] = {
+        "EU": ["EU", "Europe", "European Union", "EEA"],
+        "NA": ["NA", "North America", "United States", "US", "Canada"],
+        "APAC": ["APAC", "Asia Pacific", "Asia-Pacific", "Asia"],
+        "LATAM": ["LATAM", "Latin America", "South America"],
+        "MEA": ["MEA", "Middle East", "Africa", "Middle East and Africa"],
+    }
+    region = abac_context.get("requested_region", "").strip()
+    if region:
+        synonyms = _REGION_SYNONYMS.get(region, [region])
+        placeholders = ", ".join(f"${idx + i}" for i in range(len(synonyms)))
+        conditions.append(
+            f"EXISTS (SELECT 1 FROM unnest({table_alias}.regions) r WHERE r = ANY(ARRAY[{placeholders}]::text[]))"
+        )
+        params.extend(synonyms)
+        idx += len(synonyms)
+    elif not skip_allowed_fallbacks:
+        allowed_regions = [
+            str(v).strip() for v in (abac_context.get("allowed_regions") or [])
+            if str(v).strip()
+        ]
+        if allowed_regions:
+            all_synonyms: list[str] = []
+            for reg in allowed_regions:
+                all_synonyms.extend(_REGION_SYNONYMS.get(reg, [reg]))
+            uniq_synonyms = sorted(set(all_synonyms))
+            placeholders = ", ".join(f"${idx + i}" for i in range(len(uniq_synonyms)))
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM unnest({table_alias}.regions) r WHERE r = ANY(ARRAY[{placeholders}]::text[]))"
+            )
+            params.extend(uniq_synonyms)
+            idx += len(uniq_synonyms)
+
+    # requested_phase -> clinical_trial.phase (e.g. "Phase 3", "Phase III", "III")
+    # The DB stores values like "Phase 3" while the ABAC context uses "III".
+    # We do a LIKE match to cover both naming conventions.
+    phase = abac_context.get("requested_phase", "").strip()
+    if phase:
+        # Strip "Phase " prefix if the user sent "Phase III"
+        bare = phase.replace("Phase ", "").strip()
+        conditions.append(
+            f"({table_alias}.phase ILIKE ${idx} OR {table_alias}.phase ILIKE ${idx + 1})"
+        )
+        params.append(f"%{bare}%")
+        params.append(f"%{phase}%")
+        idx += 2
+    elif not skip_allowed_fallbacks:
+        allowed_phases = [
+            str(v).strip() for v in (abac_context.get("allowed_phases") or [])
+            if str(v).strip()
+        ]
+        if allowed_phases:
+            phase_conds: list[str] = []
+            for p in allowed_phases:
+                bare = p.replace("Phase ", "").strip()
+                phase_conds.append(
+                    f"({table_alias}.phase ILIKE ${idx} OR {table_alias}.phase ILIKE ${idx + 1})"
+                )
+                params.append(f"%{bare}%")
+                params.append(f"%{p}%")
+                idx += 2
+            conditions.append("(" + " OR ".join(phase_conds) + ")")
+
+    return conditions, params, idx
+def build_abac_qdrant_filters(
+    abac_context: dict | None,
+) -> list[Any]:
+    """
+    Build Qdrant FieldCondition filters that enforce ABAC scope against the
+    payload fields stored in the clinical_trial_embeddings collection.
+
+    Qdrant payload fields used:
+      therapeutic_area   ↔  requested_area
+      phase              ↔  requested_phase
+
+    region is NOT stored in Qdrant payload chunks (stored only in PostgreSQL)
+    — region filtering is already handled by the PostgreSQL trial-ID gate that
+    restricts `trial_ids` passed to search_vectors().
+
+    Returns a list of FieldCondition objects ready to add to Qdrant must=[].
+    """
+    from qdrant_client.models import FieldCondition, MatchValue
+
+    if not abac_context:
+        return []
+
+    conditions: list[FieldCondition] = []
+
+    area = abac_context.get("requested_area", "").strip()
+    if area:
+        conditions.append(
+            FieldCondition(key="therapeutic_area", match=MatchValue(value=area.lower()))
+        )
+    else:
+        allowed_areas = [
+            str(v).strip().lower() for v in (abac_context.get("allowed_areas") or [])
+            if str(v).strip()
+        ]
+        if len(allowed_areas) == 1:
+            conditions.append(
+                FieldCondition(key="therapeutic_area", match=MatchValue(value=allowed_areas[0]))
+            )
+
+    phase = abac_context.get("requested_phase", "").strip()
+    if phase:
+        bare = phase.replace("Phase ", "").strip()
+        conditions.append(
+            FieldCondition(key="phase", match=MatchValue(value=bare))
+        )
+    else:
+        allowed_phases = [
+            str(v).strip().replace("Phase ", "") for v in (abac_context.get("allowed_phases") or [])
+            if str(v).strip()
+        ]
+        if len(allowed_phases) == 1:
+            conditions.append(
+                FieldCondition(key="phase", match=MatchValue(value=allowed_phases[0]))
+            )
+
+    return conditions

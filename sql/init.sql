@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS outcome_measure (
     description TEXT
 );
 
+-- ── COUNTRY → REGION LOOKUP ──
+CREATE TABLE IF NOT EXISTS country_region (
+    country VARCHAR(200) PRIMARY KEY,
+    region  VARCHAR(100) NOT NULL
+);
+
 -- ── PATIENT ──
 CREATE TABLE IF NOT EXISTS patient (
     patient_id UUID PRIMARY KEY DEFAULT gen_random_uuid (),
@@ -98,6 +104,7 @@ CREATE TABLE IF NOT EXISTS patient (
     race VARCHAR(255),
     ethnicity VARCHAR(255),
     country VARCHAR(100),
+    region  VARCHAR(100),
     enrollment_date DATE,
     randomization_date DATE,
     arm_assigned TEXT,
@@ -107,6 +114,8 @@ CREATE TABLE IF NOT EXISTS patient (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_patient_region ON patient (region);
 
 CREATE TABLE IF NOT EXISTS patient_trial_enrollment (
     enrollment_id UUID PRIMARY KEY DEFAULT gen_random_uuid (),

@@ -24,10 +24,19 @@ if TYPE_CHECKING:
 
 
 
-def serialize_access_profile(access_profile: "AccessProfile") -> Dict[str, Any]:
+def serialize_access_profile(
+    access_profile: "AccessProfile",
+    abac_context: dict | None = None,
+) -> Dict[str, Any]:
     """
     Correctly serializes the researcher's AccessProfile.
     FIXED: Now populates trial_metadata with NCT IDs for reverse lookup.
+
+    abac_context — if provided (from OpenFGAContextBuilder.build()), the
+    DYNAMIC ABAC/PBAC attributes are embedded so that MCP tools can enforce
+    fine-grained conditions per tool call without re-deriving them.
+    The raw JWT and clearance_level are NEVER embedded — only the pre-validated
+    context dict produced by OpenFGAContextBuilder is safe to forward.
     """
     if not hasattr(access_profile, 'has_any_access') or not access_profile.has_any_access:
         return {}
@@ -50,7 +59,7 @@ def serialize_access_profile(access_profile: "AccessProfile") -> Dict[str, Any]:
                     for cs in scope.cohort_scopes
                 ]
 
-    return {
+    serialized: Dict[str, Any] = {
         "user_id":          getattr(access_profile, 'user_id', 'unknown'),
         "role":             getattr(access_profile, 'role', 'researcher'),
         "organization_id":  getattr(access_profile, 'organization_id', ''),
@@ -59,6 +68,13 @@ def serialize_access_profile(access_profile: "AccessProfile") -> Dict[str, Any]:
         "patient_filters":  patient_filters,
         "trial_metadata":   trial_metadata,
     }
+
+    # Embed ABAC dynamic context so MCP tools can call check_with_context()
+    # per tool invocation without reconstructing it from scratch each time.
+    if abac_context:
+        serialized["abac_context"] = abac_context
+
+    return serialized
 
 
 def describe_filters(access_profile: Any) -> list[str]:
@@ -70,24 +86,106 @@ def describe_filters(access_profile: Any) -> list[str]:
       ["ethnicity: Hispanic or Latino", "age: 10–100", "conditions: Type 2 Diabetes"]
     """
     descriptions: list[str] = []
-    seen: set[str] = set()
 
-    for trial_id, scope in access_profile.trial_scopes.items():
+    abac_context = getattr(access_profile, "abac_context", {}) or {}
+    requested_region = str(abac_context.get("requested_region") or "").strip()
+    per_trial_allowed_regions = abac_context.get("per_trial_allowed_regions") or {}
+    allowed_regions = [
+        str(v).strip()
+        for v in (abac_context.get("allowed_regions") or [])
+        if str(v).strip()
+    ]
+
+    scoped_trial_ids = sorted(
+        str(tid)
+        for tid, scope in access_profile.trial_scopes.items()
+        if getattr(scope, "access_level", "aggregate") == "individual"
+    )
+
+    def _format_criterion(key: str, value: Any) -> str | None:
+        if key in {
+            "trial_ids", "therapeutic_areas", "therapeutic_area",
+            "areas", "area", "phases", "phase", "region", "regions",
+        }:
+            return None
+
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, list):
+            values = [str(v).strip() for v in value if str(v).strip()]
+            if not values:
+                return None
+            return f"{key.replace('_', ' ')}: {', '.join(values)}"
+
+        if key == "age_min":
+            return f"age ≥ {value}"
+        if key == "age_max":
+            return f"age ≤ {value}"
+        return f"{key.replace('_', ' ')}: {value}"
+
+    for trial_id in scoped_trial_ids:
+        scope = access_profile.trial_scopes.get(trial_id)
+        if not scope:
+            continue
+
+        trial_filters: list[str] = []
+        seen_for_trial: set[str] = set()
+
+        # Extract effective regions from cohort filter criteria (most accurate source)
+        # The router calculates these after intersecting grant + tuple + metadata scopes
+        trial_regions_from_criteria: set[str] = set()
         for cs in scope.cohort_scopes:
-            criteria = cs.filter_criteria
-            for key, value in criteria.items():
-                if key == "age_min":
-                    desc = f"age ≥ {value}"
-                elif key == "age_max":
-                    desc = f"age ≤ {value}"
-                elif isinstance(value, list):
-                    desc = f"{key.replace('_', ' ')}: {', '.join(str(v) for v in value)}"
-                else:
-                    desc = f"{key.replace('_', ' ')}: {value}"
+            criteria = cs.filter_criteria or {}
+            region_vals = criteria.get("region") or criteria.get("regions") or []
+            if isinstance(region_vals, list):
+                trial_regions_from_criteria.update(
+                    str(v).strip() for v in region_vals if str(v).strip()
+                )
+            elif region_vals:
+                trial_regions_from_criteria.add(str(region_vals).strip())
 
-                if desc not in seen:
-                    descriptions.append(desc)
-                    seen.add(desc)
+        # Region display precedence (mirrors _build_patient_region_guard in access_control.py):
+        # 1. Region set directly in cohort filter criteria (patient-level cohort with region)
+        # 2. requested_region from ABAC context (explicit scope parameter)
+        # 3. per_trial_allowed_regions[trial_id] — per-trial grant from OpenFGA tuple
+        # 4. Global allowed_regions — last resort, show as "allowed regions"
+        if trial_regions_from_criteria:
+            desc = f"region: {', '.join(sorted(trial_regions_from_criteria))}"
+            trial_filters.append(desc)
+            seen_for_trial.add(desc)
+        elif requested_region:
+            trial_filters.append(f"region: {requested_region}")
+            seen_for_trial.add(f"region: {requested_region}")
+        else:
+            trial_specific = [
+                str(v).strip()
+                for v in (per_trial_allowed_regions.get(trial_id) or [])
+                if str(v).strip()
+            ]
+            if trial_specific:
+                desc = f"region: {', '.join(sorted(set(trial_specific)))}"
+                trial_filters.append(desc)
+                seen_for_trial.add(desc)
+            elif allowed_regions:
+                desc = f"allowed regions: {', '.join(sorted(set(allowed_regions)))}"
+                trial_filters.append(desc)
+                seen_for_trial.add(desc)
+
+        for cs in scope.cohort_scopes:
+            criteria = cs.filter_criteria or {}
+            for key, value in criteria.items():
+                formatted = _format_criterion(key, value)
+                if not formatted:
+                    continue
+                if formatted in seen_for_trial:
+                    continue
+                trial_filters.append(formatted)
+                seen_for_trial.add(formatted)
+
+        if trial_filters:
+            descriptions.append(f"trial {trial_id}: {'; '.join(trial_filters)}")
 
     return descriptions
 

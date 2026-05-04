@@ -519,7 +519,11 @@ class ClinicalTrialGenerator:
             sex=sex,
             race=random.choice(RACE_OPTIONS),
             ethnicity=random.choice(ETHNICITY_OPTIONS),
-            country=random.choice(trial.countries) if trial.countries else "US",
+            country=(_country := random.choice(trial.countries) if trial.countries else "US"),
+            region=next(
+                (r for r, countries in REGIONS_COUNTRIES.items() if _country in countries),
+                None,
+            ),
             enrollment_date=enrollment_date,
             arm_assigned=arm.arm_label,
             disposition_status=disposition,

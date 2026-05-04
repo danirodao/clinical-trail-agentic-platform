@@ -53,6 +53,28 @@ from ..models import (
 logger = structlog.get_logger(__name__)
 tracer = get_tracer()
 
+SEMANTIC_TOOL_NAMES = {
+    "get_semantic_cognitive_frame",
+    "resolve_semantic_term",
+    "get_concept_definition",
+    "list_ontology_concepts",
+    "get_field_concept_map",
+    "map_code_to_concept",
+    "map_concept_to_codes",
+    "semantic_compatibility_check",
+    "normalize_clinical_term",
+    "explain_metric_semantics",
+}
+
+VECTOR_DB_TOOLS = {
+    "search_documents",
+    "search_trials",
+}
+
+KNOWLEDGE_GRAPH_TOOLS = {
+    "find_drug_condition_relationships",
+}
+
 # Regex to detect UUID-format strings that may be patient IDs
 _UUID_PATTERN = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -108,6 +130,11 @@ def synthesizer_node(state: AgentState, start_time: float) -> dict:
 
         # ── Active filters (human-readable) ──────────────────────────────
         filters_applied = describe_filters(proxy)
+        response_sources = _infer_response_sources(raw_records)
+        if response_sources:
+            filters_applied.append(
+                "response sources: " + ", ".join(response_sources)
+            )
 
         # ── Security: prepend warning if aggregate answer has row-level data
         # Pass ceiling_applied so the warning can mention enforcement
@@ -135,6 +162,7 @@ def synthesizer_node(state: AgentState, start_time: float) -> dict:
         response = QueryResponse(
             answer=answer,
             sources=sources,
+            response_sources=response_sources,
             tool_calls=tool_call_records,
             access_level_applied=access_level,
             filters_applied=filters_applied,
@@ -390,6 +418,50 @@ def _extract_queried_trial_ids(records: list[dict]) -> list[str]:
     return list(ids)
 
 
+def _infer_response_sources(records: list[dict]) -> list[str]:
+    """
+    Infer high-level provenance categories from executed tools.
+
+    Categories returned:
+      - knowledge graph
+      - database
+      - vector db
+    """
+    has_database = False
+    has_graph = False
+    has_vector = False
+
+    for record in records:
+        tool_name = str(record.get("tool", "")).strip()
+        if not tool_name:
+            continue
+
+        if tool_name in SEMANTIC_TOOL_NAMES or tool_name.startswith("semantic_"):
+            has_graph = True
+            continue
+
+        if tool_name in KNOWLEDGE_GRAPH_TOOLS:
+            has_graph = True
+            has_database = True
+            continue
+
+        if tool_name in VECTOR_DB_TOOLS:
+            has_vector = True
+            has_database = True
+            continue
+
+        has_database = True
+
+    sources: list[str] = []
+    if has_graph:
+        sources.append("knowledge graph")
+    if has_database:
+        sources.append("database")
+    if has_vector:
+        sources.append("vector db")
+    return sources
+
+
 class _ProfileDictProxy:
     """
     Minimal proxy over the access_profile_dict stored in AgentState.
@@ -423,3 +495,7 @@ class _ProfileDictProxy:
     @property
     def allowed_trial_ids(self) -> list[str]:
         return self._d.get("allowed_trial_ids", [])
+
+    @property
+    def abac_context(self) -> dict:
+        return self._d.get("abac_context", {})

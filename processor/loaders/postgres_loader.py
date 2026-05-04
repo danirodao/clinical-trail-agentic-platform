@@ -213,9 +213,9 @@ class PostgresLoader:
                 await conn.execute("""
                     INSERT INTO patient (
                         patient_id, subject_id, site_id, age, sex,
-                        race, ethnicity, country, enrollment_date,
+                        race, ethnicity, country, region, enrollment_date,
                         arm_assigned, disposition_status
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 """,
                     uuid.UUID(patient_id),
                     patient_data.get('subject_id', ''),
@@ -225,6 +225,7 @@ class PostgresLoader:
                     patient_data.get('race'),
                     patient_data.get('ethnicity'),
                     patient_data.get('country'),
+                    patient_data.get('region'),
                     self._parse_date(patient_data.get('enrollment_date')),
                     patient_data.get('arm_assigned'),
                     patient_data.get('disposition_status', 'Enrolled')

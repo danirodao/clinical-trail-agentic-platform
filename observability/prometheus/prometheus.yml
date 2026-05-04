@@ -8,6 +8,9 @@ global:
     project: "clinical-trial-research-platform"
     environment: "development"
 
+rule_files:
+  - /etc/prometheus/alerts/agent-alerts.yml
+
 scrape_configs:
   # ── FastAPI API Gateway ──────────────────────────────────────────────────
   - job_name: "clinical-trial-api"

@@ -14,7 +14,13 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response
+from utils import (
+    success_response,
+    error_response,
+    serialize_row,
+    build_abac_sql_filters,
+    build_abac_qdrant_filters,
+)
 from db import postgres, neo4j_client, qdrant_client
 from observability import instrument_tool
 
@@ -51,11 +57,49 @@ async def _resolve_nct_ids(ids: list[str]) -> list[str]:
         except Exception as e:
             logger.warning(f"NCT ID resolution failed: {e}")
     return resolved
+
+
+async def _filter_trials_by_abac(
+    trial_ids: list[str],
+    abac_context: dict | None,
+) -> list[str]:
+    """
+    Apply ABAC trial-level filters (region/area/phase) to a trial ID set.
+
+    This creates a single effective trial scope that all knowledge discovery
+    branches (Neo4j, PostgreSQL fallback, Qdrant) must reuse.
+    """
+    if not trial_ids:
+        return []
+
+    conditions = ["ct.trial_id::text = ANY($1::text[])"]
+    params: list[Any] = [trial_ids]
+    idx = 2
+
+    abac_conds, abac_params, idx = build_abac_sql_filters(
+        abac_context,
+        table_alias="ct",
+        param_offset=idx,
+    )
+    if abac_conds:
+        conditions.extend(abac_conds)
+        params.extend(abac_params)
+
+    rows = await postgres.fetch(
+        f"""
+        SELECT ct.trial_id::text AS trial_id
+        FROM clinical_trial ct
+        WHERE {' AND '.join(conditions)}
+        """,
+        *params,
+    )
+    return [str(r["trial_id"]) for r in rows]
 async def _postgres_drug_condition_fallback(
     trial_ids: list[str],
     drug_name: str,
     condition_name: str,
     limit: int,
+    abac_context: dict | None = None,
 ) -> dict[str, list]:
     """
     PostgreSQL fallback for trials that have no data in Neo4j.
@@ -78,6 +122,15 @@ async def _postgres_drug_condition_fallback(
         drug_conditions: list[str] = [f"ct.trial_id IN ({placeholders})"]
         drug_params: list[Any] = list(trial_ids)
         drug_idx = len(trial_ids) + 1
+
+        abac_conds, abac_params, drug_idx = build_abac_sql_filters(
+            abac_context,
+            table_alias="ct",
+            param_offset=drug_idx,
+        )
+        if abac_conds:
+            drug_conditions.extend(abac_conds)
+            drug_params.extend(abac_params)
 
         if drug_name:
             drug_conditions.append(
@@ -112,6 +165,15 @@ async def _postgres_drug_condition_fallback(
         cond_conditions: list[str] = [f"ct.trial_id IN ({placeholders})"]
         cond_params: list[Any] = list(trial_ids)
         cond_idx = len(trial_ids) + 1
+
+        abac_conds, abac_params, cond_idx = build_abac_sql_filters(
+            abac_context,
+            table_alias="ct",
+            param_offset=cond_idx,
+        )
+        if abac_conds:
+            cond_conditions.extend(abac_conds)
+            cond_params.extend(abac_params)
 
         if condition_name:
             cond_conditions.append(
@@ -228,15 +290,26 @@ def register_tools(mcp: FastMCP) -> None:
 
             max_results = min(int(limit), 100)
 
+            # Apply ABAC trial-level scope once and reuse for every backend.
+            effective_trials = await _filter_trials_by_abac(
+                authorized,
+                ctx.abac_context,
+            )
+            if not effective_trials:
+                return error_response(
+                    "No trials matched ABAC governance scope.",
+                    "ACCESS_DENIED",
+                )
+
             # Log exactly which trials we are querying so we can diagnose gaps
             logger.info(
                 f"find_drug_condition_relationships: querying {len(authorized)} trials: "
-                f"{authorized}"
+                f"{effective_trials}"
             )
 
             # Build Cypher trial filter — UUIDs from our own DB, safe to inline
             trial_ids_cypher = (
-                "[" + ", ".join(f'"{t}"' for t in authorized) + "]"
+                "[" + ", ".join(f'"{t}"' for t in effective_trials) + "]"
             )
 
             results: dict[str, Any] = {
@@ -349,10 +422,14 @@ def register_tools(mcp: FastMCP) -> None:
                         results["drug_condition_links"] = cond_drug_rows
 
                     comorbid_rows = await neo4j_client.run_cypher(
-                        """
-                        MATCH (c1:Condition)-[:COMORBID_WITH]->(c2:Condition)
-                        WHERE toLower(c1.name) CONTAINS toLower($condition_name)
-                        OR toLower(c2.name) CONTAINS toLower($condition_name)
+                        f"""
+                        MATCH (t:ClinicalTrial)-[:STUDIES]->(c1:Condition)
+                        MATCH (c1)-[:COMORBID_WITH]->(c2:Condition)
+                        WHERE t.trial_id IN {trial_ids_cypher}
+                        AND (
+                            toLower(c1.name) CONTAINS toLower($condition_name)
+                            OR toLower(c2.name) CONTAINS toLower($condition_name)
+                        )
                         RETURN DISTINCT
                             c1.name AS condition_a,
                             c2.name AS condition_b,
@@ -381,6 +458,7 @@ def register_tools(mcp: FastMCP) -> None:
                             ae.meddra_pt  AS meddra_pt,
                             ae.soc        AS soc,
                             t.nct_id      AS nct_id,
+                            t.trial_id    AS trial_id,
                             t.phase       AS phase,
                             COUNT(p)      AS patient_count
                         ORDER BY patient_count DESC
@@ -389,7 +467,7 @@ def register_tools(mcp: FastMCP) -> None:
                         {"ae_term": ae_term.strip(), "limit": max_results},
                     )
                     results["adverse_events"] = ae_rows
-                    neo4j_trial_ids_found.update(r.get("nct_id", "") for r in ae_rows)
+                    neo4j_trial_ids_found.update(r.get("trial_id", "") for r in ae_rows)
 
                 except Exception as e:
                     logger.warning(f"Neo4j AE query failed: {e}")
@@ -429,7 +507,7 @@ def register_tools(mcp: FastMCP) -> None:
             # ----------------------------------------------------------
             # Find which authorized trials got zero results from Neo4j
             missing_from_neo4j = [
-                tid for tid in authorized
+                tid for tid in effective_trials
                 if tid not in neo4j_trial_ids_found
             ]
 
@@ -444,6 +522,7 @@ def register_tools(mcp: FastMCP) -> None:
                     drug_name=drug_name.strip(),
                     condition_name=condition_name.strip(),
                     limit=max_results,
+                    abac_context=ctx.abac_context,
                 )
 
                 # Merge PostgreSQL fallback into results
@@ -466,7 +545,7 @@ def register_tools(mcp: FastMCP) -> None:
                         "ae_term":        ae_term or None,
                     },
                     "result_counts": {k: len(v) for k, v in results.items()},
-                    "authorized_trials":         len(authorized),
+                    "authorized_trials":         len(effective_trials),
                     "trials_with_neo4j_data":    len(neo4j_trial_ids_found),
                     "trials_from_pg_fallback":   len(missing_from_neo4j),
                     "graph_schema": {
@@ -541,6 +620,13 @@ def register_tools(mcp: FastMCP) -> None:
                 # No trial_ids specified — search all authorized trials
                 search_in = ctx.allowed_trial_ids
 
+            search_in = await _filter_trials_by_abac(search_in, ctx.abac_context)
+            if not search_in:
+                return error_response(
+                    "No trials matched ABAC governance scope.",
+                    "ACCESS_DENIED",
+                )
+
             max_chunks = min(int(limit), 30)
 
             valid_sections = {
@@ -560,12 +646,14 @@ def register_tools(mcp: FastMCP) -> None:
                         logger.warning(f"Unknown section '{s}', ignoring filter.")
 
             try:
+                qdrant_abac = build_abac_qdrant_filters(ctx.abac_context)
                 chunks = await qdrant_client.search_vectors(
                     query_text=query.strip(),
                     trial_ids=search_in,
                     limit=max_chunks,
                     section=section_filter,
                     score_threshold=0.25,
+                    extra_must_conditions=qdrant_abac,
                 )
             except Exception as e:
                 logger.error(f"Qdrant search error: {e}", exc_info=True)

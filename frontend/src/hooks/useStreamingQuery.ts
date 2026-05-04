@@ -1,5 +1,20 @@
 import { useState, useCallback, useRef } from 'react';
-import { researcherApi, QueryRequest, QueryResponse, ToolCallRecord } from '../api/client';
+import { researcherApi, QueryRequest, QueryResponse, StreamingApiError } from '../api/client';
+
+interface GovernanceErrorInfo {
+    missingScopeFields: string[];
+    code?: string;
+    purposeMismatch?: boolean;
+    declaredPurpose?: string;
+    inferredPurpose?: string;
+}
+
+interface GovernanceWarningInfo {
+    purposeMismatch?: boolean;
+    declaredPurpose?: string;
+    inferredPurpose?: string;
+    message?: string;
+}
 
 interface ActiveToolCall {
     tool: string;
@@ -16,6 +31,8 @@ export function useStreamingQuery() {
     const [activeTools, setActiveTools] = useState<ActiveToolCall[]>([]);
     const [finalResponse, setFinalResponse] = useState<QueryResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [governanceError, setGovernanceError] = useState<GovernanceErrorInfo | null>(null);
+    const [governanceWarning, setGovernanceWarning] = useState<GovernanceWarningInfo | null>(null);
 
     const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -25,6 +42,8 @@ export function useStreamingQuery() {
         setActiveTools([]);
         setFinalResponse(null);
         setError(null);
+        setGovernanceError(null);
+        setGovernanceWarning(null);
     };
 
     const cancelQuery = useCallback(() => {
@@ -65,6 +84,14 @@ export function useStreamingQuery() {
                         switch (event.event) {
                             case 'status':
                                 setStatusMessage(event.data.message);
+                                if (event.data?.code === 'purpose_mismatch') {
+                                    setGovernanceWarning({
+                                        purposeMismatch: true,
+                                        declaredPurpose: event.data?.declared_purpose,
+                                        inferredPurpose: event.data?.inferred_purpose,
+                                        message: event.data?.message,
+                                    });
+                                }
                                 break;
 
                             case 'tool_call':
@@ -115,7 +142,29 @@ export function useStreamingQuery() {
                 }
             }
         } catch (err: any) {
-            setError(err.message || 'Network request failed');
+            if (err instanceof StreamingApiError) {
+                setError(err.message || 'Network request failed');
+                const missing = err.detail?.missing_scope_fields || [];
+                if (missing.length > 0) {
+                    setGovernanceError({
+                        missingScopeFields: missing,
+                        code: err.detail?.code,
+                        purposeMismatch: err.detail?.purpose_mismatch,
+                        declaredPurpose: err.detail?.declared_purpose,
+                        inferredPurpose: err.detail?.inferred_purpose,
+                    });
+                } else if (err.detail?.purpose_mismatch) {
+                    setGovernanceError({
+                        missingScopeFields: [],
+                        code: err.detail?.code,
+                        purposeMismatch: true,
+                        declaredPurpose: err.detail?.declared_purpose,
+                        inferredPurpose: err.detail?.inferred_purpose,
+                    });
+                }
+            } else {
+                setError(err?.message || 'Network request failed');
+            }
             setIsQuerying(false);
         }
     }, []);
@@ -129,6 +178,8 @@ export function useStreamingQuery() {
         activeTools,
         finalResponse,
         error,
+        governanceError,
+        governanceWarning,
         resetState
     };
 }

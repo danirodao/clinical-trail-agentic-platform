@@ -14,7 +14,7 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from access_control import AccessContext
-from utils import success_response, error_response, serialize_row, _append_demographic_filters
+from utils import success_response, error_response, serialize_row, _append_demographic_filters, build_abac_sql_filters
 
 from db import postgres
 from observability import instrument_tool
@@ -78,7 +78,14 @@ def register_tools(mcp: FastMCP) -> None:
         limit: int = 100,
     ) -> str:
 
-        """Get adverse event data from clinical trials."""
+        """
+        Get adverse event data from clinical trials.
+
+        Note:
+            `event_term` should be an adverse-event term (e.g., nausea,
+            headache, dizziness), not a disease/theme label such as
+            "diabetes" or "oncology".
+        """
         try:
             ctx = AccessContext.from_json(access_context)
             
@@ -100,7 +107,21 @@ def register_tools(mcp: FastMCP) -> None:
             )
             params.extend(auth_params)
 
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context,
+                table_alias="ct",
+                param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                auth_where = (
+                    f"({auth_where}) AND EXISTS (SELECT 1 FROM clinical_trial ct "
+                    f"WHERE ct.trial_id = pte.trial_id AND {' AND '.join(abac_conds)})"
+                )
+                params.extend(abac_params)
+
             extra: list[str] = []
+            event_term_condition: str | None = None
             if severity and severity.strip():
                 extra.append(f"ae.severity = ${idx}")
                 params.append(severity.strip())
@@ -108,7 +129,8 @@ def register_tools(mcp: FastMCP) -> None:
             if serious_only:
                 extra.append("ae.serious = TRUE")
             if event_term and event_term.strip():
-                extra.append(f"LOWER(ae.ae_term) LIKE LOWER(${idx})")
+                event_term_condition = f"LOWER(ae.ae_term) LIKE LOWER(${idx})"
+                extra.append(event_term_condition)
                 params.append(f"%{event_term.strip()}%")
                 idx += 1
 
@@ -122,9 +144,15 @@ def register_tools(mcp: FastMCP) -> None:
 
             all_conds = [f"({auth_where})"] + extra
             where = " AND ".join(all_conds)
+            logger.info(
+                "AE_FILTER_DEBUG trials=%s where=%s params=%s",
+                authorized,
+                where,
+                params,
+            )
 
             # --- Summary ---
-            summary_sql = f"""
+            summary_sql_template = """
                 SELECT
                     COUNT(*)                                         AS total_events,
                     COUNT(DISTINCT ae.patient_id)                   AS patients_with_ae,
@@ -137,8 +165,35 @@ def register_tools(mcp: FastMCP) -> None:
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                 WHERE ae.trial_id = pte.trial_id AND {where}
             """
+            summary_sql = summary_sql_template.format(where=where)
             summary_rows = await postgres.fetch(summary_sql, *params)
             summary = serialize_row(summary_rows[0]) if summary_rows else {}
+
+            effective_where = where
+            event_term_fallback_applied = False
+
+            # If the model passed a non-AE phrase as event_term (e.g. "diabetes"),
+            # it can zero out valid adverse event results. Retry without the term
+            # filter when that specific condition caused an empty result set.
+            if event_term and int(summary.get("total_events") or 0) == 0:
+                extra_without_event = [
+                    (f"({c} OR TRUE)" if event_term_condition and c == event_term_condition else c)
+                    for c in extra
+                ]
+                fallback_where = " AND ".join([f"({auth_where})"] + extra_without_event)
+                fallback_sql = summary_sql_template.format(where=fallback_where)
+                fallback_rows = await postgres.fetch(fallback_sql, *params)
+                fallback_summary = serialize_row(fallback_rows[0]) if fallback_rows else {}
+                if int(fallback_summary.get("total_events") or 0) > 0:
+                    summary = fallback_summary
+                    effective_where = fallback_where
+                    event_term_fallback_applied = True
+                    logger.info(
+                        "AE_FILTER_DEBUG_FALLBACK_APPLIED trials=%s where=%s params=%s",
+                        authorized,
+                        fallback_where,
+                        params,
+                    )
 
             # --- Top AE terms ---
             top_sql = f"""
@@ -146,7 +201,7 @@ def register_tools(mcp: FastMCP) -> None:
                 FROM adverse_event ae
                 JOIN patient p ON ae.patient_id = p.patient_id
                 JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                WHERE ae.trial_id = pte.trial_id AND {where}
+                WHERE ae.trial_id = pte.trial_id AND {effective_where}
                 GROUP BY ae.ae_term
                 ORDER BY count DESC
                 LIMIT 20
@@ -184,7 +239,7 @@ def register_tools(mcp: FastMCP) -> None:
                     JOIN patient p ON ae.patient_id = p.patient_id
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                     {trial_join}
-                    WHERE ae.trial_id = pte.trial_id AND {where}
+                    WHERE ae.trial_id = pte.trial_id AND {effective_where}
                     GROUP BY {', '.join(group_exprs)}
                     ORDER BY event_count DESC
                     LIMIT 50
@@ -204,7 +259,7 @@ def register_tools(mcp: FastMCP) -> None:
                     JOIN patient p ON ae.patient_id = p.patient_id
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                     JOIN clinical_trial ct ON ae.trial_id = ct.trial_id
-                    WHERE ae.trial_id = pte.trial_id AND {where}
+                    WHERE ae.trial_id = pte.trial_id AND {effective_where}
                     ORDER BY ae.onset_date DESC NULLS LAST
                     LIMIT {max_records}
                 """
@@ -219,7 +274,11 @@ def register_tools(mcp: FastMCP) -> None:
                     "individual_records": individual_records or None,
                     "records_returned": len(individual_records),
                 },
-                metadata={"trials_queried": len(authorized), "effective_access_level": effective_level},
+                metadata={
+                    "trials_queried": len(authorized),
+                    "effective_access_level": effective_level,
+                    "event_term_fallback_applied": event_term_fallback_applied,
+                },
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")
@@ -265,6 +324,19 @@ def register_tools(mcp: FastMCP) -> None:
                 authorized, param_offset=idx
             )
             params.extend(auth_params)
+
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context,
+                table_alias="ct",
+                param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                auth_where = (
+                    f"({auth_where}) AND EXISTS (SELECT 1 FROM clinical_trial ct "
+                    f"WHERE ct.trial_id = pte.trial_id AND {' AND '.join(abac_conds)})"
+                )
+                params.extend(abac_params)
 
             extra: list[str] = []
             if test_name and test_name.strip():
@@ -375,6 +447,19 @@ def register_tools(mcp: FastMCP) -> None:
                 authorized, param_offset=idx
             )
             params.extend(auth_params)
+
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context,
+                table_alias="ct",
+                param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                auth_where = (
+                    f"({auth_where}) AND EXISTS (SELECT 1 FROM clinical_trial ct "
+                    f"WHERE ct.trial_id = pte.trial_id AND {' AND '.join(abac_conds)})"
+                )
+                params.extend(abac_params)
 
             extra: list[str] = []
             if vital_type and vital_type.strip():
@@ -496,6 +581,19 @@ def register_tools(mcp: FastMCP) -> None:
             )
             params.extend(auth_params)
 
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context,
+                table_alias="ct",
+                param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                auth_where = (
+                    f"({auth_where}) AND EXISTS (SELECT 1 FROM clinical_trial ct "
+                    f"WHERE ct.trial_id = pte.trial_id AND {' AND '.join(abac_conds)})"
+                )
+                params.extend(abac_params)
+
             extra: list[str] = []
             if medication_name and medication_name.strip():
                 extra.append(f"LOWER(pm.medication_name) LIKE LOWER(${idx})")
@@ -583,6 +681,19 @@ def register_tools(mcp: FastMCP) -> None:
                 [resolved_id], param_offset=idx
             )
             params.extend(auth_params)
+
+            abac_conds, abac_params, idx = build_abac_sql_filters(
+                ctx.abac_context,
+                table_alias="ct",
+                param_offset=idx,
+                skip_allowed_fallbacks=True,
+            )
+            if abac_conds:
+                auth_where = (
+                    f"({auth_where}) AND EXISTS (SELECT 1 FROM clinical_trial ct "
+                    f"WHERE ct.trial_id = pte.trial_id AND {' AND '.join(abac_conds)})"
+                )
+                params.extend(abac_params)
 
             requested_metrics = set(dimensions) if dimensions else {"demographics", "disposition", "adverse_events"}
 

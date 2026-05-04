@@ -22,6 +22,28 @@ class QueryRequest(BaseModel):
     trial_ids: Optional[List[str]] = Field(default=None, description="Optional subset of trial IDs")
     session_id: Optional[str] = Field(default=None, description="Conversation session ID")
 
+    # ABAC/PBAC scope declared by the caller for this specific query.
+    # Populated server-side in the router — NEVER trusted from the raw HTTP body.
+    # The router uses OpenFGAContextBuilder to assemble and validate these values
+    # before setting this field.
+    # Keys may include:
+    #   region, area, phase, purpose                (requested values)
+    #   allowed_regions, allowed_areas, allowed_phases (grant envelope)
+    # Router validates requested values against allowlists before use.
+    scope_params: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="ABAC scope params and optional grant envelope — set server-side",
+        exclude=True,   # never serialised back in the HTTP response
+    )
+
+    # Fully built ABAC/PBAC context generated in the router from
+    # OpenFGAContextBuilder.build(). Forwarded internally to AgentService/MCP.
+    abac_context: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Validated ABAC context for OpenFGA conditional checks",
+        exclude=True,   # internal-only field
+    )
+
 
 class ToolCallRecord(BaseModel):
     """Records a single tool invocation for audit trail and frontend display."""
@@ -51,6 +73,7 @@ class QueryMetadata(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: list[QuerySource] = Field(default_factory=list)
+    response_sources: list[str] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     access_level_applied: Literal["individual", "aggregate", "mixed", "none"]
     filters_applied: list[str] = Field(default_factory=list)

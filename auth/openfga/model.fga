@@ -2,6 +2,115 @@ model
   schema 1.1
 
 # ═══════════════════════════════════════════════════════════════
+# CONDITIONS  (ABAC + PBAC — evaluated at /check time via CEL)
+#
+# Naming convention:
+#   - STATIC params  → stored on the tuple at write time by the
+#                       governance approver; never change mid-approval.
+#   - DYNAMIC params → assembled at runtime by the calling app from
+#                       JWT claims, server clock, and API parameters;
+#                       passed in the /check "context" payload.
+# ═══════════════════════════════════════════════════════════════
+
+# ── COMPOSITE: all dimensions evaluated together ──────────────
+# Apply this to any relation where you need full governance enforcement.
+condition check_fine_grained_access(
+  # STATIC: approval window set by governance system at tuple-write time
+  valid_from:              timestamp,
+  valid_until:             timestamp,
+
+  # STATIC: regional/therapeutic scope set by governance approver
+  permitted_regions:       list<string>,   # e.g. ["EU", "NA"]
+  permitted_areas:         list<string>,   # e.g. ["oncology", "cardiology"]
+  permitted_phases:        list<string>,   # e.g. ["II", "III"]
+
+  # STATIC: purpose binding — GDPR Art. 5(1)(b) purpose limitation
+  approved_purposes:       list<string>,   # e.g. ["study_ONCO_2026"]
+
+  # STATIC: data sensitivity tier and patient privacy floor
+  resource_classification: int,            # 1=PUBLIC .. 5=TOP_SECRET
+  minimum_cohort_size:     int,            # k-anonymity floor (e.g. 5)
+
+  # DYNAMIC: server clock — MUST come from datetime.utcnow(), never user input
+  current_time:            timestamp,
+
+  # DYNAMIC: request-scope attributes from tool/API call parameters
+  requested_region:        string,
+  requested_area:          string,
+  requested_phase:         string,
+
+  # DYNAMIC: purpose declared by the caller; must be pre-validated against
+  # an allowlist before being passed here (not raw user input)
+  stated_purpose:          string,
+
+  # DYNAMIC: clearance level from JWT claim — NEVER accept from user input
+  user_clearance_level:    int,
+
+  # DYNAMIC: cohort size pre-calculated by the app before the check call;
+  # prevents re-identification by enforcing the k-anonymity floor
+  actual_cohort_size:      int
+) {
+  # 1. Temporal validity — approval window must bracket the request time
+  current_time >= valid_from &&
+  current_time <= valid_until &&
+
+  # 2. Region compliance — requested region must be in the approved list
+  requested_region in permitted_regions &&
+
+  # 3. Therapeutic area — request must target an approved area
+  requested_area in permitted_areas &&
+
+  # 4. Trial phase — request must target an approved phase
+  requested_phase in permitted_phases &&
+
+  # 5. Purpose limitation (PBAC) — stated purpose must be pre-approved
+  stated_purpose in approved_purposes &&
+
+  # 6. Clearance vs. sensitivity — user must meet or exceed the data tier
+  user_clearance_level >= resource_classification &&
+
+  # 7. k-anonymity guard — actual cohort must meet the minimum size floor
+  actual_cohort_size >= minimum_cohort_size
+}
+
+# ── SINGLE-PURPOSE: temporal window only ──────────────────────
+# Use on relations where ONLY the approval period needs enforcement
+# (e.g., system-to-system links with no region/purpose restrictions).
+condition is_within_valid_period(
+  # STATIC: approval window
+  valid_from:    timestamp,
+  valid_until:   timestamp,
+  # DYNAMIC: server clock
+  current_time:  timestamp
+) {
+  current_time >= valid_from && current_time <= valid_until
+}
+
+# ── SINGLE-PURPOSE: region guard only ─────────────────────────
+# Use on relations where ONLY the region dimension matters
+# (e.g., data residency enforcement without full governance check).
+condition is_permitted_region(
+  # STATIC: approved region list
+  permitted_regions:  list<string>,
+  # DYNAMIC: region from API call parameters
+  requested_region:   string
+) {
+  requested_region in permitted_regions
+}
+
+# ── SINGLE-PURPOSE: purpose binding only ──────────────────────
+# Use on relations where ONLY GDPR purpose limitation matters
+# (e.g., a lightweight check on read-only aggregate endpoints).
+condition is_approved_purpose(
+  # STATIC: approved study/purpose identifiers
+  approved_purposes:  list<string>,
+  # DYNAMIC: purpose from validated session context
+  stated_purpose:     string
+) {
+  stated_purpose in approved_purposes
+}
+
+# ═══════════════════════════════════════════════════════════════
 # TYPES
 # ═══════════════════════════════════════════════════════════════
 
@@ -18,13 +127,20 @@ type clinical_trial
     # Direct ownership — domain owner who published this trial
     define owner: [user]
 
-    # Organization-level ceiling — set when domain owner approves org access request
-    define granted_org: [organization]
+    # Organization-level ceiling — set when domain owner approves org access.
+    # ABAC-guarded: the tuple carries governance conditions (Tier 1 ceiling).
+    # Only members of the org whose tuple satisfies check_fine_grained_access
+    # will pass the can_view_aggregate computed relation.
+    define granted_org: [organization with check_fine_grained_access]
 
-    # Researcher-level direct assignment — manager assigns specific researchers
-    define assigned_researcher: [user]
+    # Researcher-level direct assignment — manager assigns specific researchers.
+    # ABAC-guarded: narrower conditions delegated by team lead (Tier 2).
+    # Conditions MUST be a subset of the org-level Tier 1 ceiling (enforced
+    # in application code via CeilingValidator before writing this tuple).
+    define assigned_researcher: [user with check_fine_grained_access]
 
-    # Computed permissions
+    # Computed permissions — no conditions here; they are inherited from the
+    # conditional base relations above when OpenFGA evaluates the graph.
     define can_view_aggregate: member from granted_org
     define can_view_individual: assigned_researcher or owner
 
@@ -34,7 +150,8 @@ type patient
     define enrolled_in_trial: [clinical_trial]
 
     # Computed: can view this patient's individual data if you can view
-    # individual data for the trial they're enrolled in
+    # individual data for the trial they're enrolled in.
+    # Condition inheritance propagates from assigned_researcher on clinical_trial.
     define can_view_individual: can_view_individual from enrolled_in_trial
 
 type cohort
@@ -45,13 +162,14 @@ type cohort
     # Which organization this cohort belongs to
     define owning_org: [organization]
 
-    # Which researchers are assigned to this cohort
-    define assigned_researcher: [user]
+    # Which researchers are assigned to this cohort.
+    # ABAC-guarded: researcher assignment carries temporal + purpose conditions.
+    define assigned_researcher: [user with check_fine_grained_access]
 
     # Which trials are included in this cohort
     define includes_trial: [clinical_trial]
 
-    # Computed: can access the cohort if assigned or creator
+    # Computed: can access the cohort if assigned (ABAC-gated) or creator
     define can_access: assigned_researcher or creator
 
 type data_asset
@@ -59,9 +177,36 @@ type data_asset
     # Domain owner of this asset
     define owner: [user]
 
-    # Organization granted access
-    define granted_org: [organization]
+    # Organization granted access.
+    # ABAC-guarded: org-level access carries full governance conditions.
+    define granted_org: [organization with check_fine_grained_access]
 
     # Computed permissions
     define can_manage: owner
     define can_view: owner or member from granted_org
+
+# ── NEW TYPE: data_product ─────────────────────────────────────
+# Represents a curated data product (e.g., a study dataset, an
+# analytics extract) that can be granted to orgs (Tier 1 ceiling)
+# or delegated to individual researchers (Tier 2 delegation).
+#
+# Tier 1 "ceiling" tuple  → approved_consumer on organization or approver
+# Tier 2 "delegation" tuple → delegated_consumer on individual user
+#
+# Application code MUST run CeilingValidator before writing Tier 2 tuples
+# to ensure delegated conditions are a strict subset of the Tier 1 ceiling.
+type data_product
+  relations
+    # Owner / DDO who controls this data product
+    define owner: [user]
+
+    # Tier 1: broad ceiling set by DDO / governance approver.
+    # The condition carries the MAXIMUM scope allowed for this data product.
+    define approved_consumer: [user with check_fine_grained_access, organization with check_fine_grained_access]
+
+    # Tier 2: narrower delegation set by team lead for an individual member.
+    # MUST NOT exceed the Tier 1 ceiling (enforced by CeilingValidator).
+    define delegated_consumer: [user with check_fine_grained_access]
+
+    # Computed: any consumer path grants access
+    define can_access: approved_consumer or delegated_consumer or owner

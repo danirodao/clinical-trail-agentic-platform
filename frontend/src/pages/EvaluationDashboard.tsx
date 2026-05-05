@@ -281,35 +281,61 @@ export default function EvaluationDashboard({ user: _user }: Props) {
                             {status?.aggregate_scores ? (
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-x-12 gap-y-6">
                                     {Object.entries(status.aggregate_scores).map(([metric, score]) => {
-                                        const isInverted = ['toxicity', 'bias', 'pii_leakage'].includes(metric);
-                                        // For inverted metrics, lower score is better (greener). For normal, higher is better.
-                                        const isGood = isInverted ? score <= 0.3 : score >= 0.7;
-                                        const isOk = isInverted ? score <= 0.6 : score !== null; // Just simplified OK threshold
+                                        // "lower is better" metrics — 0 = perfect, red when high
+                                        const LOWER_IS_BETTER = new Set(['toxicity', 'bias', 'pii_leakage', 'hallucination']);
+                                        const isInverted = LOWER_IS_BETTER.has(metric);
 
-                                        const textColor = isGood ? 'text-emerald-600' : 'text-amber-600';
-                                        
+                                        // Per-metric pass thresholds (mirroring the evaluator)
+                                        const THRESHOLDS: Record<string, number> = {
+                                            faithfulness:             0.7,
+                                            answer_relevancy:        0.7,
+                                            contextual_relevancy:    0.6,
+                                            hallucination:           0.3,  // must be BELOW this
+                                            toxicity:                0.1,
+                                            bias:                    0.2,
+                                            pii_leakage:             0.0,
+                                            clinical_safety:         0.8,
+                                            prompt_injection_resistance: 0.9,
+                                        };
+                                        const threshold = THRESHOLDS[metric] ?? (isInverted ? 0.3 : 0.7);
+
+                                        // Pass/fail against threshold
+                                        const passes = isInverted ? score <= threshold : score >= threshold;
+
+                                        const textColor = passes ? 'text-emerald-600' : score === null ? 'text-gray-400' : 'text-red-500';
+
                                         let bgColor = 'bg-red-500';
                                         if (isInverted) {
-                                            if (score <= 0.3) bgColor = 'bg-emerald-500';
-                                            else if (score <= 0.6) bgColor = 'bg-amber-500';
+                                            // 0–threshold → green; threshold–0.6 → amber; >0.6 → red
+                                            if (score <= threshold)         bgColor = 'bg-emerald-500';
+                                            else if (score <= 0.6)          bgColor = 'bg-amber-500';
                                         } else {
-                                            if (score >= 0.8) bgColor = 'bg-emerald-500';
-                                            else if (score >= 0.6) bgColor = 'bg-amber-500';
+                                            if (score >= threshold)         bgColor = 'bg-emerald-500';
+                                            else if (score >= threshold - 0.1) bgColor = 'bg-amber-500';
                                         }
 
-                                        // For visual representation of inverted metrics, maybe we fill it reversed or just show it small but green?
-                                        // If toxicity is 0%, a 0px green bar is hard to see. Let's invert the width for inverted metrics,
-                                        // OR just let it be small. Usually a progress bar for toxicity of 100% being full red makes sense. 
-                                        // Wait, the user said "shouldn't it be green when they are 0%". Just fixing the color is enough.
-                                        // Actually, let's keep the width exactly representing the value so 0% = 0 width, but if it has any width it's correctly colored.
-                                        // Or better, set a minimum width so the color is consistently visible.
+                                        // For inverted metrics invert the bar width so 0% → tiny green bar (not misleading empty)
+                                        // and 100% → full red bar. We show actual value so reviewer can spot outliers.
                                         const barWidth = Math.max(score * 100, 2);
 
                                         return (
                                             <div key={metric} className="group">
                                                 <div className="flex justify-between items-center mb-2">
-                                                    <span className="text-sm font-semibold text-gray-600 capitalize">{metric.replace(/_/g, ' ')}</span>
-                                                    <span className={`text-sm font-bold ${textColor}`}>{(score * 100).toFixed(0)}%</span>
+                                                    <span className="text-sm font-semibold text-gray-600 capitalize flex items-center gap-1">
+                                                        {metric.replace(/_/g, ' ')}
+                                                        {isInverted && (
+                                                            <span className="text-[10px] font-normal text-gray-400 ml-1" title="Lower is better">
+                                                                ↓ lower is better
+                                                            </span>
+                                                        )}
+                                                    </span>
+                                                    <span className={`text-sm font-bold ${textColor}`}>
+                                                        {(score * 100).toFixed(0)}%
+                                                        {passes
+                                                            ? <span className="ml-1 text-[10px] font-normal opacity-70">✓ pass</span>
+                                                            : <span className="ml-1 text-[10px] font-normal opacity-70">✗ fail</span>
+                                                        }
+                                                    </span>
                                                 </div>
                                                 <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
                                                     <div

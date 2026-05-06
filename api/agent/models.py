@@ -167,6 +167,10 @@ class AgentState(TypedDict):
     requested_trial_ids: list[str]
     tools: List[Any] = []  # ADD THIS FIELD to carry tools through the graph
 
+    # Token efficiency: tracks whether mid-run compression has fired
+    # (one pass per query; prevents double-compression)
+    context_compressed: bool
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helper: timing utility

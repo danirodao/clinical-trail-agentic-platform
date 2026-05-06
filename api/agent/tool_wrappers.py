@@ -8,6 +8,7 @@ KEY SECURITY DESIGN:
   - Injects `access_context` invisibly when the tool is actually called.
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -22,6 +23,76 @@ logger = structlog.get_logger(__name__)
 
 MAX_ARG_LOG_CHARS = 2000
 MAX_RESULT_LOG_CHARS = 2000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool result TTL cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tools whose results are deterministic for identical (access_context, args).
+# These are safe to cache; all patient-query and data-mutation tools are NOT.
+CACHEABLE_TOOLS: frozenset[str] = frozenset({
+    "get_trial_metadata",
+    "list_ontology_concepts",
+    "get_concept_definition",
+    "get_field_concept_map",
+    "explain_metric_semantics",
+    "map_code_to_concept",
+    "map_concept_to_codes",
+    "normalize_clinical_term",
+})
+
+
+class _ToolCache:
+    """
+    In-process TTL cache for deterministic MCP tool calls.
+
+    Key: SHA-256( tool_name + access_context_json + sorted_args_json )
+    Value: (result_dict, expiry_timestamp)
+
+    Thread/async safety: Python's GIL protects dict reads/writes.  No lock
+    needed because asyncio tasks are cooperative and never preempt during a
+    single dict lookup or assignment.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[Any, float]] = {}
+
+    def _key(self, tool_name: str, access_context_json: str, kwargs: dict) -> str:
+        payload = json.dumps(
+            {"tool": tool_name, "ctx": access_context_json, "args": kwargs},
+            sort_keys=True,
+            default=str,
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def get(self, tool_name: str, access_context_json: str, kwargs: dict) -> Any | None:
+        key = self._key(tool_name, access_context_json, kwargs)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        result, expiry = entry
+        if time.monotonic() > expiry:
+            del self._store[key]
+            return None
+        return result
+
+    def set(
+        self,
+        tool_name: str,
+        access_context_json: str,
+        kwargs: dict,
+        result: Any,
+        ttl_seconds: int,
+    ) -> None:
+        key = self._key(tool_name, access_context_json, kwargs)
+        self._store[key] = (result, time.monotonic() + ttl_seconds)
+
+    def size(self) -> int:
+        return len(self._store)
+
+
+# Module-level singleton — shared across all queries in the same process
+_tool_cache = _ToolCache()
 
 
 def _preview_text(value: Any, max_chars: int) -> str:
@@ -162,18 +233,29 @@ async def create_secure_tools(
             async def _caller(**kwargs) -> dict:
                 # Secretly inject the authorization context
                 kwargs["access_context"] = access_context_json
-                
+
                 # Remove None values so MCP uses its native defaults
                 clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
                 public_kwargs = _sanitize_args(clean_kwargs)
                 started = time.perf_counter()
+
+                # ── TTL cache check for deterministic lookup tools ──────────
+                if t_name in CACHEABLE_TOOLS:
+                    cached = _tool_cache.get(t_name, access_context_json, public_kwargs)
+                    if cached is not None:
+                        logger.debug(
+                            "tool_cache_hit",
+                            tool=t_name,
+                            cache_size=_tool_cache.size(),
+                        )
+                        return cached
 
                 logger.info(
                     "tool_invocation",
                     tool=t_name,
                     arguments_preview=_preview_text(public_kwargs, MAX_ARG_LOG_CHARS),
                 )
-                
+
                 try:
                     result = await session.call_tool(t_name, arguments=clean_kwargs)
                     parsed = _parse_tool_result(result)
@@ -185,6 +267,19 @@ async def create_secure_tools(
                         result_preview=_preview_text(parsed, MAX_RESULT_LOG_CHARS),
                         status=("error" if isinstance(parsed, dict) and parsed.get("error") else "success"),
                     )
+
+                    # Store in cache if eligible and result is clean
+                    if (
+                        t_name in CACHEABLE_TOOLS
+                        and isinstance(parsed, dict)
+                        and not parsed.get("error")
+                    ):
+                        from .config import agent_config as _cfg  # avoid circular at module level
+                        _tool_cache.set(
+                            t_name, access_context_json, public_kwargs,
+                            parsed, _cfg.tool_cache_ttl_seconds,
+                        )
+
                     return parsed
                 except Exception as e:
                     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -196,7 +291,7 @@ async def create_secure_tools(
                         error=str(e),
                     )
                     return {"error": str(e), "tool": t_name}
-            
+
             _caller.__name__ = t_name
             _caller.__doc__ = description
             return _caller

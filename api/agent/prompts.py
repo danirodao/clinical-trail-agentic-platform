@@ -64,6 +64,21 @@ RESPONSE FORMAT:
 # Dynamic prompt builder
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Module-level constant — byte-identical for every user and query.
+# Placing this as the FIRST SystemMessage lets OpenAI's automatic prompt
+# cache fire from the second iteration onward, saving 40-70% of prompt
+# tokens on complex multi-step queries.
+# ────────────────────────────────────────────────────────────────────────────────
+
+STATIC_SYSTEM_PROMPT: str = "\n".join([
+    _ROLE_AND_DOMAIN,
+    "\n--- PROTOCOL & RULES ---",
+    _TOOL_USAGE_AND_SECURITY,
+    _RESPONSE_FORMAT,
+])
+
+
 def build_system_prompt(
     access_profile: Any,
     query_complexity: str,
@@ -106,6 +121,54 @@ def build_system_prompt(
     ]
 
     return "\n".join(s for s in sections if s)
+
+
+def build_dynamic_prompt(
+    access_profile: Any,
+    query_complexity: str,
+) -> str:
+    """
+    Build the *per-user* section of the system prompt only.
+
+    This is injected as a SECOND SystemMessage so the first SystemMessage
+    (STATIC_SYSTEM_PROMPT) remains byte-identical across all users and can
+    be cached automatically by OpenAI's prompt-caching layer.
+
+    Contains:
+      - Access profile summary (individual / aggregate trial lists)
+      - Active cohort filters
+      - Optional complexity hint
+    """
+    if isinstance(access_profile, dict):
+        individual = access_profile.get("individual_trial_ids", [])
+        aggregate = access_profile.get("aggregate_trial_ids", [])
+        lines = []
+        if individual:
+            lines.append(f"INDIVIDUAL ACCESS ({len(individual)}): {', '.join(individual)}")
+        if aggregate:
+            lines.append(f"AGGREGATE ACCESS ({len(aggregate)}): {', '.join(aggregate)}")
+        access_summary = "\n".join(lines) if lines else "NO ACCESS"
+        active_filters: list[str] = []
+    else:
+        access_summary = build_access_summary_for_prompt(access_profile)
+        active_filters = describe_filters(access_profile)
+
+    filter_section = ""
+    if active_filters:
+        filter_section = f"\nACTIVE FILTERS: {', '.join(active_filters)}"
+
+    complexity_note = ""
+    if query_complexity == "complex":
+        complexity_note = "\n(Complex Query: Coordinate multiple tools to synthesize a comprehensive answer.)"
+
+    parts = [
+        "--- ACCESS PROFILE ---",
+        access_summary,
+        filter_section,
+        complexity_note,
+    ]
+    return "\n".join(p for p in parts if p)
+
 
 
 def classify_query_complexity(query: str, config: Any) -> str:

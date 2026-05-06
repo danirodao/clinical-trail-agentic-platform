@@ -24,14 +24,15 @@ A secure, agentic platform for clinical trial data analysis that combines **LLM-
 9. [The Access Level Ceiling Principle](#-the-access-level-ceiling-principle)
 10. [MCP Server — Tool Hub](#-mcp-server--tool-hub)
 11. [Agentic Reasoning — LangGraph ReAct](#-agentic-reasoning--langgraph-react)
-12. [Frontend — React + Keycloak SPA](#-frontend--react--keycloak-spa)
-13. [Evaluation Framework](#-evaluation-framework)
-14. [Project Structure](#-project-structure)
-15. [Getting Started](#-getting-started)
-16. [Common Commands](#-common-commands)
-17. [Dashboards & Exploration](#-dashboards--exploration)
-18. [Testing & Validation](#-testing--validation)
-19. [Topics Covered](#-topics-covered)
+12. [Token Efficiency](#-token-efficiency)
+13. [Frontend — React + Keycloak SPA](#-frontend--react--keycloak-spa)
+14. [Evaluation Framework](#-evaluation-framework)
+15. [Project Structure](#-project-structure)
+16. [Getting Started](#-getting-started)
+17. [Common Commands](#-common-commands)
+18. [Dashboards & Exploration](#-dashboards--exploration)
+19. [Testing & Validation](#-testing--validation)
+20. [Topics Covered](#-topics-covered)
 
 ---
 
@@ -821,15 +822,132 @@ stateDiagram-v2
 
 Queries are classified as `simple` or `complex` based on keyword heuristics (e.g., "compare", "trend", "across"). Simple queries use `GPT-4o-mini` for cost efficiency; complex queries use `GPT-4o`.
 
-### System Prompt Engineering
+### System Prompt Engineering — Prompt Caching Split
 
-The system prompt is assembled **per-query** by injecting:
-- The researcher's access summary (which trials, which level)
-- Active cohort filters in human-readable form
-- Security guardrails (anti-prompt-injection directives, anti-chatter rules)
-- CDISC domain knowledge (phases, sex values, severity levels)
+The system prompt is split into **two separate `SystemMessage`s** injected locally on every ReAct iteration:
+
+| # | Content | Changes per call? | Cache effect |
+|:---|:---|:---|:---|
+| **[0] Static** | Role, domain knowledge, tool-usage rules, response format | Never | OpenAI automatic prompt cache fires after the first call — up to 40-70 % of prompt tokens cached |
+| **[1] Dynamic** | Per-user access summary (trial IDs, access levels), active cohort filters, complexity hint | Per user/query | Not cached — varies per request |
+
+Because `SystemMessage[0]` is a byte-identical module-level constant (`STATIC_SYSTEM_PROMPT`), OpenAI's automatic cache key includes it in every call's prefix. The per-user profile is kept narrow and separate so the cacheable prefix is never invalidated.
 
 ---
+
+## ⚡ Token Efficiency
+
+Four complementary strategies reduce LLM cost and latency for complex, multi-iteration queries without compromising answer quality or security.
+
+### 1 — Prompt Caching (Static / Dynamic Split)
+
+```mermaid
+sequenceDiagram
+    participant A as agent_node (iter 1)
+    participant B as agent_node (iter N)
+    participant O as OpenAI API
+
+    A->>O: SystemMessage[0] STATIC (420 tok)<br/>SystemMessage[1] DYNAMIC (80 tok)<br/>HumanMessage + history
+    Note over O: Cache MISS on STATIC (first call)<br/>Full prompt billed
+    O-->>A: AIMessage + tool_calls
+
+    B->>O: SystemMessage[0] STATIC (identical bytes)<br/>SystemMessage[1] DYNAMIC<br/>HumanMessage + history
+    Note over O: Cache HIT on STATIC prefix<br/>~420 tokens at cache price
+    O-->>B: AIMessage + tool_calls
+```
+
+**Files**: `prompts.py` (`STATIC_SYSTEM_PROMPT`, `build_dynamic_prompt()`), `agent_node.py` (dual-message injection).
+
+### 2 — Mid-Run History Compression
+
+For **complex** queries only, at iteration 4 (`summarise_at_iteration`) the `_maybe_compress_history()` function:
+
+1. Collects all past `ToolMessage` contents before the most-recent `AIMessage`.
+2. Calls `gpt-4o-mini` with a 350-token budget to compress them into ≤12 bullet points.
+3. Replaces each past `ToolMessage` in-place — **`tool_call_id` is preserved** so OpenAI's function-call pairing remains valid.
+4. Sets `context_compressed = True` in `AgentState` to prevent double-compression.
+
+```mermaid
+flowchart LR
+    subgraph "Messages before compression (iter 4)"
+        S0[SystemMessage STATIC]
+        S1[SystemMessage DYNAMIC]
+        HM[HumanMessage]
+        AI1[AIMessage tool_calls]
+        TM1[ToolMessage t1 — 800 chars]
+        TM2[ToolMessage t2 — 1200 chars]
+        TM3[ToolMessage t3 — 950 chars]
+        AI2[AIMessage tool_calls]
+        TM4[ToolMessage t4 — current]
+    end
+
+    subgraph "After compression"
+        S0b[SystemMessage STATIC]
+        S1b[SystemMessage DYNAMIC]
+        HMb[HumanMessage]
+        AI1b[AIMessage tool_calls]
+        TMC["ToolMessage t1\n[COMPRESSED — 3 results]\n• Finding A\n• Finding B\n• Finding C"]
+        TMP[ToolMessage t2 — included above]
+        TMP2[ToolMessage t3 — included above]
+        AI2b[AIMessage tool_calls]
+        TM4b[ToolMessage t4 — current]
+    end
+
+    TM1 & TM2 & TM3 -->|gpt-4o-mini| TMC
+```
+
+**Files**: `config.py` (`summarise_at_iteration`, `compress_model`), `models.py` (`context_compressed`), `agent_node.py` (`_maybe_compress_history()`).
+
+### 3 — Dynamic `max_tokens` Budgeting
+
+`max_tokens` is computed per-call by `_compute_max_tokens()` based on query complexity and current iteration:
+
+| Query type | Iteration | `max_tokens` | Rationale |
+|:---|:---|:---|:---|
+| Simple | 0 (first/likely only call) | **512** | Single-step lookups rarely need more |
+| Simple | 1–2 | **1 024** | Extra headroom for unexpected follow-up |
+| Simple | ≥ 3 (safety fallback) | 2 048 | Prevents truncation on long loops |
+| Complex | Any | **2 048** | Multi-tool synthesis needs the full budget |
+
+The value is set on the `ChatOpenAI` instance and tagged as `llm.max_tokens` on the OTel span for observability.
+
+**File**: `agent_node.py` (`_compute_max_tokens()`).
+
+### 4 — TTL Tool Result Cache
+
+Deterministic lookup tools are cached in-process with a SHA-256 keyed TTL dict. The `access_context_json` is part of the key, so cross-user contamination is impossible.
+
+```mermaid
+flowchart TD
+    CALL["agent_node calls tool\n(e.g. normalize_clinical_term)"] --> CHECK{tool in\nCACHEABLE_TOOLS?}
+    CHECK -->|No| MCP[session.call_tool MCP]
+    CHECK -->|Yes| CACHE{Cache hit?}
+    CACHE -->|No| MCP
+    CACHE -->|Yes — TTL valid| HIT["Return cached result\nlog: tool_cache_hit"]
+    MCP --> STORE{"Result clean?\n(no error)"}
+    STORE -->|Yes| WRITE[Write to _ToolCache\nwith TTL]
+    STORE -->|No| SKIP[Skip cache write]
+    WRITE --> RETURN[Return result]
+    SKIP --> RETURN
+    HIT --> RETURN
+```
+
+**Cached tools** (5-minute TTL, configurable via `tool_cache_ttl_seconds`):
+`get_trial_metadata`, `list_ontology_concepts`, `get_concept_definition`, `get_field_concept_map`, `explain_metric_semantics`, `map_code_to_concept`, `map_concept_to_codes`, `normalize_clinical_term`.
+
+**File**: `tool_wrappers.py` (`_ToolCache`, `CACHEABLE_TOOLS`).
+
+### Configuration Reference
+
+All knobs live in `api/agent/config.py` (`AgentConfig`):
+
+| Field | Default | Effect |
+|:---|:---|:---|
+| `summarise_at_iteration` | `4` | Iteration at which mid-run compression fires (complex queries only). Set to `999` to disable. |
+| `compress_model` | `"gpt-4o-mini"` | Model used for the cheap compression call. |
+| `tool_cache_ttl_seconds` | `300` | TTL in seconds for deterministic tool results. |
+| `max_tokens` | `2048` | Ceiling used by `_compute_max_tokens` for complex queries. |
+
 
 ## 💻 Frontend — React + Keycloak SPA
 
@@ -1001,7 +1119,8 @@ clinical-trial/
 │   │   ├── observability.py      # Prometheus metrics + Phoenix OTLP tracing
 │   │   └── nodes/
 │   │       ├── guardrails.py     # Prompt injection detection, access gate
-│   │       ├── agent_node.py     # GPT-4o function calling
+│   │       ├── agent_node.py     # GPT-4o function calling + token efficiency helpers
+│   │       │                     #   _compute_max_tokens, _maybe_compress_history
 │   │       ├── tool_node.py      # MCP tool execution with access_context injection
 │   │       └── synthesizer.py    # Response formatting, ceiling warnings, source extraction
 │   ├── evaluation/               # Evaluation Framework
@@ -1314,7 +1433,7 @@ make test-agent-dani
 | **Data Mesh** | Multi-modal data products (Relational + Graph + Vector), domain-oriented ownership, self-serve data platform |
 | **Knowledge Graphs** | Neo4j Cypher, labeled property graphs, drug-condition-AE relationships, comorbidity inference, full-text indexes |
 | **Vector Search** | OpenAI `text-embedding-3-large` (3072-dim), semantic document retrieval, chunk typing, dimension validation |
-| **LLM Orchestration** | LangGraph StateGraph, ReAct loop, function calling, query complexity routing, dynamic tool discovery, prompt injection guardrails |
+| **LLM Orchestration** | LangGraph StateGraph, ReAct loop, function calling, query complexity routing, dynamic tool discovery, prompt injection guardrails, prompt caching (static/dynamic split), mid-run history compression, dynamic token budgeting, TTL tool-result cache |
 | **LLM Evaluation** | DeepEval metrics (faithfulness, hallucination, relevancy), GEval custom criteria, golden dataset management, Phoenix span annotations, Argilla HITL |
 | **Clinical Informatics** | CDISC-like modeling (SDTM/CDASH patterns), ICD-10, MeSH, SNOMED CT, RxNorm, LOINC, MedDRA PT/SOC |
 | **Modern Auth Patterns** | Two-layer access control, access level ceiling principle, cohort-based patient filtering, organization-scoped multi-tenancy |

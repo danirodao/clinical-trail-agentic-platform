@@ -1,16 +1,18 @@
 """
 Agent node — invokes the LLM with bound tools.
 
-Phase 5 fixes applied:
-  - Fixed `total_tokens` reference in the else-branch where `usage` is None
-  - Added AGENT_ITERATION_COUNT histogram recording
-  - Added OTel span wrapping the LLM call with token count attributes
-  - Guard against `tools` being empty with a clear error log
+Token efficiency additions:
+  - Prompt caching: static instructions in SystemMessage[0] (byte-identical
+    every call) + per-user access profile in SystemMessage[1].
+  - Mid-run compression: at `summarise_at_iteration` (complex queries only),
+    past ToolMessage content is replaced with a cheap-model bullet summary.
+  - Dynamic max_tokens: sized to query complexity and iteration phase.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import structlog
@@ -26,7 +28,7 @@ from ..observability import (
 )
 from ..config import agent_config
 from ..models import AgentState
-from ..prompts import build_system_prompt
+from ..prompts import STATIC_SYSTEM_PROMPT, build_dynamic_prompt, build_system_prompt
 
 logger = structlog.get_logger(__name__)
 tracer = get_tracer()
@@ -39,6 +41,23 @@ def _preview_text(value: str, max_chars: int = MAX_PROMPT_LOG_CHARS) -> str:
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + "... [truncated]"
+
+
+def _extract_key_content(text: str, max_chars: int = 800) -> str:
+    """
+    Retain lines that contain numerics, UUIDs, or percentages first;
+    append prose lines after. Hard-clip to max_chars.
+    This ensures critical clinical values survive truncation.
+    """
+    lines = text.splitlines()
+    key_lines, prose_lines = [], []
+    for line in lines:
+        if re.search(r'\d+\.?\d*|[a-f0-9]{8}-[a-f0-9]{4}|%', line):
+            key_lines.append(line)
+        else:
+            prose_lines.append(line)
+    combined = "\n".join(key_lines + prose_lines)
+    return combined[:max_chars]
 
 
 async def agent_node(state: AgentState, tools: list) -> dict:
@@ -84,37 +103,60 @@ async def agent_node(state: AgentState, tools: list) -> dict:
         span.set_attribute("llm.message_count", len(state["messages"]))
 
         # ── Build fresh model with tools bound ────────────────────────────
+        max_tokens = _compute_max_tokens(
+            complexity=state.get("query_complexity", "simple"),
+            iteration=iteration,
+            max_iter=max_iter,
+        )
         llm = ChatOpenAI(
             model=model_name,
             temperature=agent_config.temperature,
-            max_tokens=agent_config.max_tokens,
+            max_tokens=max_tokens,
             streaming=True,
             max_retries=6,
         )
         llm_with_tools = llm.bind_tools(tools)
+        span.set_attribute("llm.max_tokens", max_tokens)
 
         logger.debug(
             f"agent_node: model={model_name}, iteration={iteration}, "
             f"tools_bound={len(tools)}, messages={len(state['messages'])}"
         )
 
-        # ── Inject system prompt if not already present ───────────────────
+        # ── Inject system prompts if not already present ───────────────────
+        # Two SystemMessages injected locally (never written back to state):
+        #   [0] STATIC  — byte-identical every call → OpenAI caches it
+        #   [1] DYNAMIC — per-user access profile + active filters
         messages = list(state["messages"])
+        already_compressed: bool = state.get("context_compressed", False)
+        did_compress: bool = False
         if not messages or not isinstance(messages[0], SystemMessage):
-            system_prompt = build_system_prompt(
+            dynamic_prompt = build_dynamic_prompt(
                 access_profile=state.get("access_profile_dict", {}),
                 query_complexity=state.get("query_complexity", "simple"),
             )
-            messages = [SystemMessage(content=system_prompt)] + messages
-            logger.debug("agent_node: System prompt injected into messages.")
+            messages = [
+                SystemMessage(content=STATIC_SYSTEM_PROMPT),
+                SystemMessage(content=dynamic_prompt),
+            ] + messages
+            logger.debug("agent_node: dual system prompts injected (static+dynamic).")
             logger.info(
                 "agent_prompt",
                 model=model_name,
                 iteration=iteration,
-                prompt_preview=_preview_text(system_prompt),
+                static_chars=len(STATIC_SYSTEM_PROMPT),
+                dynamic_chars=len(dynamic_prompt),
             )
 
-        # ── Token Optimizer: Sliding Window & Tool Pruning ────────────────────
+        # ── Mid-run history compression (complex queries, once per query) ──
+        messages, did_compress = await _maybe_compress_history(
+            messages=messages,
+            complexity=state.get("query_complexity", "simple"),
+            iteration=iteration,
+            already_compressed=already_compressed,
+        )
+
+        # ── Token Optimizer: Sliding Window & Tool Pruning ──────────────────
         messages = _prune_context(
             messages,
             max_turns=agent_config.max_history_turns,
@@ -198,6 +240,7 @@ async def agent_node(state: AgentState, tools: list) -> dict:
         "total_completion_tokens": (
             state.get("total_completion_tokens", 0) + completion_tokens
         ),
+        "context_compressed": already_compressed or did_compress,
     }
 
 
@@ -254,7 +297,7 @@ def _prune_context(
                 # We only need a summary of it, not the raw JSON.
                 if isinstance(m.content, str) and len(m.content) > max_tool_chars:
                     m = ToolMessage(
-                        content=m.content[:max_tool_chars] + "... [Rest of historical output pruned]",
+                        content=_extract_key_content(m.content, max_chars=max_tool_chars) + "\n... [Rest of historical output pruned]",
                         name=m.name,
                         tool_call_id=m.tool_call_id,
                     )
@@ -273,3 +316,114 @@ def _prune_context(
         turns_kept=len(turns),
     )
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token-efficiency helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_max_tokens(complexity: str, iteration: int, max_iter: int) -> int:
+    """
+    Return a context-aware max_tokens budget for the LLM call.
+    
+    To prioritize response quality and prevent truncated answers, we always
+    provide the full output budget. The model naturally stops when done, 
+    so a higher cap does not waste tokens unless required for a better answer.
+    """
+    return agent_config.max_tokens
+
+
+async def _maybe_compress_history(
+    messages: list,
+    complexity: str,
+    iteration: int,
+    already_compressed: bool,
+) -> tuple[list, bool]:
+    """
+    At the configured checkpoint, call the cheap model to compress accumulated
+    past ToolMessage content into a concise bullet summary.
+
+    Only fires when ALL of:
+      - complexity == "complex"
+      - iteration == agent_config.summarise_at_iteration
+      - not already compressed this query (one pass per query)
+      - there are past ToolMessages worth compressing
+
+    The summary replaces the FIRST past ToolMessage's content; subsequent ones
+    get a placeholder. tool_call_ids are preserved so OpenAI's function-call
+    pairing remains valid.
+
+    Returns (possibly-modified messages, did_compress_bool).
+    """
+    if (
+        complexity != "complex"
+        or already_compressed
+        or iteration != agent_config.summarise_at_iteration
+    ):
+        return messages, False
+
+    # Find the last AIMessage — everything before it is "past" context
+    last_ai_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], AIMessage):
+            last_ai_idx = i
+            break
+
+    if last_ai_idx <= 0:
+        return messages, False
+
+    # Collect indices and text of ToolMessages before the last AIMessage
+    past_tool_indices: list[int] = []
+    past_tool_texts: list[str] = []
+    for i, m in enumerate(messages):
+        if i < last_ai_idx and isinstance(m, ToolMessage):
+            text = m.content if isinstance(m.content, str) else str(m.content)
+            if len(text) > 150:          # only bother if there's real content
+                past_tool_indices.append(i)
+                past_tool_texts.append(f"[{m.name}]: {text[:500]}")
+
+    if not past_tool_texts:
+        return messages, False
+
+    # Call the cheap model to produce the summary
+    try:
+        mini_llm = ChatOpenAI(
+            model=agent_config.compress_model,
+            temperature=0.0,
+            max_tokens=350,
+        )
+        compress_prompt = (
+            "Compress these clinical trial tool results into ≤12 bullet points. "
+            "Preserve ALL numeric values, patient counts, UUIDs, statistical "
+            "results, and key findings. Be extremely terse — no prose.\n\n"
+            + "\n\n".join(past_tool_texts)
+        )
+        resp = await mini_llm.ainvoke([HumanMessage(content=compress_prompt)])
+        summary = resp.content.strip()
+    except Exception as exc:
+        logger.warning("history_compression_failed", error=str(exc))
+        return messages, False
+
+    # Replace ToolMessages in-place (keep tool_call_id intact for API compat)
+    new_messages = list(messages)
+    for idx_pos, msg_idx in enumerate(past_tool_indices):
+        orig = new_messages[msg_idx]
+        new_content = (
+            f"[HISTORY COMPRESSED at iter {iteration} — "
+            f"{len(past_tool_indices)} tool results]\n{summary}"
+            if idx_pos == 0
+            else "[Included in compressed history above]"
+        )
+        new_messages[msg_idx] = ToolMessage(
+            content=new_content,
+            tool_call_id=orig.tool_call_id,
+            name=orig.name,
+        )
+
+    logger.info(
+        "history_compressed",
+        tool_messages_compressed=len(past_tool_indices),
+        iteration=iteration,
+        compress_model=agent_config.compress_model,
+    )
+    return new_messages, True

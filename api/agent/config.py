@@ -33,8 +33,20 @@ class AgentConfig:
     # ── ReAct Loop Guards ─────────────────────────────────────────────────────
     max_iterations: int = 15                   # Hard stop on tool-call loops
     simple_query_max_iterations: int = 15      # Match complex limit to prevent premature cutoff
-    max_history_turns: int = 5                 # Multi-turn conversation sliding window
-    max_tool_output_chars: int = 1000          # Limit for older tool results in history
+    max_history_turns: int = 2                 # Reduced from 5: keeps only 1 previous Q&A for basic follow-ups
+    max_tool_output_chars: int = 1000           # Aggressively prune old tool results since we focus on current prompt
+
+    # ── Mid-Run History Compression ───────────────────────────────────────────
+    # For complex queries only: compress accumulated ToolMessages into a bullet
+    # summary at this iteration using the cheap model to keep context lean.
+    # Set to 999 to disable.
+    summarise_at_iteration: int = 4
+    compress_model: str = "gpt-4o-mini"        # Cheap model used for compression
+
+    # ── Tool Result Cache (TTL) ────────────────────────────────────────────────
+    # Seconds to cache results from deterministic lookup tools.
+    # Only whitelisted tools are cached (see tool_wrappers.CACHEABLE_TOOLS).
+    tool_cache_ttl_seconds: int = 300
 
     # ── Complexity Classification ─────────────────────────────────────────────
     # Queries containing these keywords are routed to GPT-4o

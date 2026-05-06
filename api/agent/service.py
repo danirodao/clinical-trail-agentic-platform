@@ -496,6 +496,7 @@ class AgentService:
             total_completion_tokens=0,
             final_response=None,
             requested_trial_ids=request.trial_ids or [],
+            context_compressed=False,              # reset per query
         )
 
     @asynccontextmanager

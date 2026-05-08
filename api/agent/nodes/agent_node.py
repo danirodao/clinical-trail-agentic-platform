@@ -76,6 +76,8 @@ async def agent_node(state: AgentState, tools: list) -> dict:
     if iteration >= max_iter:
         logger.warning(f"Max iterations ({max_iter}) reached — forcing synthesizer")
         AGENT_MAX_ITERATIONS_REACHED_TOTAL.labels(model=model_name).inc()
+        # Record the final iteration count even though max limit reached
+        AGENT_ITERATION_COUNT.labels(model=model_name).observe(iteration + 1)
         return {
             "messages": [
                 AIMessage(

@@ -9,9 +9,12 @@ Usage:
 
 import os
 import logging
+import time
 from typing import Any
 
 import asyncpg
+
+from observability import MCP_DB_QUERY_DURATION
 
 logger = logging.getLogger(__name__)
 
@@ -54,28 +57,44 @@ def get_pool() -> asyncpg.Pool:
 async def fetch(query: str, *args: Any) -> list[dict[str, Any]]:
     """Execute a query and return all rows as list of dicts."""
     pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *args)
-        return [dict(row) for row in rows]
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, *args)
+            return [dict(row) for row in rows]
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="postgres", operation="fetch").observe(time.perf_counter() - start)
 
 
 async def fetchrow(query: str, *args: Any) -> dict[str, Any] | None:
     """Execute a query and return a single row as dict, or None."""
     pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(query, *args)
-        return dict(row) if row else None
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+            return dict(row) if row else None
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="postgres", operation="fetchrow").observe(time.perf_counter() - start)
 
 
 async def fetchval(query: str, *args: Any) -> Any:
     """Execute a query and return a single scalar value."""
     pool = get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchval(query, *args)
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchval(query, *args)
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="postgres", operation="fetchval").observe(time.perf_counter() - start)
 
 
 async def execute(query: str, *args: Any) -> str:
     """Execute a query and return the command status string."""
     pool = get_pool()
-    async with pool.acquire() as conn:
-        return await conn.execute(query, *args)
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            return await conn.execute(query, *args)
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="postgres", operation="execute").observe(time.perf_counter() - start)

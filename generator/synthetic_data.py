@@ -417,29 +417,55 @@ class ClinicalTrialGenerator:
                 is_ongoing=True
             ))
 
-        # Adverse Events (0-5)
+        # Adverse Events (0-5) with correlation to medications
         adverse_events = []
-        for ae in random.sample(
-            ta_data["adverse_events"],
-            k=random.randint(0, min(5, len(ta_data["adverse_events"])))
-        ):
-            onset = enrollment_date + timedelta(days=random.randint(1, 180))
-            resolved = random.choice([True, True, False])
-            adverse_events.append(AdverseEvent(
-                ae_term=ae["term"],
-                meddra_pt=ae["meddra_pt"],
-                meddra_soc=ae["soc"],
-                severity=random.choice(list(Severity)),
-                serious=ae["serious"],
-                causality=random.choice(list(Causality)),
-                outcome="Recovered" if resolved else "Ongoing",
-                onset_date=onset,
-                resolution_date=onset + timedelta(days=random.randint(1, 30)) if resolved else None,
-                action_taken=random.choice([
-                    "None", "Dose Reduced", "Drug Interrupted",
-                    "Drug Withdrawn", "Concomitant Medication Given"
-                ])
-            ))
+        drug_names = [m.medication_name for m in medications]
+        
+        # Drug-specific adverse events
+        drug_ae_mapping = {
+            "Pembrolizumab": ["Pneumonitis", "Immune-mediated hepatitis"],
+            "Nivolumab": ["Pneumonitis", "Immune-mediated hepatitis"],
+            "Atezolizumab": ["Pneumonitis", "Immune-mediated hepatitis"],
+            "Paclitaxel": ["Neutropenia", "Fatigue"],
+        }
+        
+        correlated_aes = []
+        for drug, aes in drug_ae_mapping.items():
+            if drug in drug_names:
+                for ae_name in aes:
+                    if random.random() < 0.3:  # 30% chance
+                        correlated_aes.append(ae_name)
+        
+        # General adverse events
+        general_aes = [ae for ae in ta_data["adverse_events"] if ae["term"] not in correlated_aes]
+        selected_general = random.sample(
+            general_aes,
+            k=random.randint(0, min(3, len(general_aes)))
+        )
+        
+        all_selected_aes = correlated_aes + [ae["term"] for ae in selected_general]
+        all_selected_aes = list(set(all_selected_aes))  # remove duplicates
+        
+        for ae_term in all_selected_aes[:5]:  # limit to 5
+            ae_data = next((ae for ae in ta_data["adverse_events"] if ae["term"] == ae_term), None)
+            if ae_data:
+                onset = enrollment_date + timedelta(days=random.randint(1, 180))
+                resolved = random.choice([True, True, False])
+                adverse_events.append(AdverseEvent(
+                    ae_term=ae_data["term"],
+                    meddra_pt=ae_data["meddra_pt"],
+                    meddra_soc=ae_data["soc"],
+                    severity=random.choice(list(Severity)),
+                    serious=ae_data["serious"],
+                    causality=random.choice(list(Causality)),
+                    outcome="Recovered" if resolved else "Ongoing",
+                    onset_date=onset,
+                    resolution_date=onset + timedelta(days=random.randint(1, 30)) if resolved else None,
+                    action_taken=random.choice([
+                        "None", "Dose Reduced", "Drug Interrupted",
+                        "Drug Withdrawn", "Concomitant Medication Given"
+                    ])
+                ))
 
         # Lab Results (multiple visits)
         lab_results = []

@@ -68,6 +68,13 @@ def instrument_tool(tool_name: str):
             ...
     """
     def decorator(fn: Callable[..., Coroutine[Any, Any, Any]]):
+        # Pre-initialize metrics so this tool appears in Grafana immediately on startup
+        try:
+            for status in ["success", "error", "unauthorized", "empty"]:
+                MCP_TOOL_CALL_TOTAL.labels(tool_name=tool_name, status=status).inc(0)
+        except Exception as e:
+            logger.warning("Failed to pre-initialize metrics for %s: %s", tool_name, e)
+            
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             start = time.perf_counter()

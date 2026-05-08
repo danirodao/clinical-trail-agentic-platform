@@ -23,7 +23,7 @@ from fastmcp import FastMCP
 
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row, _append_demographic_filters
-from db import postgres
+from db import postgres, neo4j_client, qdrant_client
 from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,9 @@ def register_tools(mcp: FastMCP) -> None:
         cross-trial comparison in a single response. Returns per-trial AE
         counts, serious event rates, the top N event terms globally, and a
         severity breakdown — all scoped to the caller's authorized access.
+
+        **ORCHESTRATION HINT**: If the user asks for side-effects or safety comparisons across 
+        MULTIPLE trials, ALWAYS use this tool instead of looping `get_adverse_events`.
 
         Args:
             trial_ids:      List (or comma-string) of trial IDs / NCT IDs to compare.
@@ -215,6 +218,9 @@ def register_tools(mcp: FastMCP) -> None:
         Combines enrollment counts, disposition status distribution, completion
         rates, and withdrawal reasons — covering what previously required
         separate patient_analytics and clinical_analysis calls.
+
+        **ORCHESTRATION HINT**: When the user asks about enrollment status, who completed the trial, 
+        or dropout rates, use this single composite tool instead of multiple granular tools.
 
         Args:
             trial_ids:      Trial IDs / NCT IDs (one or more).
@@ -715,3 +721,175 @@ def register_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             logger.error("data_quality_overview failed: %s", exc, exc_info=True)
             return error_response(str(exc), "INTERNAL_ERROR")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # get_cohort_safety_profile
+    # ──────────────────────────────────────────────────────────────────────────
+    @mcp.tool()
+    @instrument_tool("get_cohort_safety_profile")
+    async def get_cohort_safety_profile(
+        trial_id: str,
+        access_context: str,
+        arm_assigned: Optional[str] = None,
+    ) -> str:
+        """
+        Cross-modal Safety Profile: Combines PostgreSQL AE counts with Neo4j 
+        Knowledge Graph ontology to classify Adverse Events as 'Expected' (known risk)
+        or 'Unexpected' for the trial's drug.
+
+        **ORCHESTRATION HINT**: Use this tool instead of chaining `get_adverse_events` and 
+        `find_drug_condition_relationships` when the user asks for a comprehensive safety review 
+        or unexpected side effects.
+
+        Args:
+            trial_id: Trial ID or NCT ID.
+            access_context: Authorization context (injected).
+            arm_assigned: Optional arm filter (e.g., 'Placebo').
+        """
+        try:
+            ctx = AccessContext.from_json(access_context)
+            requested = await _resolve_nct_ids([trial_id])
+            authorized = ctx.validate_trial_access(requested)
+            if not authorized:
+                return error_response("No authorized access to trial.", "ACCESS_DENIED")
+            tid = authorized[0]
+            
+            params: list[Any] = [tid]
+            idx = 2
+            auth_where, auth_params, idx = ctx.build_authorized_patient_filter(
+                authorized, param_offset=idx
+            )
+            params.extend(auth_params)
+            
+            extra: list[str] = []
+            idx = _append_demographic_filters(
+                extra, params, idx, arm_assigned=arm_assigned
+            )
+            where = f"ae.trial_id = $1::uuid AND ({auth_where})" + ("".join(f" AND {c}" for c in extra) if extra else "")
+            
+            ae_sql = f"""
+                SELECT
+                    ae.ae_term,
+                    COUNT(*) as occurrences,
+                    COUNT(*) FILTER (WHERE ae.serious = TRUE) as serious_count
+                FROM adverse_event ae
+                JOIN patient p ON ae.patient_id = p.patient_id
+                JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                WHERE {where}
+                GROUP BY ae.ae_term
+            """
+            ae_rows = await postgres.fetch(ae_sql, *params)
+            if not ae_rows:
+                return success_response({"message": "No AEs found."})
+            
+            cypher = """
+                MATCH (t:ClinicalTrial {trial_id: $trial_id})-[:TESTS_INTERVENTION]->(d:Drug)
+                MATCH (d)-[:MAY_CAUSE]->(ae:AdverseEvent)
+                RETURN DISTINCT toLower(ae.term) as expected_term, d.name as drug_name
+            """
+            graph_rows = await neo4j_client.run_cypher(cypher, {"trial_id": tid})
+            expected_terms = {r["expected_term"] for r in graph_rows if r.get("expected_term")}
+            drugs_found = list({r["drug_name"] for r in graph_rows if r.get("drug_name")})
+            
+            expected = []
+            unexpected = []
+            for row in ae_rows:
+                term = row["ae_term"]
+                r = serialize_row(row)
+                if term.lower() in expected_terms:
+                    expected.append(r)
+                else:
+                    unexpected.append(r)
+                    
+            return success_response({
+                "trial_id": tid,
+                "drugs_tested": drugs_found,
+                "safety_profile": {
+                    "expected_adverse_events": expected,
+                    "unexpected_adverse_events": unexpected
+                }
+            })
+        except Exception as exc:
+            logger.error("get_cohort_safety_profile failed: %s", exc, exc_info=True)
+            return error_response(str(exc), "INTERNAL_ERROR")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # find_trials_by_concept_and_metric
+    # ──────────────────────────────────────────────────────────────────────────
+    @mcp.tool()
+    @instrument_tool("find_trials_by_concept_and_metric")
+    async def find_trials_by_concept_and_metric(
+        concept: str,
+        access_context: str,
+        min_patients: int = 0,
+        phase: Optional[str] = None,
+        limit: int = 10,
+    ) -> str:
+        """
+        Cross-modal Discovery: Finds trials matching an unstructured semantic concept 
+        (e.g., 'innovative mRNA vaccines') via Vector DB, then strictly filters them 
+        using relational database constraints (e.g., minimum enrolled patients).
+        
+        **ORCHESTRATION HINT**: Use this tool instead of chaining `search_documents` and 
+        `cohort_outcome_snapshot` when the user asks to filter semantically-found trials by 
+        hard quantitative metrics like minimum patients.
+        
+        Args:
+            concept: The semantic concept to search for.
+            access_context: Authorization context (injected).
+            min_patients: Minimum number of enrolled patients required.
+            phase: Optional phase filter (e.g., 'Phase 3').
+            limit: Max trials to return.
+        """
+        try:
+            ctx = AccessContext.from_json(access_context)
+            if not ctx.allowed_trial_ids:
+                return error_response("No trial access.", "NO_ACCESS")
+                
+            from utils import build_abac_qdrant_filters
+            qdrant_abac = build_abac_qdrant_filters(ctx.abac_context)
+            chunks = await qdrant_client.search_vectors(
+                query_text=concept,
+                trial_ids=ctx.allowed_trial_ids,
+                limit=30,
+                section="summary",
+                score_threshold=0.25,
+                extra_must_conditions=qdrant_abac,
+            )
+            
+            trial_ids_found = list({c["trial_id"] for c in chunks})
+            if not trial_ids_found:
+                return success_response({"message": "No trials matched the semantic concept.", "trials": []})
+                
+            params: list[Any] = [trial_ids_found]
+            idx = 2
+            
+            phase_cond = ""
+            if phase:
+                phase_cond = f" AND ct.phase = ${idx}"
+                params.append(phase)
+                idx += 1
+                
+            sql = f"""
+                SELECT 
+                    ct.trial_id::text, ct.nct_id, ct.title, ct.phase,
+                    COUNT(DISTINCT pte.patient_id) as enrolled_patients
+                FROM clinical_trial ct
+                LEFT JOIN patient_trial_enrollment pte ON ct.trial_id = pte.trial_id
+                WHERE ct.trial_id = ANY($1::uuid[]) {phase_cond}
+                GROUP BY ct.trial_id, ct.nct_id, ct.title, ct.phase
+                HAVING COUNT(DISTINCT pte.patient_id) >= {int(min_patients)}
+                ORDER BY enrolled_patients DESC
+                LIMIT {min(int(limit), 20)}
+            """
+            rows = await postgres.fetch(sql, *params)
+            
+            return success_response({
+                "concept_searched": concept,
+                "trials": [serialize_row(r) for r in rows],
+                "total_matched": len(rows)
+            })
+        except Exception as exc:
+            logger.error("find_trials_by_concept_and_metric failed: %s", exc, exc_info=True)
+            return error_response(str(exc), "INTERNAL_ERROR")
+

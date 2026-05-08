@@ -81,6 +81,10 @@ def register_tools(mcp: FastMCP) -> None:
         """
         Get adverse event data from clinical trials.
 
+        **ORCHESTRATION HINT**:
+        - You CANNOT use `group_by="medication"`, `group_by="medication_name"`, `group_by="drug"`, or `group_by="laboratory"`.
+        - If the user asks for AEs related to a specific drug, use `group_by="arm"` or `group_by="treatment_arm"` instead, or call the `get_cohort_safety_profile` composite tool to see Expected vs Unexpected side effects for the drug tested in the trial.
+
         Note:
             `event_term` should be an adverse-event term (e.g., nausea,
             headache, dizziness), not a disease/theme label such as
@@ -213,39 +217,57 @@ def register_tools(mcp: FastMCP) -> None:
             VALID_GROUP_BY = {
                 "severity":  "ae.severity", "serious":   "ae.serious",
                 "term":      "ae.ae_term",  "arm":       "p.arm_assigned",
+                "treatment arm": "p.arm_assigned",
+                "treatment_arm": "p.arm_assigned",
+                "treatment-arm": "p.arm_assigned",
                 "trial":     "ct.nct_id",   "outcome":   "ae.outcome",
             }
             grouped_data: list[dict] = []
+            invalid_group_dims: list[str] = []
             if group_by and group_by.strip():
                 group_cols: list[str] = []
                 group_exprs: list[str] = []
                 needs_trial_join = False
-                for dim in group_by.strip().split(","):
-                    dim = dim.strip().lower()
+                seen_exprs = set()
+                
+                for dim_raw in group_by.strip().split(","):
+                    dim = dim_raw.strip().lower()
+                    if not dim:
+                        continue
                     if dim not in VALID_GROUP_BY:
-                        return error_response(f"Invalid group_by '{dim}'. Options: {list(VALID_GROUP_BY.keys())}", "INVALID_ARGS")
+                        invalid_group_dims.append(dim)
+                        continue
+                        
                     expr = VALID_GROUP_BY[dim]
-                    group_cols.append(f"{expr} AS {dim}")
+                    # Avoid duplicate columns/expressions if aliases map to the same field
+                    if expr in seen_exprs:
+                        continue
+                    seen_exprs.add(expr)
+                    
+                    # Normalize the column alias (replace hyphens and spaces with underscores for SQL alias)
+                    safe_dim = dim.replace(" ", "_").replace("-", "_")
+                    group_cols.append(f"{expr} AS {safe_dim}")
                     group_exprs.append(expr)
                     if dim == "trial":
                         needs_trial_join = True
 
-                trial_join = "JOIN clinical_trial ct ON ae.trial_id = ct.trial_id" if needs_trial_join else ""
-                group_sql = f"""
-                    SELECT {', '.join(group_cols)},
-                           COUNT(*)                      AS event_count,
-                           COUNT(DISTINCT ae.patient_id) AS patient_count
-                    FROM adverse_event ae
-                    JOIN patient p ON ae.patient_id = p.patient_id
-                    JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                    {trial_join}
-                    WHERE ae.trial_id = pte.trial_id AND {effective_where}
-                    GROUP BY {', '.join(group_exprs)}
-                    ORDER BY event_count DESC
-                    LIMIT 50
-                """
-                group_rows = await postgres.fetch(group_sql, *params)
-                grouped_data = [serialize_row(r) for r in group_rows]
+                if group_cols:
+                    trial_join = "JOIN clinical_trial ct ON ae.trial_id = ct.trial_id" if needs_trial_join else ""
+                    group_sql = f"""
+                        SELECT {', '.join(group_cols)},
+                               COUNT(*)                      AS event_count,
+                               COUNT(DISTINCT ae.patient_id) AS patient_count
+                        FROM adverse_event ae
+                        JOIN patient p ON ae.patient_id = p.patient_id
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        {trial_join}
+                        WHERE ae.trial_id = pte.trial_id AND {effective_where}
+                        GROUP BY {', '.join(group_exprs)}
+                        ORDER BY event_count DESC
+                        LIMIT 50
+                    """
+                    group_rows = await postgres.fetch(group_sql, *params)
+                    grouped_data = [serialize_row(r) for r in group_rows]
 
             # --- Individual records (ONLY IF INDIVIDUAL ACCESS) ---
             individual_records: list[dict] = []

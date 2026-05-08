@@ -266,6 +266,12 @@ def register_tools(mcp: FastMCP) -> None:
         This tool queries ALL authorized trials automatically.
         Do NOT pass trial_ids — it always covers your full authorized scope.
 
+        **ORCHESTRATION HINT**:
+        This tool returns precise medical terms and ontologies from the graph.
+        If you need patient metrics (counts, percentages, etc.) for these conditions or AEs,
+        you MUST pass the terms returned here into PostgreSQL tools like `get_adverse_events`
+        or `get_patient_demographics` to get the actual data.
+
         Args:
             drug_name: Search by drug name or generic name (partial match).
             condition_name: Search by condition name or ICD-10 code (partial match).
@@ -583,6 +589,13 @@ def register_tools(mcp: FastMCP) -> None:
         Use this when a researcher asks about protocol details, methodology,
         study design, or any topic that requires searching the full text
         of trial documents.
+
+        **ORCHESTRATION HINT**:
+        This tool returns trial IDs based on unstructured semantic concepts.
+        If the user's query ALSO requires quantitative filters (e.g., "trials with > 50 patients")
+        or safety metrics, you MUST pass the `trial_ids` returned here into PostgreSQL tools
+        like `get_patient_demographics`, `cross_trial_safety_summary`, or use the composite
+        tool `find_trials_by_concept_and_metric`.
 
         Args:
             query: Natural language search query. Required.

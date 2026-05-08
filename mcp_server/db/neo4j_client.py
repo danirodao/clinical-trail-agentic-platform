@@ -12,9 +12,12 @@ Usage:
 
 import os
 import logging
+import time
 from typing import Any
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
+
+from observability import MCP_DB_QUERY_DURATION
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,7 @@ async def run_cypher(
         logger.error("Neo4j driver not initialized")
         return []
 
+    start = time.perf_counter()
     try:
         async with _driver.session(database=database or "neo4j") as session:
             result = await session.run(query, parameters or {})
@@ -105,6 +109,8 @@ async def run_cypher(
         logger.error(f"Neo4j query error: {e}", exc_info=True)
         logger.debug(f"Failed query: {query} | params: {parameters}")
         return []
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="neo4j", operation="cypher").observe(time.perf_counter() - start)
 
 
 async def run_cypher_single(

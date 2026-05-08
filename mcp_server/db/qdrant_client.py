@@ -13,11 +13,14 @@ Usage:
 
 import os
 import logging
+import time
 from typing import Any
 
 from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
+
+from observability import MCP_DB_QUERY_DURATION
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +141,7 @@ async def search_vectors(
     if not trial_ids:
         return []
 
+    start = time.perf_counter()
     try:
         embedding = await embed_text(query_text)
 
@@ -180,6 +184,8 @@ async def search_vectors(
     except Exception as e:
         logger.error(f"Qdrant search error: {e}", exc_info=True)
         return []
+    finally:
+        MCP_DB_QUERY_DURATION.labels(db="qdrant", operation="search").observe(time.perf_counter() - start)
 
 
 async def collection_exists() -> bool:

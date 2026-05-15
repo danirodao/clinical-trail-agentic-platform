@@ -45,12 +45,19 @@ def serialize_access_profile(
     patient_filters: Dict[str, List[Dict]] = {}
     trial_metadata: Dict[str, Dict] = dict(getattr(access_profile, 'trial_metadata', {}) or {})
 
+    def _norm_tid(tid: str) -> str:
+        return str(tid).strip()
+
     if hasattr(access_profile, 'trial_scopes'):
         for tid, scope in access_profile.trial_scopes.items():
-            access_levels[tid] = scope.access_level
+            norm_tid = _norm_tid(tid)
+            level = str(getattr(scope, "access_level", "aggregate")).strip().lower()
+            access_levels[norm_tid] = (
+                "individual" if level == "individual" else "aggregate"
+            )
 
             if scope.cohort_scopes:
-                patient_filters[tid] = [
+                patient_filters[norm_tid] = [
                     {
                         "cohort_id":   cs.cohort_id,
                         "cohort_name": cs.cohort_name,
@@ -59,14 +66,32 @@ def serialize_access_profile(
                     for cs in scope.cohort_scopes
                 ]
 
+    individual_trial_ids = [
+        _norm_tid(t) for t in (getattr(access_profile, "individual_trial_ids", []) or [])
+    ]
+    for tid in individual_trial_ids:
+        access_levels[tid] = "individual"
+
+    aggregate_trial_ids = [
+        _norm_tid(t)
+        for t in (getattr(access_profile, "aggregate_trial_ids", []) or [])
+        if _norm_tid(t) not in set(individual_trial_ids)
+    ]
+
     serialized: Dict[str, Any] = {
         "user_id":          getattr(access_profile, 'user_id', 'unknown'),
         "role":             getattr(access_profile, 'role', 'researcher'),
         "organization_id":  getattr(access_profile, 'organization_id', ''),
-        "allowed_trial_ids": getattr(access_profile, 'allowed_trial_ids', []),
+        "allowed_trial_ids": sorted(
+            {_norm_tid(t) for t in (getattr(access_profile, "allowed_trial_ids", []) or [])}
+        ),
+        "individual_trial_ids": individual_trial_ids,
+        "aggregate_trial_ids": aggregate_trial_ids,
         "access_levels":    access_levels,
         "patient_filters":  patient_filters,
-        "trial_metadata":   trial_metadata,
+        "trial_metadata":   {
+            _norm_tid(k): v for k, v in trial_metadata.items()
+        },
     }
 
     # Embed ABAC dynamic context so MCP tools can call check_with_context()

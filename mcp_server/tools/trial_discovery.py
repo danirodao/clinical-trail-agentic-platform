@@ -20,7 +20,7 @@ from fastmcp import FastMCP
 
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row, build_abac_sql_filters, build_abac_qdrant_filters
-from db import postgres, qdrant_client
+from db import postgres, qdrant_client, neo4j_client
 from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ def register_tools(mcp: FastMCP) -> None:
                     vector_results = await qdrant_client.search_vectors(
                         query_text=query.strip(),
                         trial_ids=ctx.allowed_trial_ids,
-                        limit=max_results,
+                        limit=max_results * 5,  # Increased to find more unique trials
                         score_threshold=0.25,
                         extra_must_conditions=abac_qdrant,
                     )
@@ -210,7 +210,7 @@ def register_tools(mcp: FastMCP) -> None:
             # Enrich each result with its access level for the researcher
             for result in all_results:
                 tid = result.get("trial_id", "")
-                trial_access = ctx.trial_access.get(tid)
+                trial_access = ctx._resolve_trial_info(tid)
                 result["access_level"] = trial_access.access_level if trial_access else "none"
 
             return success_response(
@@ -221,6 +221,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "search_type":           "semantic+structured" if query.strip() else "structured",
                     "authorized_trial_count": len(ctx.allowed_trial_ids),
                 },
+                data_sources=["qdrant", "postgres"],
             )
 
         except Exception as e:
@@ -346,7 +347,7 @@ def register_tools(mcp: FastMCP) -> None:
                 trial_data["total_patient_count"] = None
 
             # Access level info for the researcher
-            trial_access = ctx.trial_access.get(resolved_id)
+            trial_access = ctx._resolve_trial_info(resolved_id)
             access_info = {
                 "access_level":       trial_access.access_level if trial_access else "none",
                 "has_patient_filter": trial_access.has_patient_filter if trial_access else False,
@@ -364,9 +365,49 @@ def register_tools(mcp: FastMCP) -> None:
                     for cf in trial_access.cohort_filters
                 ]
 
+            data_sources_used = ["postgres"]
+
+            # --- KG Enrichment (Relationship Counts) ---
+            try:
+                kg_counts = await neo4j_client.run_cypher(
+                    """
+                    MATCH (t:ClinicalTrial {trial_id: $tid})
+                    OPTIONAL MATCH (t)-[:TESTS_INTERVENTION]->(d:Drug)
+                    OPTIONAL MATCH (t)-[:STUDIES]->(c:Condition)
+                    OPTIONAL MATCH (t)<-[:ENROLLED_IN]-(p:Patient)-[:EXPERIENCED]->(ae:AdverseEvent)
+                    RETURN count(DISTINCT d) as drug_count,
+                           count(DISTINCT c) as condition_count,
+                           count(DISTINCT ae) as distinct_ae_count
+                    """,
+                    {"tid": resolved_id}
+                )
+                if kg_counts:
+                    trial_data["kg_relationship_counts"] = kg_counts[0]
+                    data_sources_used.append("neo4j")
+            except Exception as e:
+                logger.warning(f"Neo4j enrichment failed for get_trial_details: {e}")
+
+            # --- Qdrant Enrichment (Summary Chunk) ---
+            try:
+                abac_filters = build_abac_qdrant_filters(ctx.abac_context)
+                chunks = await qdrant_client.search_vectors(
+                    query_text="trial summary objective",
+                    trial_ids=[resolved_id],
+                    limit=1,
+                    section="summary",
+                    score_threshold=0.1,
+                    extra_must_conditions=abac_filters
+                )
+                if chunks:
+                    trial_data["semantic_summary"] = chunks[0]["chunk_text"]
+                    data_sources_used.append("qdrant")
+            except Exception as e:
+                logger.warning(f"Qdrant enrichment failed for get_trial_details: {e}")
+
             return success_response(
                 data=trial_data,
                 metadata={"access": access_info},
+                data_sources=data_sources_used,
             )
 
         except Exception as e:
@@ -466,6 +507,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "criteria":      grouped,
                     "total_criteria": len(rows),
                 },
+                data_sources=["postgres"],
             )
 
         except Exception as e:

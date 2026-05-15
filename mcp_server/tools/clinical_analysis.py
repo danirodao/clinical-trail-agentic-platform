@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row, _append_demographic_filters, build_abac_sql_filters
 
-from db import postgres
+from db import postgres, neo4j_client
 from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
@@ -269,9 +269,13 @@ def register_tools(mcp: FastMCP) -> None:
                     group_rows = await postgres.fetch(group_sql, *params)
                     grouped_data = [serialize_row(r) for r in group_rows]
 
-            # --- Individual records (ONLY IF INDIVIDUAL ACCESS) ---
+            # --- Individual records (ONLY for individually-accessible trials) ---
             individual_records: list[dict] = []
-            if effective_level == "individual":
+            individual_trial_ids = ctx.individual_trial_ids_in_scope(authorized)
+            if individual_trial_ids:
+                trial_param_idx = idx
+                rec_params = list(params)
+                rec_params.append(individual_trial_ids)
                 rec_sql = f"""
                     SELECT ae.ae_id, ae.patient_id, p.subject_id,
                            ae.ae_term, ae.severity, ae.serious, ae.outcome, 
@@ -282,11 +286,44 @@ def register_tools(mcp: FastMCP) -> None:
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                     JOIN clinical_trial ct ON ae.trial_id = ct.trial_id
                     WHERE ae.trial_id = pte.trial_id AND {effective_where}
+                      AND pte.trial_id = ANY(${trial_param_idx}::uuid[])
                     ORDER BY ae.onset_date DESC NULLS LAST
                     LIMIT {max_records}
                 """
-                rec_rows = await postgres.fetch(rec_sql, *params)
+                rec_rows = await postgres.fetch(rec_sql, *rec_params)
                 individual_records = [serialize_row(r) for r in rec_rows]
+
+            # --- KG Enrichment (Expected vs Unexpected) ---
+            data_sources_used = ["postgres"]
+            if individual_records:
+                try:
+                    # Collect unique trials and AE terms from the results
+                    tids = list({str(r["trial_id"]) for r in individual_records if r.get("trial_id")})
+                    # Use nct_id if trial_id is not in the row but nct_id is
+                    if not tids:
+                        tids = authorized # fallback to all authorized if missing from row for some reason
+
+                    trial_ids_cypher = "[" + ", ".join(f'"{t}"' for t in tids) + "]"
+                    
+                    expected_aes_query = f"""
+                        MATCH (t:ClinicalTrial)-[:TESTS_INTERVENTION]->(d:Drug)-[:MAY_CAUSE]->(a:AdverseEvent)
+                        WHERE t.trial_id IN {trial_ids_cypher}
+                        RETURN DISTINCT toLower(a.term) as expected_term, toLower(a.meddra_pt) as expected_meddra
+                    """
+                    expected_rows = await neo4j_client.run_cypher(expected_aes_query)
+                    
+                    expected_terms = set()
+                    for r in expected_rows:
+                        if r.get("expected_term"): expected_terms.add(r["expected_term"])
+                        if r.get("expected_meddra"): expected_terms.add(r["expected_meddra"])
+                        
+                    for rec in individual_records:
+                        term = str(rec.get("ae_term", "")).strip().lower()
+                        rec["expected"] = term in expected_terms
+                        
+                    data_sources_used.append("neo4j")
+                except Exception as e:
+                    logger.warning("KG enrichment failed for get_adverse_events: %s", e)
 
             return success_response(
                 data={
@@ -301,6 +338,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "effective_access_level": effective_level,
                     "event_term_fallback_applied": event_term_fallback_applied,
                 },
+                data_sources=data_sources_used,
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")
@@ -405,21 +443,50 @@ def register_tools(mcp: FastMCP) -> None:
                 stats_rows = await postgres.fetch(stats_sql, *params)
                 stats_data = [serialize_row(r) for r in stats_rows]
             else:
-                rec_sql = f"""
-                    SELECT lr.lab_id, lr.patient_id, p.subject_id,
-                           lr.test_name, lr.loinc_code,
-                           lr.result_value, lr.result_unit,
-                           lr.collection_date, p.arm_assigned, ct.nct_id
-                    FROM lab_result lr
-                    JOIN patient p ON lr.patient_id = p.patient_id
-                    JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                    JOIN clinical_trial ct ON lr.trial_id = ct.trial_id
-                    WHERE lr.trial_id = pte.trial_id AND {where}
-                    ORDER BY lr.collection_date DESC NULLS LAST
-                    LIMIT 100
-                """
-                rec_rows = await postgres.fetch(rec_sql, *params)
-                individual_records = [serialize_row(r) for r in rec_rows]
+                individual_trial_ids = ctx.individual_trial_ids_in_scope(authorized)
+                if individual_trial_ids:
+                    trial_param_idx = idx
+                    rec_params = list(params)
+                    rec_params.append(individual_trial_ids)
+                    rec_sql = f"""
+                        SELECT lr.lab_id, lr.patient_id, p.subject_id,
+                               lr.test_name, lr.loinc_code,
+                               lr.result_value, lr.result_unit,
+                               lr.collection_date, p.arm_assigned, ct.nct_id
+                        FROM lab_result lr
+                        JOIN patient p ON lr.patient_id = p.patient_id
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        JOIN clinical_trial ct ON lr.trial_id = ct.trial_id
+                        WHERE lr.trial_id = pte.trial_id AND {where}
+                          AND pte.trial_id = ANY(${trial_param_idx}::uuid[])
+                        ORDER BY lr.collection_date DESC NULLS LAST
+                        LIMIT 100
+                    """
+                    rec_rows = await postgres.fetch(rec_sql, *rec_params)
+                    individual_records = [serialize_row(r) for r in rec_rows]
+                else:
+                    summary_only = True
+                    stats_rows = await postgres.fetch(
+                        f"""
+                        SELECT
+                            lr.test_name,
+                            lr.result_unit AS unit,
+                            COUNT(*) AS result_count,
+                            COUNT(DISTINCT lr.patient_id) AS patient_count,
+                            ROUND(AVG(lr.result_value)::numeric, 2) AS mean_value,
+                            MIN(lr.result_value) AS min_value,
+                            MAX(lr.result_value) AS max_value
+                        FROM lab_result lr
+                        JOIN patient p ON lr.patient_id = p.patient_id
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        WHERE lr.trial_id = pte.trial_id AND {where}
+                        GROUP BY lr.test_name, lr.result_unit
+                        ORDER BY result_count DESC
+                        LIMIT 30
+                        """,
+                        *params,
+                    )
+                    stats_data = [serialize_row(r) for r in stats_rows]
 
             return success_response(
                 data={
@@ -427,6 +494,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "individual_records": individual_records if not summary_only else None,
                 },
                 metadata={"effective_access_level": effective_level},
+                data_sources=["postgres"],
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")
@@ -522,19 +590,46 @@ def register_tools(mcp: FastMCP) -> None:
                 stats_rows = await postgres.fetch(stats_sql, *params)
                 stats_data = [serialize_row(r) for r in stats_rows]
             else:
-                rec_sql = f"""
-                    SELECT vs.vital_id, vs.test_name AS vital_type, vs.result_value AS value,
-                           vs.result_unit AS unit, vs.collection_date AS measurement_date,
-                           p.arm_assigned
-                    FROM vital_sign vs
-                    JOIN patient p ON vs.patient_id = p.patient_id
-                    JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
-                    WHERE vs.trial_id = pte.trial_id AND {where}
-                    ORDER BY vs.collection_date DESC NULLS LAST
-                    LIMIT 100
-                """
-                rec_rows = await postgres.fetch(rec_sql, *params)
-                individual_records = [serialize_row(r) for r in rec_rows]
+                individual_trial_ids = ctx.individual_trial_ids_in_scope(authorized)
+                if individual_trial_ids:
+                    trial_param_idx = idx
+                    rec_params = list(params)
+                    rec_params.append(individual_trial_ids)
+                    rec_sql = f"""
+                        SELECT vs.vital_id, vs.test_name AS vital_type, vs.result_value AS value,
+                               vs.result_unit AS unit, vs.collection_date AS measurement_date,
+                               p.arm_assigned
+                        FROM vital_sign vs
+                        JOIN patient p ON vs.patient_id = p.patient_id
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        WHERE vs.trial_id = pte.trial_id AND {where}
+                          AND pte.trial_id = ANY(${trial_param_idx}::uuid[])
+                        ORDER BY vs.collection_date DESC NULLS LAST
+                        LIMIT 100
+                    """
+                    rec_rows = await postgres.fetch(rec_sql, *rec_params)
+                    individual_records = [serialize_row(r) for r in rec_rows]
+                else:
+                    summary_only = True
+                    stats_rows = await postgres.fetch(
+                        f"""
+                        SELECT
+                            vs.test_name AS vital_type,
+                            vs.result_unit AS unit,
+                            COUNT(*) AS measurement_count,
+                            ROUND(AVG(vs.result_value)::numeric, 2) AS mean_value,
+                            MIN(vs.result_value) AS min_value,
+                            MAX(vs.result_value) AS max_value
+                        FROM vital_sign vs
+                        JOIN patient p ON vs.patient_id = p.patient_id
+                        JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
+                        WHERE vs.trial_id = pte.trial_id AND {where}
+                        GROUP BY vs.test_name, vs.result_unit
+                        ORDER BY measurement_count DESC
+                        """,
+                        *params,
+                    )
+                    stats_data = [serialize_row(r) for r in stats_rows]
 
             return success_response(
                 data={
@@ -542,6 +637,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "individual_records": individual_records if not summary_only else None,
                 },
                 metadata={"effective_access_level": effective_level},
+                data_sources=["postgres"],
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")
@@ -651,7 +747,11 @@ def register_tools(mcp: FastMCP) -> None:
             frequency_data = [serialize_row(r) for r in freq_rows]
 
             individual_records = []
-            if effective_level == "individual":
+            individual_trial_ids = ctx.individual_trial_ids_in_scope(authorized)
+            if individual_trial_ids:
+                trial_param_idx = idx
+                rec_params = list(params)
+                rec_params.append(individual_trial_ids)
                 rec_sql = f"""
                     SELECT pm.medication_id, pm.patient_id, pm.medication_name,
                            pm.dose_value, pm.dose_unit, pm.route,
@@ -660,10 +760,11 @@ def register_tools(mcp: FastMCP) -> None:
                     JOIN patient p ON pm.patient_id = p.patient_id
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                     WHERE {where}
+                      AND pte.trial_id = ANY(${trial_param_idx}::uuid[])
                     ORDER BY pm.medication_name, pm.start_date
                     LIMIT {max_records}
                 """
-                rec_rows = await postgres.fetch(rec_sql, *params)
+                rec_rows = await postgres.fetch(rec_sql, *rec_params)
                 individual_records = [serialize_row(r) for r in rec_rows]
 
             return success_response(
@@ -672,6 +773,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "individual_records": individual_records or None,
                 },
                 metadata={"effective_access_level": effective_level},
+                data_sources=["postgres"],
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")
@@ -802,6 +904,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "metrics_compared": sorted(requested_metrics),
                     "effective_access_level": effective_level, # Note: this query naturally supports aggregate access
                 },
+                data_sources=["postgres"],
             )
         except Exception as e:
             return error_response(str(e), "TOOL_ERROR")

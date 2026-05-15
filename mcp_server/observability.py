@@ -52,6 +52,12 @@ MCP_ACTIVE_TOOL_CALLS = Counter(
     ["tool_name"],
 )
 
+MCP_DATA_SOURCE_USAGE = Counter(
+    "mcp_data_source_usage_total",
+    "Data sources used per tool invocation (postgres, neo4j, qdrant)",
+    ["tool_name", "source"],  # source: postgres | neo4j | qdrant
+)
+
 
 # ── Decorator: automatically instrument any async tool function ───────────────
 

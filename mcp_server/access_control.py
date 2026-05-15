@@ -11,6 +11,11 @@ from typing import Any, List, Optional, Tuple, Dict
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_trial_id(tid: Any) -> str:
+    return str(tid).strip()
+
+
 # Toggle detailed authorization filter traces in MCP logs.
 LOG_AUTH_FILTERS = os.getenv("LOG_AUTH_FILTERS", "true").lower() == "true"
 
@@ -31,11 +36,11 @@ class TrialAccess:
 
     @property
     def is_individual(self) -> bool:
-        return self.access_level == "individual"
+        return str(self.access_level).strip().lower() == "individual"
 
     @property
     def is_aggregate(self) -> bool:
-        return self.access_level == "aggregate"
+        return not self.is_individual
 
     @property
     def has_patient_filter(self) -> bool:
@@ -52,6 +57,7 @@ class AccessContext:
     organization_id: str
     allowed_trial_ids: list[str]
     trial_access: dict[str, TrialAccess] = field(default_factory=dict)
+    nct_index: dict[str, str] = field(default_factory=dict)
 
     # ABAC dynamic context forwarded from OpenFGAContextBuilder.
     # Present only when the caller provided scope_params in the query request.
@@ -67,16 +73,31 @@ class AccessContext:
         except (json.JSONDecodeError, TypeError) as e:
             raise ValueError(f"Invalid access_context JSON: {e}")
 
-        allowed_ids = data.get("allowed_trial_ids", [])
-        access_levels = data.get("access_levels", {})
-        patient_filters_raw = data.get("patient_filters", {})
-        
-        # New: metadata mapping if provided by the agent (optional but helpful)
-        trial_metadata = data.get("trial_metadata", {}) 
+        allowed_ids = [_normalize_trial_id(t) for t in data.get("allowed_trial_ids", [])]
+        access_levels = {
+            _normalize_trial_id(k): str(v).strip().lower()
+            for k, v in (data.get("access_levels") or {}).items()
+        }
+        patient_filters_raw = {
+            _normalize_trial_id(k): v
+            for k, v in (data.get("patient_filters") or {}).items()
+        }
+        trial_metadata = {
+            _normalize_trial_id(k): v
+            for k, v in (data.get("trial_metadata") or {}).items()
+        }
+        individual_ids = {
+            _normalize_trial_id(t)
+            for t in (data.get("individual_trial_ids") or [])
+        }
 
         trial_access: dict[str, TrialAccess] = {}
         for tid in allowed_ids:
-            level = access_levels.get(tid, "aggregate")
+            level = access_levels.get(tid)
+            if not level and tid in individual_ids:
+                level = "individual"
+            if not level:
+                level = "aggregate"
             
             # Extract NCT ID from metadata if available
             nct_id = trial_metadata.get(tid, {}).get("nct_id", "")
@@ -100,12 +121,24 @@ class AccessContext:
                 cohort_filters=cohort_filters,
             )
 
+        nct_index: dict[str, str] = {}
+        for tid, info in trial_access.items():
+            if info.nct_id:
+                nct_index[str(info.nct_id).upper()] = tid
+        for tid, meta in (trial_metadata or {}).items():
+            if tid not in trial_access:
+                continue
+            nct = str((meta or {}).get("nct_id", "")).strip()
+            if nct:
+                nct_index[nct.upper()] = tid
+
         return cls(
             user_id=data.get("user_id", "unknown"),
             role=data.get("role", "researcher"),
             organization_id=data.get("organization_id", ""),
             allowed_trial_ids=allowed_ids,
             trial_access=trial_access,
+            nct_index=nct_index,
             # Deserialize ABAC context if the agent forwarded it.
             # This was built by OpenFGAContextBuilder in the router and
             # embedded by serialize_access_profile() — it is safe to trust here.
@@ -123,10 +156,14 @@ class AccessContext:
         if tid_or_nct in self.trial_access:
             return self.trial_access[tid_or_nct]
 
-        # NCT ID match
-        for info in self.trial_access.values():
-            if info.nct_id == tid_or_nct or info.nct_id.endswith(tid_or_nct):
-                return info
+        # NCT ID match (exact, case-insensitive)
+        if tid_or_nct.upper().startswith("NCT"):
+            mapped_tid = self.nct_index.get(tid_or_nct.upper())
+            if mapped_tid and mapped_tid in self.trial_access:
+                return self.trial_access[mapped_tid]
+            for info in self.trial_access.values():
+                if info.nct_id and info.nct_id.upper() == tid_or_nct.upper():
+                    return info
 
         # Partial UUID match (first 8 chars)
         for tid, info in self.trial_access.items():
@@ -161,15 +198,27 @@ class AccessContext:
             if info:
                 resolved_uuids.append(info.trial_id)
 
-        # If nothing resolved, fall back to all authorized trials
+        # Explicit trial identifiers that could not be resolved must not widen scope.
         if not resolved_uuids:
             logger.warning(
-                f"None of the requested trial_ids {requested_ids} could be resolved. "
-                f"Falling back to all {len(self.allowed_trial_ids)} authorized trials."
+                "None of the requested trial_ids %s could be resolved for user=%s. "
+                "Denying trial scope (strict resolution).",
+                requested_ids,
+                self.user_id,
             )
-            return self.allowed_trial_ids
+            return []
 
-        return resolved_uuids
+        return list(dict.fromkeys(resolved_uuids))
+
+    def individual_trial_ids_in_scope(self, trial_ids: List[str]) -> List[str]:
+        """Return UUIDs from trial_ids that have individual-level access."""
+        individual: list[str] = []
+        for raw_tid in trial_ids:
+            info = self._resolve_trial_info(raw_tid)
+            if info and info.is_individual and info.trial_id not in individual:
+                individual.append(info.trial_id)
+        return individual
+
     def get_effective_access_level(self, trial_ids: List[str]) -> str:
         """
         Ceiling principle: if ANY of the requested trials is aggregate-only,
@@ -180,7 +229,8 @@ class AccessContext:
 
         for raw_tid in trial_ids:
             info = self._resolve_trial_info(raw_tid)
-            if not info or info.is_aggregate:
+            # Default to aggregate if missing or not explicitly individual
+            if not info or not info.is_individual:
                 return "aggregate"
         
         return "individual"

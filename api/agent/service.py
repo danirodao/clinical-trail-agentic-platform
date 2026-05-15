@@ -751,7 +751,7 @@ def _serialize_profile(access_profile: Any, abac_context: dict | None = None) ->
     "Populated below if available" but no code — now it is populated.
     """
     trial_scopes: dict = {}
-    trial_metadata: dict = {}
+    trial_metadata: dict = dict(getattr(access_profile, "trial_metadata", {}) or {})
 
     for trial_id, scope in access_profile.trial_scopes.items():
         # Serialise scope for guardrails / synthesizer use
@@ -768,14 +768,16 @@ def _serialize_profile(access_profile: Any, abac_context: dict | None = None) ->
             ],
         }
 
-        # Populate trial_metadata for NCT ID reverse lookup.
-        # The AccessProfile does not carry nct_id/title directly — these are
-        # available if the caller (researcher router) has enriched the profile.
-        # We store whatever is available; the synthesizer tolerates empty dicts.
-        nct_id = getattr(scope, "nct_id", "") or ""
-        title = getattr(scope, "title", "") or ""
-        if nct_id or title:
-            trial_metadata[trial_id] = {"nct_id": nct_id, "title": title}
+        # Enrich trial_metadata for NCT ID reverse lookup (merge scope hints).
+        existing_meta = dict(trial_metadata.get(trial_id) or {})
+        nct_id = getattr(scope, "nct_id", "") or existing_meta.get("nct_id", "")
+        title = getattr(scope, "title", "") or existing_meta.get("title", "")
+        if nct_id or title or existing_meta:
+            trial_metadata[trial_id] = {
+                **existing_meta,
+                **({"nct_id": nct_id} if nct_id else {}),
+                **({"title": title} if title else {}),
+            }
 
     payload = {
         "user_id": access_profile.user_id,

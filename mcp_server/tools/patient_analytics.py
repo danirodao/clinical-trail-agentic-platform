@@ -21,7 +21,7 @@ from fastmcp import FastMCP
 from access_control import AccessContext
 from utils import success_response, error_response, serialize_row, _append_demographic_filters, build_abac_sql_filters
 
-from db import postgres
+from db import postgres, neo4j_client
 from observability import instrument_tool
 
 logger = logging.getLogger(__name__)
@@ -253,6 +253,7 @@ def register_tools(mcp: FastMCP) -> None:
                 if needs_trial_join else ""
             )
 
+            sql = ""
             # 7. Execute query
             if group_columns:
                 select_cols = ", ".join(group_columns)
@@ -310,6 +311,7 @@ def register_tools(mcp: FastMCP) -> None:
                     ),
                     "cohort_filters_applied": ctx.get_filter_descriptions(),
                 },
+                data_sources=["postgres"],
             )
 
         except Exception as e:
@@ -367,8 +369,10 @@ def register_tools(mcp: FastMCP) -> None:
             # 2. Ceiling principle
             effective_level = ctx.get_effective_access_level(authorized)
 
+            individual_trial_ids = ctx.individual_trial_ids_in_scope(authorized)
+
             # NEVER return individual records for aggregate-only access
-            if effective_level == "aggregate":
+            if effective_level == "aggregate" or not individual_trial_ids:
                 include_individual_records = False
 
             # 3. Build authorization WHERE clause
@@ -474,9 +478,12 @@ def register_tools(mcp: FastMCP) -> None:
             eth_rows = await postgres.fetch(eth_sql, *params)
             race_rows = await postgres.fetch(race_sql, *params)
 
-            # 5. Individual records — ONLY if individual access
+            # 5. Individual records — ONLY for trials with individual access
             individual_records: list[dict] = []
-            if include_individual_records and effective_level == "individual":
+            if include_individual_records and individual_trial_ids:
+                trial_param_idx = idx
+                rec_params = list(params)
+                rec_params.append(individual_trial_ids)
                 rec_sql = f"""
                     SELECT
                         p.patient_id, p.subject_id, p.age, p.sex, p.race,
@@ -485,11 +492,12 @@ def register_tools(mcp: FastMCP) -> None:
                     FROM patient p
                     JOIN patient_trial_enrollment pte ON p.patient_id = pte.patient_id
                     WHERE {where}
+                      AND pte.trial_id = ANY(${trial_param_idx}::uuid[])
                     ORDER BY p.subject_id
                     LIMIT 100
                 """
 
-                rec_rows = await postgres.fetch(rec_sql, *params)
+                rec_rows = await postgres.fetch(rec_sql, *rec_params)
                 individual_records = [serialize_row(r) for r in rec_rows]
 
             return success_response(
@@ -715,6 +723,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "effective_access_level": effective_level,
                     "cohort_filters_applied": ctx.get_filter_descriptions(),
                 },
+                data_sources=["postgres"],
             )
 
         except Exception as e:

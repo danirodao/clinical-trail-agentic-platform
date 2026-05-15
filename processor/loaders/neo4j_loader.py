@@ -81,6 +81,11 @@ class Neo4jGraphLoader:
                             route: $route,
                             frequency: $frequency
                         }]->(d)
+                        WITH d
+                        OPTIONAL MATCH (oc:Concept {concept_id: 'concept:drug.rxnorm'})
+                        FOREACH (_ IN CASE WHEN oc IS NOT NULL THEN [1] ELSE [] END |
+                            MERGE (d)-[:INSTANCE_OF]->(oc)
+                        )
                     """, {
                         'rxnorm': interv['rxnorm_code'],
                         'name': interv.get('name', ''),
@@ -154,6 +159,11 @@ class Neo4jGraphLoader:
                         WITH c
                         MATCH (t:ClinicalTrial {trial_id: $trial_id})
                         MERGE (t)-[:STUDIES]->(c)
+                        WITH c
+                        OPTIONAL MATCH (oc:Concept {concept_id: 'concept:condition.icd10'})
+                        FOREACH (_ IN CASE WHEN oc IS NOT NULL THEN [1] ELSE [] END |
+                            MERGE (c)-[:INSTANCE_OF]->(oc)
+                        )
                     """, {
                         'icd10': icd10,
                         'name': cond.get('condition_name', ''),
@@ -206,6 +216,11 @@ class Neo4jGraphLoader:
                             causality: $causality,
                             outcome: $outcome
                         }]->(a)
+                        WITH a
+                        OPTIONAL MATCH (oc:Concept {concept_id: 'concept:ae.meddra'})
+                        FOREACH (_ IN CASE WHEN oc IS NOT NULL THEN [1] ELSE [] END |
+                            MERGE (a)-[:INSTANCE_OF]->(oc)
+                        )
                     """, {
                         'meddra': meddra,
                         'term': ae.get('ae_term', ''),
@@ -269,6 +284,11 @@ class Neo4jGraphLoader:
                         collection_date: $date,
                         visit_name: $visit
                     }]->(l)
+                    WITH l
+                    OPTIONAL MATCH (oc:Concept {concept_id: 'concept:lab.loinc'})
+                    FOREACH (_ IN CASE WHEN oc IS NOT NULL THEN [1] ELSE [] END |
+                        MERGE (l)-[:INSTANCE_OF]->(oc)
+                    )
                 """, {
                     'loinc': loinc,
                     'test_name': lab.get('test_name', ''),

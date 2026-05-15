@@ -565,6 +565,7 @@ def register_tools(mcp: FastMCP) -> None:
                         ],
                     },
                 },
+                data_sources=["neo4j", "postgres"],
             )
 
         except Exception as e:
@@ -701,6 +702,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "limit":               max_chunks,
                     "authorized_trials":   len(ctx.allowed_trial_ids),
                 },
+                data_sources=["qdrant"],
             )
 
         except Exception as e:

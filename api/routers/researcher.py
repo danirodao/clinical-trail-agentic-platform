@@ -186,10 +186,14 @@ def _infer_scope_from_prompt(prompt: str) -> dict[str, str]:
         (r"\brare\s*disease\b", "rare_disease"),
         (r"\bmetabolic\b", "metabolic"),
     ]
+    matched_areas: list[str] = []
     for pattern, area in area_patterns:
-        if re.search(pattern, text):
-            inferred["area"] = area
-            break
+        if re.search(pattern, text) and area not in matched_areas:
+            matched_areas.append(area)
+    if matched_areas:
+        inferred["areas"] = matched_areas
+        if len(matched_areas) == 1:
+            inferred["area"] = matched_areas[0]
 
     phase_patterns: list[tuple[str, str]] = [
         (r"\bphase\s*i/ii\b|\bphase\s*1/2\b", "I/II"),
@@ -391,6 +395,26 @@ def _validate_scope_against_envelope(
                     "message": (
                         f"Requested {key}='{requested}' is outside your granted scope. "
                         f"Allowed: {sorted(granted)}"
+                    ),
+                },
+            )
+
+    requested_areas = [
+        _normalize_area_value(v)
+        for v in _coerce_scope_values(scope, ["areas", "therapeutic_areas", "area"])
+        if _normalize_area_value(v)
+    ]
+    granted_areas = {_normalize_area_value(v) for v in envelope.get("areas", set()) if _normalize_area_value(v)}
+    for area in requested_areas:
+        if granted_areas and area not in granted_areas:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": True,
+                    "code": AgentErrorCode.ACCESS_DENIED.value,
+                    "message": (
+                        f"Requested area='{area}' is outside your granted scope. "
+                        f"Allowed: {sorted(granted_areas)}"
                     ),
                 },
             )
@@ -995,13 +1019,23 @@ async def execute_query(
         for tid, regs in (grant_envelope.get("trial_regions") or {}).items()
     }
 
-    # Only run per-trial ABAC /check when all 4 dimensions are fully declared.
-    # When only purpose is provided, the base ReBAC profile already enforces
-    # trial-level access; region/area/phase are enforced via SQL filters in
-    # the MCP tools using the allowed_* envelope values above.
-    has_full_scope = all(
+    scope_areas = [
+        _normalize_area_value(v)
+        for v in _coerce_scope_values(resolved_scope, ["areas", "therapeutic_areas", "area"])
+        if _normalize_area_value(v)
+    ]
+    if scope_areas:
+        abac_context["requested_areas"] = sorted(set(scope_areas))
+        if len(scope_areas) == 1 and not abac_context.get("requested_area"):
+            abac_context["requested_area"] = scope_areas[0]
+
+    # Only run per-trial ABAC /check when region, phase, purpose, and at least
+    # one therapeutic-area constraint are declared. Multi-area prompts set
+    # requested_areas (not a single requested_area).
+    has_area_scope = bool((resolved_scope.get("area") or "").strip()) or bool(scope_areas)
+    has_full_scope = has_area_scope and all(
         (resolved_scope.get(k) or "").strip()
-        for k in ("region", "area", "phase", "purpose")
+        for k in ("region", "phase", "purpose")
     )
     if has_full_scope:
         profile = await auth_service.compute_access_profile_with_abac(user, abac_context)
@@ -1203,10 +1237,21 @@ async def execute_query_stream(
         for tid, regs in (grant_envelope.get("trial_regions") or {}).items()
     }
 
-    # Only run per-trial ABAC /check when all 4 scope dimensions are declared.
-    has_full_scope = all(
+    scope_areas = [
+        _normalize_area_value(v)
+        for v in _coerce_scope_values(resolved_scope, ["areas", "therapeutic_areas", "area"])
+        if _normalize_area_value(v)
+    ]
+    if scope_areas:
+        abac_context["requested_areas"] = sorted(set(scope_areas))
+        if len(scope_areas) == 1 and not abac_context.get("requested_area"):
+            abac_context["requested_area"] = scope_areas[0]
+
+    # Only run per-trial ABAC /check when region, phase, purpose, and area are set.
+    has_area_scope = bool((resolved_scope.get("area") or "").strip()) or bool(scope_areas)
+    has_full_scope = has_area_scope and all(
         (resolved_scope.get(k) or "").strip()
-        for k in ("region", "area", "phase", "purpose")
+        for k in ("region", "phase", "purpose")
     )
     if has_full_scope:
         profile = await auth_service.compute_access_profile_with_abac(user, abac_context)

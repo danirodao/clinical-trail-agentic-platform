@@ -179,10 +179,42 @@ def register_tools(mcp: FastMCP) -> None:
             """
             top_terms_rows = await postgres.fetch(top_terms_sql, *params)
 
+            # --- KG Enrichment (Expected vs Unexpected) ---
+            data_sources_used = ["postgres"]
+            if top_terms_rows:
+                try:
+                    trial_ids_cypher = "[" + ", ".join(f'"{t}"' for t in authorized) + "]"
+                    
+                    expected_aes_query = f"""
+                        MATCH (t:ClinicalTrial)-[:TESTS_INTERVENTION]->(d:Drug)-[:MAY_CAUSE]->(a:AdverseEvent)
+                        WHERE t.trial_id IN {trial_ids_cypher}
+                        RETURN DISTINCT toLower(a.term) as expected_term, toLower(a.meddra_pt) as expected_meddra
+                    """
+                    expected_rows = await neo4j_client.run_cypher(expected_aes_query)
+                    
+                    expected_terms = set()
+                    for r in expected_rows:
+                        if r.get("expected_term"): expected_terms.add(r["expected_term"])
+                        if r.get("expected_meddra"): expected_terms.add(r["expected_meddra"])
+                        
+                    enriched_top_terms = []
+                    for r in top_terms_rows:
+                        row_dict = serialize_row(r)
+                        term = str(row_dict.get("ae_term", "")).strip().lower()
+                        row_dict["expected"] = term in expected_terms
+                        enriched_top_terms.append(row_dict)
+                        
+                    data_sources_used.append("neo4j")
+                except Exception as e:
+                    logger.warning("KG enrichment failed for cross_trial_safety_summary: %s", e)
+                    enriched_top_terms = [serialize_row(r) for r in top_terms_rows]
+            else:
+                enriched_top_terms = []
+
             return success_response(
                 data={
                     "per_trial_summary": [serialize_row(r) for r in per_trial_rows],
-                    "global_top_terms": [serialize_row(r) for r in top_terms_rows],
+                    "global_top_terms": enriched_top_terms,
                     "trials_compared": len(authorized),
                     "access_level": effective_level,
                     "filters_applied": {
@@ -192,6 +224,7 @@ def register_tools(mcp: FastMCP) -> None:
                     },
                 },
                 metadata={"trial_count": len(authorized)},
+                data_sources=data_sources_used,
             )
 
         except Exception as exc:
@@ -316,6 +349,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "access_level": effective_level,
                 },
                 metadata={"trial_count": len(authorized)},
+                data_sources=["postgres"],
             )
 
         except Exception as exc:
@@ -440,6 +474,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "trials_compared": len(authorized),
                 },
                 metadata={"trial_count": len(authorized)},
+                data_sources=["postgres"],
             )
 
         except Exception as exc:
@@ -589,6 +624,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "event_count": len(timeline),
                 },
                 metadata={"access_level": effective_level},
+                data_sources=["postgres"],
             )
 
         except Exception as exc:
@@ -716,6 +752,7 @@ def register_tools(mcp: FastMCP) -> None:
                     },
                 },
                 metadata={"trial_count": len(authorized)},
+                data_sources=["postgres"],
             )
 
         except Exception as exc:
@@ -780,7 +817,7 @@ def register_tools(mcp: FastMCP) -> None:
             """
             ae_rows = await postgres.fetch(ae_sql, *params)
             if not ae_rows:
-                return success_response({"message": "No AEs found."})
+                return success_response({"message": "No AEs found."}, data_sources=["postgres"])
             
             cypher = """
                 MATCH (t:ClinicalTrial {trial_id: $trial_id})-[:TESTS_INTERVENTION]->(d:Drug)
@@ -808,7 +845,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "expected_adverse_events": expected,
                     "unexpected_adverse_events": unexpected
                 }
-            })
+            }, data_sources=["postgres", "neo4j"])
         except Exception as exc:
             logger.error("get_cohort_safety_profile failed: %s", exc, exc_info=True)
             return error_response(str(exc), "INTERNAL_ERROR")
@@ -851,7 +888,7 @@ def register_tools(mcp: FastMCP) -> None:
             chunks = await qdrant_client.search_vectors(
                 query_text=concept,
                 trial_ids=ctx.allowed_trial_ids,
-                limit=30,
+                limit=100,  # Increased to capture more trials for multi-concept queries
                 section="summary",
                 score_threshold=0.25,
                 extra_must_conditions=qdrant_abac,
@@ -859,7 +896,7 @@ def register_tools(mcp: FastMCP) -> None:
             
             trial_ids_found = list({c["trial_id"] for c in chunks})
             if not trial_ids_found:
-                return success_response({"message": "No trials matched the semantic concept.", "trials": []})
+                return success_response({"message": "No trials matched the semantic concept.", "trials": []}, data_sources=["qdrant"])
                 
             params: list[Any] = [trial_ids_found]
             idx = 2
@@ -888,7 +925,7 @@ def register_tools(mcp: FastMCP) -> None:
                 "concept_searched": concept,
                 "trials": [serialize_row(r) for r in rows],
                 "total_matched": len(rows)
-            })
+            }, data_sources=["qdrant", "postgres"])
         except Exception as exc:
             logger.error("find_trials_by_concept_and_metric failed: %s", exc, exc_info=True)
             return error_response(str(exc), "INTERNAL_ERROR")

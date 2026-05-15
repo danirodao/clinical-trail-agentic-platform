@@ -147,6 +147,7 @@ async def _search_by_drug(ctx: AccessContext, drug_name: str) -> str:
                 "trials_searched":             len(ctx.allowed_trial_ids),
                 "trials_matched":              len(by_trial),
             },
+            data_sources=["postgres", "neo4j"],
         )
 
     except Exception as e:
@@ -252,6 +253,7 @@ def register_tools(mcp: FastMCP) -> None:
                     "outcome_measures": grouped,
                     "total_measures":   len(rows),
                 },
+                data_sources=["postgres"],
             )
 
         except Exception as e:

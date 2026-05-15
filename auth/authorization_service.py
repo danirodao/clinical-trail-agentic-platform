@@ -13,9 +13,10 @@ conditions are enforced only by /check. When an abac_context is provided
 performs per-trial /check calls to filter down the allowed list post-hoc.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 
@@ -25,6 +26,39 @@ from auth.openfga_client import OpenFGAClient, get_openfga_client
 logger = logging.getLogger(__name__)
 
 K_ANONYMITY_MIN = 5
+
+
+def _normalize_area_token(value: str) -> str:
+    return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _normalize_trial_id(tid: Any) -> str:
+    """Canonical trial UUID string for set/dict lookups across FGA and PostgreSQL."""
+    return str(tid).strip()
+
+
+def _normalize_access_level(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    return "individual" if level == "individual" else "aggregate"
+
+
+# Active assignment predicate — evaluated at query time (not stale is_active boolean).
+_ACTIVE_ASSIGNMENT_WHERE = """
+    ra.revoked_at IS NULL
+    AND ra.expires_at > NOW()
+"""
+
+
+def _parse_filter_criteria(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 
 @dataclass
@@ -231,12 +265,20 @@ class AuthorizationService:
                 profile.organization_id,
             )
 
-        aggregate_ids = sorted(set(aggregate_ids).union(db_aggregate_ids))
-        individual_ids = sorted(set(individual_ids).union(db_individual_ids))
+        aggregate_ids = sorted(
+            {_normalize_trial_id(t) for t in aggregate_ids}
+            | {_normalize_trial_id(t) for t in db_aggregate_ids}
+        )
+        individual_ids = sorted(
+            {_normalize_trial_id(t) for t in individual_ids}
+            | {_normalize_trial_id(t) for t in db_individual_ids}
+        )
+        # Individual assignment always wins over org-level aggregate grant for the same trial.
+        aggregate_ids = sorted(set(aggregate_ids) - set(individual_ids))
 
         profile.aggregate_trial_ids = aggregate_ids
         profile.individual_trial_ids = individual_ids
-        profile.allowed_trial_ids = list(set(aggregate_ids + individual_ids))
+        profile.allowed_trial_ids = sorted(set(aggregate_ids) | set(individual_ids))
         profile.has_any_access = len(profile.allowed_trial_ids) > 0
         profile.has_individual_access = len(individual_ids) > 0
         profile.aggregate_only = len(individual_ids) == 0
@@ -260,6 +302,93 @@ class AuthorizationService:
 
         return profile
 
+    async def _fetch_direct_assignments(self, profile: AccessProfile) -> list[asyncpg.Record]:
+        return await self.db.fetch(
+            f"""
+            SELECT ra.trial_id::text AS trial_id, ra.access_level
+            FROM researcher_assignment ra
+            WHERE ra.researcher_id = $1
+              AND ra.organization_id = $2
+              AND ra.trial_id IS NOT NULL
+              AND ra.cohort_id IS NULL
+              AND {_ACTIVE_ASSIGNMENT_WHERE}
+            """,
+            profile.user_id,
+            profile.organization_id,
+        )
+
+    async def _fetch_expanded_cohort_assignments(
+        self, profile: AccessProfile
+    ) -> list[dict[str, Any]]:
+        """
+        Return one row per (cohort, trial) for active cohort-based assignments.
+
+        Trial membership is resolved from cohort.filter_criteria.trial_ids first,
+        then cohort_trial as a fallback — matching manager assignment semantics.
+        """
+        rows = await self.db.fetch(
+            f"""
+            SELECT
+                ra.cohort_id::text AS cohort_id,
+                ra.access_level,
+                c.name AS cohort_name,
+                c.filter_criteria
+            FROM researcher_assignment ra
+            JOIN cohort c ON c.cohort_id = ra.cohort_id
+            WHERE ra.researcher_id = $1
+              AND ra.organization_id = $2
+              AND ra.cohort_id IS NOT NULL
+              AND {_ACTIVE_ASSIGNMENT_WHERE}
+            """,
+            profile.user_id,
+            profile.organization_id,
+        )
+
+        expanded: list[dict[str, Any]] = []
+        for row in rows:
+            criteria = _parse_filter_criteria(row["filter_criteria"])
+            trial_ids = [
+                str(tid).strip()
+                for tid in (criteria.get("trial_ids") or [])
+                if str(tid).strip()
+            ]
+
+            if not trial_ids:
+                ct_rows = await self.db.fetch(
+                    """
+                    SELECT ct.trial_id::text AS trial_id
+                    FROM cohort_trial ct
+                    WHERE ct.cohort_id = $1::uuid
+                    """,
+                    row["cohort_id"],
+                )
+                trial_ids = [str(r["trial_id"]) for r in ct_rows]
+
+            for trial_id in trial_ids:
+                expanded.append({
+                    "cohort_id": str(row["cohort_id"]),
+                    "cohort_name": row["cohort_name"],
+                    "access_level": row["access_level"],
+                    "filter_criteria": criteria,
+                    "trial_id": trial_id,
+                })
+
+        return expanded
+
+    async def _trial_ids_from_cohort_assignments(
+        self,
+        profile: AccessProfile,
+        access_level: str | None = None,
+    ) -> list[str]:
+        rows = await self._fetch_expanded_cohort_assignments(profile)
+        if access_level:
+            level = access_level.strip().lower()
+            rows = [
+                r for r in rows
+                if str(r.get("access_level") or "").strip().lower() == level
+            ]
+        return sorted({str(r["trial_id"]) for r in rows})
+
     async def _db_aggregate_trial_ids(self, profile: AccessProfile) -> list[str]:
         """Fallback source for aggregate trial access from active grants/assignments."""
         rows = await self.db.fetch(
@@ -279,64 +408,51 @@ class AuthorizationService:
                 FROM researcher_assignment ra
                 WHERE ra.organization_id = $1
                   AND ra.researcher_id = $2
+                  AND ra.access_level = 'aggregate'
                   AND ra.trial_id IS NOT NULL
-                  AND ra.revoked_at IS NULL
-                  AND ra.expires_at > NOW()
-            ),
-            cohort_assignments AS (
-                SELECT DISTINCT ct.trial_id::text AS trial_id
-                FROM researcher_assignment ra
-                JOIN cohort_trial ct ON ct.cohort_id = ra.cohort_id
-                WHERE ra.organization_id = $1
-                  AND ra.researcher_id = $2
-                  AND ra.cohort_id IS NOT NULL
+                  AND ra.cohort_id IS NULL
                   AND ra.revoked_at IS NULL
                   AND ra.expires_at > NOW()
             )
             SELECT trial_id FROM granted_trials
             UNION
             SELECT trial_id FROM direct_assignments
-            UNION
-            SELECT trial_id FROM cohort_assignments
             """,
             profile.organization_id,
             profile.user_id,
         )
-        return [r["trial_id"] for r in rows]
+        cohort_ids = await self._trial_ids_from_cohort_assignments(
+            profile, access_level="aggregate"
+        )
+        return sorted(
+            {_normalize_trial_id(r["trial_id"]) for r in rows}
+            | {_normalize_trial_id(t) for t in cohort_ids}
+        )
 
     async def _db_individual_trial_ids(self, profile: AccessProfile) -> list[str]:
         """Fallback source for individual trial access from active assignments."""
-        rows = await self.db.fetch(
-            """
-            WITH direct_assignments AS (
-                SELECT DISTINCT ra.trial_id::text AS trial_id
-                FROM researcher_assignment ra
-                WHERE ra.organization_id = $1
-                  AND ra.researcher_id = $2
-                  AND ra.access_level = 'individual'
-                  AND ra.trial_id IS NOT NULL
-                  AND ra.revoked_at IS NULL
-                  AND ra.expires_at > NOW()
-            ),
-            cohort_assignments AS (
-                SELECT DISTINCT ct.trial_id::text AS trial_id
-                FROM researcher_assignment ra
-                JOIN cohort_trial ct ON ct.cohort_id = ra.cohort_id
-                WHERE ra.organization_id = $1
-                  AND ra.researcher_id = $2
-                  AND ra.access_level = 'individual'
-                  AND ra.cohort_id IS NOT NULL
-                  AND ra.revoked_at IS NULL
-                  AND ra.expires_at > NOW()
-            )
-            SELECT trial_id FROM direct_assignments
-            UNION
-            SELECT trial_id FROM cohort_assignments
+        direct_rows = await self.db.fetch(
+            f"""
+            SELECT DISTINCT ra.trial_id::text AS trial_id
+            FROM researcher_assignment ra
+            WHERE ra.organization_id = $1
+              AND ra.researcher_id = $2
+              AND ra.access_level = 'individual'
+              AND ra.trial_id IS NOT NULL
+              AND ra.cohort_id IS NULL
+              AND {_ACTIVE_ASSIGNMENT_WHERE}
             """,
             profile.organization_id,
             profile.user_id,
         )
-        return [r["trial_id"] for r in rows]
+        direct_ids = {_normalize_trial_id(r["trial_id"]) for r in direct_rows}
+        cohort_ids = {
+            _normalize_trial_id(t)
+            for t in await self._trial_ids_from_cohort_assignments(
+                profile, access_level="individual"
+            )
+        }
+        return sorted(direct_ids | cohort_ids)
 
     async def compute_access_profile_with_abac(
         self,
@@ -394,6 +510,24 @@ class AuthorizationService:
             trial_context = dict(abac_context)
             trial_context["actual_cohort_size"] = cohort_sizes.get(trial_id, 0)
 
+            # OpenFGA CEL requires requested_area in permitted_areas. An empty
+            # string always fails. Derive the area from the trial when the query
+            # declared multiple areas (requested_areas) or omitted area entirely.
+            if not str(trial_context.get("requested_area") or "").strip():
+                requested_areas = [
+                    _normalize_area_token(v)
+                    for v in (abac_context.get("requested_areas") or [])
+                    if _normalize_area_token(v)
+                ]
+                meta = profile.trial_metadata.get(trial_id, {})
+                trial_area = _normalize_area_token(meta.get("therapeutic_area", ""))
+                if requested_areas:
+                    if trial_area not in requested_areas:
+                        return trial_id, False
+                    trial_context["requested_area"] = trial_area
+                elif trial_area:
+                    trial_context["requested_area"] = trial_area
+
             result = await self.fga.check_with_context(
                 user     = f"user:{user.username}",
                 relation = relation,
@@ -413,9 +547,14 @@ class AuthorizationService:
             for tid in profile.aggregate_trial_ids
         ])
 
-        abac_individual = [tid for tid, ok in individual_checks if ok]
-        abac_aggregate  = [tid for tid, ok in aggregate_checks  if ok]
-        abac_allowed    = list(set(abac_individual + abac_aggregate))
+        abac_individual = [_normalize_trial_id(tid) for tid, ok in individual_checks if ok]
+        abac_aggregate  = [
+            _normalize_trial_id(tid) for tid, ok in aggregate_checks if ok
+        ]
+        abac_aggregate = [
+            tid for tid in abac_aggregate if tid not in set(abac_individual)
+        ]
+        abac_allowed = sorted(set(abac_individual) | set(abac_aggregate))
 
         removed = len(profile.allowed_trial_ids) - len(abac_allowed)
         if removed > 0:
@@ -443,16 +582,26 @@ class AuthorizationService:
         else:
             profile.sql_trial_filter = "1=0"
 
-        # Drop scopes and metadata for removed trials
-        profile.trial_scopes = {
-            tid: scope
-            for tid, scope in profile.trial_scopes.items()
-            if tid in abac_allowed
-        }
+        abac_allowed_set = set(abac_allowed)
+        abac_individual_set = set(abac_individual)
+        abac_aggregate_set = set(abac_aggregate)
+
+        normalized_scopes: dict[str, TrialAccessScope] = {}
+        for tid, scope in profile.trial_scopes.items():
+            ntid = _normalize_trial_id(tid)
+            if ntid not in abac_allowed_set:
+                continue
+            if ntid in abac_individual_set:
+                scope.access_level = "individual"
+            elif ntid in abac_aggregate_set:
+                scope.access_level = "aggregate"
+            normalized_scopes[ntid] = scope
+        profile.trial_scopes = normalized_scopes
+
         profile.trial_metadata = {
-            tid: meta
+            _normalize_trial_id(tid): meta
             for tid, meta in profile.trial_metadata.items()
-            if tid in abac_allowed
+            if _normalize_trial_id(tid) in abac_allowed_set
         }
 
         # Capture runtime region restriction for row-level filtering.
@@ -599,7 +748,8 @@ class AuthorizationService:
         """
         Build trial scopes for ALL accessible trials (individual AND aggregate).
         """
-        individual_set = set(profile.individual_trial_ids)
+        individual_set = {_normalize_trial_id(t) for t in profile.individual_trial_ids}
+        assignment_level_by_trial: dict[str, str] = {}
 
         # Policy-first: Get cohorts the user can access in OpenFGA.
         # NOTE: Some tuples may still be in the outbox queue, so we also include
@@ -612,65 +762,67 @@ class AuthorizationService:
             )
         )
 
-        # ── 1. Get ALL active cohort assignments (any access level) ──
-        cohort_assignments = await self.db.fetch(
-            """
-            SELECT ra.cohort_id, ra.access_level,
-                c.name AS cohort_name, c.filter_criteria,
-                ct.trial_id
-            FROM researcher_assignment ra
-            JOIN cohort c ON ra.cohort_id = c.cohort_id
-            JOIN cohort_trial ct ON c.cohort_id = ct.cohort_id
-            WHERE ra.researcher_id = $1
-            AND ra.organization_id = $2
-            AND ra.cohort_id IS NOT NULL
-            AND ra.revoked_at IS NULL
-            AND ra.expires_at > NOW()
-            """,
-            profile.user_id,
-            profile.organization_id,
-        )
+        # ── 1. Cohort assignments expanded to trial_ids (filter_criteria first) ──
+        cohort_assignments = await self._fetch_expanded_cohort_assignments(profile)
 
-        # ── 1b. Get assigned cohort IDs from DB (in case tuples still in outbox) ──
         db_assigned_cohort_ids = {str(ca["cohort_id"]) for ca in cohort_assignments}
-
-        # Union OpenFGA + DB cohorts (defensive: if OpenFGA tuple hasn't synced yet,
-        # the DB assignment still counts)
         allowed_cohort_ids = allowed_cohort_ids.union(db_assigned_cohort_ids)
 
-        # ── 2. Get ALL direct trial assignments (any access level) ───
-        direct_assignments = await self.db.fetch(
-            """
-            SELECT ra.trial_id, ra.access_level
-            FROM researcher_assignment ra
-            WHERE ra.researcher_id = $1
-            AND ra.organization_id = $2
-            AND ra.trial_id IS NOT NULL
-            AND ra.cohort_id IS NULL
-            AND ra.revoked_at IS NULL
-            AND ra.expires_at > NOW()
-            """,
-            profile.user_id,
-            profile.organization_id,
-        )
+        # ── 2. Direct trial assignments (trial_id set, no cohort) ───
+        direct_assignments = await self._fetch_direct_assignments(profile)
 
         # ── 3. Index for fast lookup ─────────────────────────────────
         direct_trial_ids = {str(d["trial_id"]) for d in direct_assignments}
+
+        # PostgreSQL assignments are the source of truth for access LEVEL.
+        for d in direct_assignments:
+            tid = _normalize_trial_id(d["trial_id"])
+            level = _normalize_access_level(d.get("access_level"))
+            assignment_level_by_trial[tid] = level
+            if level == "individual":
+                individual_set.add(tid)
+
+        for ca in cohort_assignments:
+            tid = _normalize_trial_id(ca["trial_id"])
+            level = _normalize_access_level(ca.get("access_level"))
+            prev = assignment_level_by_trial.get(tid)
+            if prev != "individual":
+                assignment_level_by_trial[tid] = level
+            if level == "individual":
+                individual_set.add(tid)
+
+        profile.individual_trial_ids = sorted(individual_set)
+        profile.has_individual_access = bool(individual_set)
+        profile.aggregate_only = not bool(individual_set)
+
+        allowed_set = {
+            _normalize_trial_id(t) for t in profile.allowed_trial_ids
+        } | individual_set
+        profile.allowed_trial_ids = sorted(allowed_set)
+        profile.aggregate_trial_ids = sorted(
+            set(_normalize_trial_id(t) for t in profile.aggregate_trial_ids)
+            - individual_set
+        )
+
+        direct_trial_ids = {_normalize_trial_id(t) for t in direct_trial_ids}
 
         cohort_by_trial: dict[str, list] = {}
         for ca in cohort_assignments:
             if str(ca["cohort_id"]) not in allowed_cohort_ids:
                 continue
-            tid = str(ca["trial_id"])
-            if tid not in cohort_by_trial:
-                cohort_by_trial[tid] = []
-            cohort_by_trial[tid].append(ca)
+            tid = _normalize_trial_id(ca["trial_id"])
+            cohort_by_trial.setdefault(tid, []).append(ca)
 
         # ── 4. Build scope for EVERY accessible trial ────────────────
         for trial_id in profile.allowed_trial_ids:
-            is_individual = trial_id in individual_set
-            has_direct = trial_id in direct_trial_ids
-            trial_cohorts = cohort_by_trial.get(trial_id, [])
+            tid = _normalize_trial_id(trial_id)
+            assigned_level = assignment_level_by_trial.get(tid)
+            is_individual = (
+                tid in individual_set
+                or assigned_level == "individual"
+            )
+            has_direct = tid in direct_trial_ids
+            trial_cohorts = cohort_by_trial.get(tid, [])
 
             # Determine cohort_scopes list:
             #   - direct assignment  → empty list → is_unrestricted = True
@@ -690,8 +842,8 @@ class AuthorizationService:
             else:
                 scopes = []
 
-            profile.trial_scopes[trial_id] = TrialAccessScope(
-                trial_id=trial_id,
+            profile.trial_scopes[tid] = TrialAccessScope(
+                trial_id=tid,
                 access_level="individual" if is_individual else "aggregate",
                 cohort_scopes=scopes,
             )
@@ -705,41 +857,14 @@ class AuthorizationService:
         For each trial, find ALL active cohort assignments and collect their
         filter criteria. Multiple cohorts = UNION of filters.
         """
-        # Get all active cohort assignments for this researcher
-        cohort_assignments = await self.db.fetch(
-            """
-            SELECT ra.cohort_id, c.name as cohort_name, c.filter_criteria,
-                   ct.trial_id
-            FROM researcher_assignment ra
-            JOIN cohort c ON ra.cohort_id = c.cohort_id
-            JOIN cohort_trial ct ON c.cohort_id = ct.cohort_id
-            WHERE ra.researcher_id = $1
-            AND ra.organization_id = $2
-            AND ra.access_level = 'individual'
-            AND ra.cohort_id IS NOT NULL
-            AND ra.revoked_at IS NULL
-            AND ra.expires_at > NOW()
-            """,
-            profile.user_id,
-            profile.organization_id,
-        )
-
-        # Get direct trial assignments (no cohort = no patient filter)
-        direct_assignments = await self.db.fetch(
-            """
-            SELECT ra.trial_id
-            FROM researcher_assignment ra
-            WHERE ra.researcher_id = $1
-            AND ra.organization_id = $2
-            AND ra.access_level = 'individual'
-            AND ra.trial_id IS NOT NULL
-            AND ra.cohort_id IS NULL
-            AND ra.revoked_at IS NULL
-            AND ra.expires_at > NOW()
-            """,
-            profile.user_id,
-            profile.organization_id,
-        )
+        cohort_assignments = [
+            ca for ca in await self._fetch_expanded_cohort_assignments(profile)
+            if str(ca.get("access_level") or "").strip().lower() == "individual"
+        ]
+        direct_assignments = [
+            d for d in await self._fetch_direct_assignments(profile)
+            if str(d.get("access_level") or "").strip().lower() == "individual"
+        ]
 
         # Build trial scopes
         for trial_id in profile.individual_trial_ids:

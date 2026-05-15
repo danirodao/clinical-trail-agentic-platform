@@ -10,6 +10,7 @@ import logging
 from typing import Any, Optional
 
 from semantic_layer import build_inline_semantic_context
+from observability import MCP_DATA_SOURCE_USAGE
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ def make_tool_response(
     error: str | None = None,
     code: str | None = None,
     tool_name: str | None = None,
+    data_sources: list[str] | None = None,
 ) -> str:
     """Create a standardized tool response JSON string."""
     response: dict[str, Any] = {"status": status}
@@ -136,10 +138,23 @@ def make_tool_response(
         response["data"] = data
     if metadata:
         response["metadata"] = metadata
+    else:
+        response["metadata"] = {}
     if error:
         response["error"] = error
     if code:
         response["code"] = code
+
+    # Embed which data stores contributed to this response
+    if data_sources:
+        response["metadata"]["data_sources"] = data_sources
+        for src in data_sources:
+            try:
+                MCP_DATA_SOURCE_USAGE.labels(
+                    tool_name=tool_name or "unknown", source=src,
+                ).inc()
+            except Exception:
+                pass
 
     # Attach semantic context inline so downstream agents can interpret fields
     # without separate ontology lookups.
@@ -155,12 +170,51 @@ def make_tool_response(
     return to_json(response)
 
 
-def success_response(data: Any, metadata: dict | None = None) -> str:
-    return make_tool_response("success", data=data, metadata=metadata)
+def success_response(
+    data: Any,
+    metadata: dict | None = None,
+    data_sources: list[str] | None = None,
+) -> str:
+    return make_tool_response(
+        "success", data=data, metadata=metadata, data_sources=data_sources,
+    )
 
 
 def error_response(message: str, code: str = "ERROR") -> str:
     return make_tool_response("error", error=message, code=code)
+
+
+def _normalize_area_token(value: str) -> str:
+    return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _extract_requested_areas(abac_context: dict | None) -> list[str]:
+    """Collect explicit therapeutic-area constraints from ABAC context."""
+    if not abac_context:
+        return []
+
+    areas: list[str] = []
+    single = _normalize_area_token(abac_context.get("requested_area", ""))
+    if single:
+        areas.append(single)
+
+    for key in ("requested_areas", "areas", "therapeutic_areas"):
+        raw = abac_context.get(key)
+        if isinstance(raw, list):
+            for item in raw:
+                normalized = _normalize_area_token(str(item))
+                if normalized:
+                    areas.append(normalized)
+        elif isinstance(raw, str) and raw.strip():
+            normalized = _normalize_area_token(raw)
+            if normalized:
+                areas.append(normalized)
+
+    deduped: list[str] = []
+    for area in areas:
+        if area not in deduped:
+            deduped.append(area)
+    return deduped
 
 
 def build_abac_sql_filters(
@@ -198,12 +252,17 @@ def build_abac_sql_filters(
     params: list[Any] = []
     idx = param_offset
 
-    # requested_area -> clinical_trial.therapeutic_area (case-insensitive exact)
-    area = abac_context.get("requested_area", "").strip()
-    if area:
-        conditions.append(f"LOWER({table_alias}.therapeutic_area) = LOWER(${idx})")
-        params.append(area)
-        idx += 1
+    # requested_area / requested_areas -> clinical_trial.therapeutic_area
+    requested_areas = _extract_requested_areas(abac_context)
+    if requested_areas:
+        placeholders = ", ".join(f"${idx + i}" for i in range(len(requested_areas)))
+        conditions.append(
+            "LOWER(REPLACE(REPLACE("
+            f"{table_alias}.therapeutic_area, '-', '_'), ' ', '_')) "
+            f"= ANY(ARRAY[{placeholders}]::text[])"
+        )
+        params.extend(requested_areas)
+        idx += len(requested_areas)
     elif not skip_allowed_fallbacks:
         allowed_areas = [
             str(v).strip() for v in (abac_context.get("allowed_areas") or [])
@@ -301,18 +360,29 @@ def build_abac_qdrant_filters(
 
     Returns a list of FieldCondition objects ready to add to Qdrant must=[].
     """
-    from qdrant_client.models import FieldCondition, MatchValue
+    from qdrant_client.models import FieldCondition, MatchAny, MatchValue
 
     if not abac_context:
         return []
 
     conditions: list[FieldCondition] = []
 
-    area = abac_context.get("requested_area", "").strip()
-    if area:
-        conditions.append(
-            FieldCondition(key="therapeutic_area", match=MatchValue(value=area.lower()))
-        )
+    requested_areas = _extract_requested_areas(abac_context)
+    if requested_areas:
+        if len(requested_areas) == 1:
+            conditions.append(
+                FieldCondition(
+                    key="therapeutic_area",
+                    match=MatchValue(value=requested_areas[0]),
+                )
+            )
+        else:
+            conditions.append(
+                FieldCondition(
+                    key="therapeutic_area",
+                    match=MatchAny(any=requested_areas),
+                )
+            )
     else:
         allowed_areas = [
             str(v).strip().lower() for v in (abac_context.get("allowed_areas") or [])
@@ -321,6 +391,10 @@ def build_abac_qdrant_filters(
         if len(allowed_areas) == 1:
             conditions.append(
                 FieldCondition(key="therapeutic_area", match=MatchValue(value=allowed_areas[0]))
+            )
+        elif len(allowed_areas) > 1:
+            conditions.append(
+                FieldCondition(key="therapeutic_area", match=MatchAny(any=allowed_areas))
             )
 
     phase = abac_context.get("requested_phase", "").strip()

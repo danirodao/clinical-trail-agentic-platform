@@ -727,7 +727,41 @@ Operational impact:
 - Adverse-event queries no longer return spurious zeroes due to over-restrictive ABAC fallback.
 - Every response carries explicit provenance of the systems consulted.
 
+
+### 🛡️ Authorization & Synchronization Hardening (May 15, 2026)
+
+Applied end-to-end fixes to the authorization layer to ensure synchronization consistency between PostgreSQL and OpenFGA, and to strictly enforce the "Access Ceiling" principle.
+
+#### 1. OpenFGA Reconciliation Recovery
+Resolved a "desynchronization" bug where individual assignments in PostgreSQL were not correctly reflected in OpenFGA.
+- **Self-Healing Reconciliation**: The service now automatically detects and removes "plain" (non-conditional) tuples that were blocking the creation of mandatory **conditional tuples**.
+- **Context Integrity**: Fixed `auth/reconciliation_service.py` to correctly handle JSONB conditions from the database, ensuring `assigned_researcher` relations always carry the necessary CEL context (region, purpose, clearance).
+
+#### 2. Strict Ceiling Enforcement
+Hardened the `AccessContext` logic in the MCP Server (`mcp_server/access_control.py`) to strictly enforce the **Access Level Ceiling Principle** at the SQL generation layer.
+- **Safe-Default Logic**: Queries spanning trials with mixed access levels (Individual + Aggregate) are now guaranteed to run in `aggregate-only` mode, preventing accidental patient-level data leakage.
+- **Revocation Safety**: Ensured that trials with missing or revoked assignments default to `aggregate` or `none` rather than falling back to an unsafe state.
+
+#### 3. Discovery Recall Optimization
+Increased the default search limits for `search_trials` (PostgreSQL) and `find_trials_by_concept_and_metric` (Qdrant) from 30 to **100**.
+- **Multi-Category Recall**: This improvement addresses recall issues for complex, multi-category queries (e.g., "oncology and cardiology"), ensuring that trials from both therapeutic areas are represented in the results.
+
+#### 4. Authorization Service Resilience
+- Fixed an issue where the `AuthorizationService` would return zero individual trials if the OpenFGA `list-objects` call failed due to missing context.
+- The service now uses a more robust fallback that combines verified database assignments with OpenFGA results, while still maintaining the "Access Ceiling" during final profile computation.
+
+#### Summary of Changed Files (May 15, 2026)
+
+| File | Change |
+|:---|:---|
+| [`auth/reconciliation_service.py`](auth/reconciliation_service.py) | Added logic to purge invalid tuples before sync; fixed JSONB condition handling |
+| [`mcp_server/access_control.py`](mcp_server/access_control.py) | Hardened `get_effective_access_level` and `individual_trial_ids_in_scope` for mixed-access safety |
+| [`mcp_server/tools/trial_discovery.py`](mcp_server/tools/trial_discovery.py) | Increased search limit to 100; improved result grouping |
+| [`mcp_server/tools/composite_tools.py`](mcp_server/tools/composite_tools.py) | Increased Qdrant search limit to 100 for broad concept queries |
+| [`auth/authorization_service.py`](auth/authorization_service.py) | Improved OpenFGA error handling and database-to-FGA fallback logic |
+
 ---
+
 
 ## 🚧 The Access Level Ceiling Principle
 

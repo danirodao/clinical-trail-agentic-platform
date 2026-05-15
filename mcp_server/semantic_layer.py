@@ -15,38 +15,101 @@ from typing import Any
 
 
 SEMANTIC_LAYER_VERSION = "1.0.0"
-ONTOLOGY_VERSION = "clinical-trials-ontology-v1"
+ONTOLOGY_VERSION = "clinical-trials-ontology-v2"
 
 # Minimal concept metadata needed to annotate field names in tool responses.
 # The authoritative registry lives in semantic_mcp_server/ontology.py.
 _CONCEPT_LABELS: dict[str, tuple[str, str]] = {
     # concept_id -> (label, code_system)
-    "concept:trial.phase":       ("Clinical Trial Phase",       "internal"),
-    "concept:trial.status":      ("Trial Overall Status",       "ClinicalTrials.gov"),
-    "concept:patient.sex":       ("Patient Sex",                "internal"),
-    "concept:patient.disposition": ("Patient Disposition Status", "internal"),
-    "concept:condition.icd10":   ("Medical Condition ICD-10",   "ICD-10"),
-    "concept:condition.snomed":  ("Medical Condition SNOMED CT", "SNOMED CT"),
-    "concept:lab.loinc":         ("Lab Test LOINC Code",        "LOINC"),
-    "concept:drug.rxnorm":       ("Drug RxNorm Code",           "RxNorm"),
-    "concept:ae.meddra":         ("Adverse Event MedDRA Term",  "MedDRA"),
-    "concept:ae.severity":       ("Adverse Event Severity",     "CTCAE"),
-    "concept:access.level":      ("Data Access Level",          "internal"),
-    "concept:cohort":            ("Patient Cohort",             "internal"),
+    # ── Trial ──
+    "concept:trial.phase":           ("Clinical Trial Phase",       "internal"),
+    "concept:trial.status":          ("Trial Overall Status",       "ClinicalTrials.gov"),
+    "concept:trial.therapeutic_area":("Therapeutic Area",           "MeSH"),
+    "concept:trial.study_type":      ("Study Type",                 "CDISC"),
+    "concept:trial.allocation":      ("Allocation Method",          "CDISC"),
+    "concept:trial.masking":         ("Masking / Blinding",         "CDISC"),
+    "concept:trial.arm_type":        ("Treatment Arm Type",         "CDISC"),
+    "concept:trial.sponsor":         ("Lead Sponsor",               "internal"),
+    "concept:trial.enrollment":      ("Enrollment Count",           "internal"),
+    "concept:trial.outcome_type":    ("Outcome Measure Type",       "ClinicalTrials.gov"),
+    "concept:trial.eligibility_type":("Eligibility Criteria Type",  "ClinicalTrials.gov"),
+    # ── Patient ──
+    "concept:patient.sex":           ("Patient Sex",                "internal"),
+    "concept:patient.age":           ("Patient Age",                "internal"),
+    "concept:patient.race":          ("Patient Race",               "OMB"),
+    "concept:patient.ethnicity":     ("Patient Ethnicity",          "OMB"),
+    "concept:patient.disposition":   ("Patient Disposition Status", "internal"),
+    "concept:patient.arm":           ("Patient Assigned Arm",       "internal"),
+    # ── Condition ──
+    "concept:condition.icd10":       ("Medical Condition ICD-10",   "ICD-10"),
+    "concept:condition.snomed":      ("Medical Condition SNOMED CT","SNOMED CT"),
+    # ── Lab / Vitals ──
+    "concept:lab.loinc":             ("Lab Test LOINC Code",        "LOINC"),
+    "concept:lab.test_name":         ("Laboratory Test Name",       "internal"),
+    "concept:vitals.type":           ("Vital Sign Type",            "CDISC CDASH"),
+    # ── Drug ──
+    "concept:drug.rxnorm":           ("Drug RxNorm Code",           "RxNorm"),
+    "concept:drug.route":            ("Drug Administration Route",  "NCI Thesaurus"),
+    "concept:drug.intervention_type":("Intervention Type",          "CDISC"),
+    # ── Adverse events ──
+    "concept:ae.meddra":             ("Adverse Event MedDRA Term",  "MedDRA"),
+    "concept:ae.soc":                ("MedDRA System Organ Class",  "MedDRA"),
+    "concept:ae.severity":           ("Adverse Event Severity",     "CTCAE"),
+    "concept:ae.causality":          ("Adverse Event Causality",    "CDISC"),
+    "concept:ae.outcome":            ("Adverse Event Outcome",      "CDISC"),
+    # ── Geography ──
+    "concept:site.region":           ("Geographic Region",          "internal"),
+    "concept:site.country":          ("Country",                    "ISO 3166"),
+    # ── Access control ──
+    "concept:access.level":          ("Data Access Level",          "internal"),
+    "concept:cohort":                ("Patient Cohort",             "internal"),
 }
 
 FIELD_CONCEPT_MAP: dict[str, str] = {
+    # ── Trial-level fields ──
     "phase":              "concept:trial.phase",
     "overall_status":     "concept:trial.status",
+    "therapeutic_area":   "concept:trial.therapeutic_area",
+    "study_type":         "concept:trial.study_type",
+    "allocation":         "concept:trial.allocation",
+    "masking":            "concept:trial.masking",
+    "lead_sponsor":       "concept:trial.sponsor",
+    "enrollment_count":   "concept:trial.enrollment",
+    # ── Arm / Intervention ──
+    "arm_type":           "concept:trial.arm_type",
+    "arm_label":          "concept:trial.arm_type",
+    "arm_assigned":       "concept:patient.arm",
+    "intervention_type":  "concept:drug.intervention_type",
+    "route":              "concept:drug.route",
+    "rxnorm_code":        "concept:drug.rxnorm",
+    # ── Eligibility / Outcomes ──
+    "criteria_type":      "concept:trial.eligibility_type",
+    "outcome_type":       "concept:trial.outcome_type",
+    # ── Patient demographics ──
     "sex":                "concept:patient.sex",
+    "age":                "concept:patient.age",
+    "race":               "concept:patient.race",
+    "ethnicity":          "concept:patient.ethnicity",
     "disposition_status": "concept:patient.disposition",
+    "country":            "concept:site.country",
+    "region":             "concept:site.region",
+    # ── Conditions ──
     "icd10_code":         "concept:condition.icd10",
     "snomed_code":        "concept:condition.snomed",
+    # ── Laboratory ──
     "loinc_code":         "concept:lab.loinc",
-    "rxnorm_code":        "concept:drug.rxnorm",
+    "test_name":          "concept:lab.test_name",
+    # ── Vital signs ──
+    "vital_type":         "concept:vitals.type",
+    # ── Adverse events ──
     "meddra_pt":          "concept:ae.meddra",
     "event_term":         "concept:ae.meddra",
+    "ae_term":            "concept:ae.meddra",
+    "meddra_soc":         "concept:ae.soc",
     "severity":           "concept:ae.severity",
+    "causality":          "concept:ae.causality",
+    "outcome":            "concept:ae.outcome",
+    # ── Access control ──
     "access_level":       "concept:access.level",
     "cohort_id":          "concept:cohort",
 }

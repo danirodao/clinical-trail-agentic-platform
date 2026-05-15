@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 SEMANTIC_LAYER_VERSION = "1.0.0"
-ONTOLOGY_VERSION = "clinical-trials-ontology-v1"
+ONTOLOGY_VERSION = "clinical-trials-ontology-v2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Concept registry
@@ -105,7 +105,7 @@ CONCEPT_REGISTRY: dict[str, dict[str, Any]] = {
         ),
         "code_system": "MedDRA",
         "synonyms": ["adverse event term", "ae term", "meddra pt", "preferred term"],
-        "broader": None,
+        "broader": "concept:ae.soc",
     },
     "concept:ae.severity": {
         "label": "Adverse Event Severity",
@@ -136,6 +136,226 @@ CONCEPT_REGISTRY: dict[str, dict[str, Any]] = {
         "synonyms": ["patient cohort", "cohort filter", "study cohort"],
         "broader": None,
     },
+
+    # ── Priority 1: Critical gaps ──────────────────────────────────────────
+
+    "concept:vitals.type": {
+        "label": "Vital Sign Type",
+        "preferred_term": "vital sign",
+        "definition": (
+            "A physiological measurement collected during clinical visits. "
+            "Standard types: systolic blood pressure (SYSBP), diastolic blood "
+            "pressure (DIABP), heart rate (HR), temperature (TEMP), weight (WEIGHT)."
+        ),
+        "code_system": "CDISC CDASH",
+        "synonyms": ["vital", "vitals", "vital signs", "blood pressure", "heart rate"],
+        "allowed_values": ["SYSBP", "DIABP", "HR", "TEMP", "WEIGHT"],
+        "broader": None,
+    },
+    "concept:trial.therapeutic_area": {
+        "label": "Therapeutic Area",
+        "preferred_term": "therapeutic area",
+        "definition": "The medical specialty or disease domain targeted by a clinical trial.",
+        "code_system": "MeSH",
+        "synonyms": ["indication area", "disease area", "therapy area", "specialty"],
+        "allowed_values": ["Oncology", "Cardiology", "Endocrinology"],
+        "broader": None,
+    },
+    "concept:lab.test_name": {
+        "label": "Laboratory Test Name",
+        "preferred_term": "lab test name",
+        "definition": "Human-readable name of a laboratory test (e.g., Hemoglobin, HbA1c, Creatinine).",
+        "code_system": "internal",
+        "synonyms": ["lab name", "test name", "laboratory test", "lab test"],
+        "broader": "concept:lab.loinc",
+    },
+
+    # ── Priority 2: Study design & AE enrichment ──────────────────────────
+
+    "concept:trial.study_type": {
+        "label": "Study Type",
+        "preferred_term": "study type",
+        "definition": "The nature of the investigation: Interventional, Observational, or Expanded Access.",
+        "code_system": "CDISC",
+        "synonyms": ["study design type", "investigation type"],
+        "allowed_values": ["Interventional", "Observational", "Expanded Access"],
+        "broader": None,
+    },
+    "concept:trial.allocation": {
+        "label": "Allocation Method",
+        "preferred_term": "allocation",
+        "definition": "Method of assigning participants to arms: Randomized or Non-Randomized.",
+        "code_system": "CDISC",
+        "synonyms": ["randomization", "randomization method"],
+        "allowed_values": ["Randomized", "Non-Randomized", "N/A"],
+        "broader": None,
+    },
+    "concept:trial.masking": {
+        "label": "Masking / Blinding",
+        "preferred_term": "masking",
+        "definition": "Blinding strategy to reduce bias in outcome assessment.",
+        "code_system": "CDISC",
+        "synonyms": ["blinding", "blind", "double blind", "open label"],
+        "allowed_values": [
+            "None (Open Label)", "Single", "Double", "Triple", "Quadruple",
+        ],
+        "broader": None,
+    },
+    "concept:trial.arm_type": {
+        "label": "Treatment Arm Type",
+        "preferred_term": "arm type",
+        "definition": "Classification of a treatment arm within a clinical trial.",
+        "code_system": "CDISC",
+        "synonyms": ["arm", "treatment arm", "study arm", "arm label"],
+        "allowed_values": [
+            "Experimental", "Active Comparator",
+            "Placebo Comparator", "Sham Comparator", "No Intervention",
+        ],
+        "broader": None,
+    },
+    "concept:ae.soc": {
+        "label": "MedDRA System Organ Class",
+        "preferred_term": "system organ class",
+        "definition": (
+            "The highest level of the MedDRA hierarchy grouping adverse events "
+            "by the body system affected (e.g., Gastrointestinal disorders, "
+            "Nervous system disorders)."
+        ),
+        "code_system": "MedDRA",
+        "synonyms": ["soc", "organ class", "body system", "meddra soc"],
+        "broader": None,
+    },
+    "concept:ae.causality": {
+        "label": "Adverse Event Causality",
+        "preferred_term": "causality",
+        "definition": "Assessment of the causal relationship between the study drug and an adverse event.",
+        "code_system": "CDISC",
+        "synonyms": ["causal relationship", "relatedness", "drug relationship"],
+        "allowed_values": ["Related", "Possibly Related", "Unlikely Related", "Not Related"],
+        "broader": None,
+    },
+    "concept:ae.outcome": {
+        "label": "Adverse Event Outcome",
+        "preferred_term": "ae outcome",
+        "definition": "The resolution status of an adverse event at the time of reporting.",
+        "code_system": "CDISC",
+        "synonyms": ["event outcome", "resolution", "ae resolution"],
+        "allowed_values": ["Recovered", "Recovering", "Not Recovered", "Fatal", "Unknown"],
+        "broader": None,
+    },
+    "concept:trial.outcome_type": {
+        "label": "Outcome Measure Type",
+        "preferred_term": "outcome type",
+        "definition": "Classification of a study endpoint as primary, secondary, or other.",
+        "code_system": "ClinicalTrials.gov",
+        "synonyms": ["endpoint type", "measure type", "primary endpoint", "secondary endpoint"],
+        "allowed_values": ["primary", "secondary", "other"],
+        "broader": None,
+    },
+    "concept:trial.eligibility_type": {
+        "label": "Eligibility Criteria Type",
+        "preferred_term": "criteria type",
+        "definition": "Whether a criterion defines who CAN (inclusion) or CANNOT (exclusion) participate.",
+        "code_system": "ClinicalTrials.gov",
+        "synonyms": ["inclusion", "exclusion", "eligibility", "enrollment criteria"],
+        "allowed_values": ["inclusion", "exclusion"],
+        "broader": None,
+    },
+
+    # ── Priority 3: Demographics, geography, drug details, trial metadata ─
+
+    "concept:patient.age": {
+        "label": "Patient Age",
+        "preferred_term": "age",
+        "definition": "Age of the patient at the time of enrollment, in years.",
+        "code_system": "internal",
+        "synonyms": ["patient age", "age at enrollment"],
+        "broader": None,
+    },
+    "concept:patient.race": {
+        "label": "Patient Race",
+        "preferred_term": "race",
+        "definition": "Self-reported racial category per OMB standards.",
+        "code_system": "OMB",
+        "synonyms": ["racial category", "patient race"],
+        "allowed_values": [
+            "White", "Black or African American", "Asian",
+            "American Indian or Alaska Native",
+            "Native Hawaiian or Other Pacific Islander", "Other", "Unknown",
+        ],
+        "broader": None,
+    },
+    "concept:patient.ethnicity": {
+        "label": "Patient Ethnicity",
+        "preferred_term": "ethnicity",
+        "definition": "Self-reported ethnicity per OMB standards.",
+        "code_system": "OMB",
+        "synonyms": ["ethnic group", "patient ethnicity"],
+        "allowed_values": ["Hispanic or Latino", "Not Hispanic or Latino", "Unknown"],
+        "broader": None,
+    },
+    "concept:patient.arm": {
+        "label": "Patient Assigned Arm",
+        "preferred_term": "arm assigned",
+        "definition": "The treatment arm to which a patient was randomized or assigned.",
+        "code_system": "internal",
+        "synonyms": ["assigned arm", "treatment group", "patient arm"],
+        "broader": "concept:trial.arm_type",
+    },
+    "concept:site.region": {
+        "label": "Geographic Region",
+        "preferred_term": "region",
+        "definition": "Geographic region where a trial site or patient is located.",
+        "code_system": "internal",
+        "synonyms": ["geographic region", "site region", "study region"],
+        "allowed_values": ["North America", "Europe", "Asia-Pacific", "Latin America"],
+        "broader": None,
+    },
+    "concept:site.country": {
+        "label": "Country",
+        "preferred_term": "country",
+        "definition": "Country where a trial site is located or where a patient resides.",
+        "code_system": "ISO 3166",
+        "synonyms": ["nation", "site country", "patient country"],
+        "broader": "concept:site.region",
+    },
+    "concept:drug.route": {
+        "label": "Drug Administration Route",
+        "preferred_term": "route",
+        "definition": "The path by which a drug is administered (e.g., Oral, Intravenous, Subcutaneous).",
+        "code_system": "NCI Thesaurus",
+        "synonyms": ["administration route", "route of administration"],
+        "allowed_values": ["Oral", "Intravenous", "Subcutaneous", "Intramuscular", "Topical"],
+        "broader": "concept:drug.rxnorm",
+    },
+    "concept:drug.intervention_type": {
+        "label": "Intervention Type",
+        "preferred_term": "intervention type",
+        "definition": "Category of the clinical intervention being tested.",
+        "code_system": "CDISC",
+        "synonyms": ["drug type", "treatment type", "therapy type"],
+        "allowed_values": [
+            "Drug", "Biological", "Device", "Procedure",
+            "Radiation", "Behavioral", "Dietary Supplement",
+        ],
+        "broader": None,
+    },
+    "concept:trial.sponsor": {
+        "label": "Lead Sponsor",
+        "preferred_term": "lead sponsor",
+        "definition": "The organization primarily responsible for conducting the clinical trial.",
+        "code_system": "internal",
+        "synonyms": ["sponsor", "primary sponsor", "trial sponsor"],
+        "broader": None,
+    },
+    "concept:trial.enrollment": {
+        "label": "Enrollment Count",
+        "preferred_term": "enrollment count",
+        "definition": "The total number of participants enrolled (or planned) in a clinical trial.",
+        "code_system": "internal",
+        "synonyms": ["enrollment", "sample size", "number of patients", "n"],
+        "broader": None,
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,19 +363,52 @@ CONCEPT_REGISTRY: dict[str, dict[str, Any]] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 FIELD_CONCEPT_MAP: dict[str, str] = {
-    "phase": "concept:trial.phase",
-    "overall_status": "concept:trial.status",
-    "sex": "concept:patient.sex",
+    # ── Trial-level fields ──
+    "phase":              "concept:trial.phase",
+    "overall_status":     "concept:trial.status",
+    "therapeutic_area":   "concept:trial.therapeutic_area",
+    "study_type":         "concept:trial.study_type",
+    "allocation":         "concept:trial.allocation",
+    "masking":            "concept:trial.masking",
+    "lead_sponsor":       "concept:trial.sponsor",
+    "enrollment_count":   "concept:trial.enrollment",
+    # ── Arm / Intervention fields ──
+    "arm_type":           "concept:trial.arm_type",
+    "arm_label":          "concept:trial.arm_type",
+    "arm_assigned":       "concept:patient.arm",
+    "intervention_type":  "concept:drug.intervention_type",
+    "route":              "concept:drug.route",
+    "rxnorm_code":        "concept:drug.rxnorm",
+    # ── Eligibility / Outcomes ──
+    "criteria_type":      "concept:trial.eligibility_type",
+    "outcome_type":       "concept:trial.outcome_type",
+    # ── Patient demographics ──
+    "sex":                "concept:patient.sex",
+    "age":                "concept:patient.age",
+    "race":               "concept:patient.race",
+    "ethnicity":          "concept:patient.ethnicity",
     "disposition_status": "concept:patient.disposition",
-    "icd10_code": "concept:condition.icd10",
-    "snomed_code": "concept:condition.snomed",
-    "loinc_code": "concept:lab.loinc",
-    "rxnorm_code": "concept:drug.rxnorm",
-    "meddra_pt": "concept:ae.meddra",
-    "event_term": "concept:ae.meddra",
-    "severity": "concept:ae.severity",
-    "access_level": "concept:access.level",
-    "cohort_id": "concept:cohort",
+    "country":            "concept:site.country",
+    "region":             "concept:site.region",
+    # ── Conditions ──
+    "icd10_code":         "concept:condition.icd10",
+    "snomed_code":        "concept:condition.snomed",
+    # ── Laboratory ──
+    "loinc_code":         "concept:lab.loinc",
+    "test_name":          "concept:lab.test_name",
+    # ── Vital signs ──
+    "vital_type":         "concept:vitals.type",
+    # ── Adverse events ──
+    "meddra_pt":          "concept:ae.meddra",
+    "event_term":         "concept:ae.meddra",
+    "ae_term":            "concept:ae.meddra",
+    "meddra_soc":         "concept:ae.soc",
+    "severity":           "concept:ae.severity",
+    "causality":          "concept:ae.causality",
+    "outcome":            "concept:ae.outcome",
+    # ── Access control ──
+    "access_level":       "concept:access.level",
+    "cohort_id":          "concept:cohort",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

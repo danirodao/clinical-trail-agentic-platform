@@ -246,3 +246,36 @@ class Neo4jGraphLoader:
                             'code1': conditions[i],
                             'code2': conditions[j]
                         })
+
+            # ── HAS_LAB_RESULT (Lab Tests) ──
+            # Deduplicate by LOINC code so each unique test becomes one
+            # LabTest node, and each patient gets a HAS_LAB_RESULT edge
+            # carrying the observation-level metadata.
+            seen_loinc: set[str] = set()
+            for lab in patient_data.get('lab_results', []):
+                loinc = lab.get('loinc_code')
+                if not loinc or loinc in seen_loinc:
+                    continue
+                seen_loinc.add(loinc)
+                await session.run("""
+                    MERGE (l:LabTest {loinc_code: $loinc})
+                    SET l.test_name   = $test_name,
+                        l.result_unit = $unit
+                    WITH l
+                    MATCH (p:Patient {patient_id: $patient_id})
+                    MERGE (p)-[:HAS_LAB_RESULT {
+                        result_value: $value,
+                        abnormal_flag: $flag,
+                        collection_date: $date,
+                        visit_name: $visit
+                    }]->(l)
+                """, {
+                    'loinc': loinc,
+                    'test_name': lab.get('test_name', ''),
+                    'unit': lab.get('result_unit', ''),
+                    'patient_id': patient_id,
+                    'value': lab.get('result_value'),
+                    'flag': lab.get('abnormal_flag', 'N'),
+                    'date': str(lab.get('collection_date', '')),
+                    'visit': lab.get('visit_name', ''),
+                })

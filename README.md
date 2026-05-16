@@ -19,20 +19,19 @@ A secure, agentic platform for clinical trial data analysis that combines **LLM-
 4. [Architecture Patterns & Best Practices](#-architecture-patterns--best-practices)
 5. [Synthetic Data Generation](#-synthetic-data-generation)
 6. [Data Ingestion Pipeline](#-data-ingestion-pipeline)
-7. [Authentication — Keycloak OIDC](#-authentication--keycloak-oidc)
-8. [Fine-Grained Authorization — OpenFGA](#-fine-grained-authorization--openfga)
-9. [The Access Level Ceiling Principle](#-the-access-level-ceiling-principle)
-10. [MCP Server — Tool Hub](#-mcp-server--tool-hub)
-11. [Agentic Reasoning — LangGraph ReAct](#-agentic-reasoning--langgraph-react)
-12. [Token Efficiency](#-token-efficiency)
-13. [Frontend — React + Keycloak SPA](#-frontend--react--keycloak-spa)
-14. [Evaluation Framework](#-evaluation-framework)
-15. [Project Structure](#-project-structure)
-16. [Getting Started](#-getting-started)
-17. [Common Commands](#-common-commands)
-18. [Dashboards & Exploration](#-dashboards--exploration)
-19. [Testing & Validation](#-testing--validation)
-20. [Topics Covered](#-topics-covered)
+7. [Security Architecture & Access Control](#-security-architecture--access-control)
+8. [The Access Level Ceiling Principle](#-the-access-level-ceiling-principle)
+9. [MCP Server — Tool Hub](#-mcp-server--tool-hub)
+10. [Agentic Reasoning — LangGraph ReAct](#-agentic-reasoning--langgraph-react)
+11. [Token Efficiency](#-token-efficiency)
+12. [Frontend — React + Keycloak SPA](#-frontend--react--keycloak-spa)
+13. [Evaluation Framework](#-evaluation-framework)
+14. [Project Structure](#-project-structure)
+15. [Getting Started](#-getting-started)
+16. [Common Commands](#-common-commands)
+17. [Dashboards & Exploration](#-dashboards--exploration)
+18. [Testing & Validation](#-testing--validation)
+19. [Topics Covered](#-topics-covered)
 
 ---
 
@@ -388,12 +387,17 @@ graph LR
 
 ---
 
-## 🔑 Authentication — Keycloak OIDC
 
+---
+
+## 🔐 Security Architecture & Access Control
+
+The platform follows a **"Defense in Depth"** strategy, ensuring that sensitive clinical data is protected at every layer, from the user's initial login to the final SQL execution.
+
+### 1. Identity & Authentication (Keycloak OIDC)
 Keycloak serves as the **OpenID Connect (OIDC) Identity Provider**. It issues **RS256-signed JWTs** that carry user identity, roles, and custom claims.
 
-### Token Issuance Flow
-
+#### Token Issuance Flow
 ```mermaid
 sequenceDiagram
     participant Browser as React SPA
@@ -415,32 +419,21 @@ sequenceDiagram
     API->>API: 10. Extract UserContext
 ```
 
-### JWT Claims Used
-
+#### JWT Claims Used
 | Claim | Source | Purpose |
 |:---|:---|:---|
 | `sub` | Keycloak standard | User ID (UUID) |
 | `preferred_username` | Keycloak standard | Display name |
 | `realm_access.roles` | Keycloak realm roles | Role determination (`domain_owner` > `manager` > `researcher`) |
 | `organization_id` | Custom attribute mapper | Organization scoping for multi-tenancy |
-
-### Realm Configuration
-
-The `clinical-trials` realm is auto-imported via `realm-export.json` mounted into Keycloak. It defines:
-
-- **Client**: `research-platform-api` (confidential client)
-- **Roles**: `domain_owner`, `manager`, `researcher`
-- **Attribute Mappers**: `organization_id` → JWT claim
-- **Authentication**: PKCE (S256) required
+| `clearance_level` | Custom attribute mapper | Classification-based ABAC gating |
 
 ---
 
-## 🛡️ Fine-Grained Authorization — OpenFGA
-
+### 2. Fine-Grained Authorization (OpenFGA ReBAC)
 OpenFGA implements **Google Zanzibar-style Relationship-Based Access Control (ReBAC)**. It answers questions like "Can user X view individual data for trial Y?" by evaluating a graph of relationship tuples.
 
-### Authorization Model
-
+#### Authorization Model
 ```text
 type user
 
@@ -462,77 +455,56 @@ type patient
   relations
     define enrolled_in_trial: [clinical_trial]
     define can_view_individual: can_view_individual from enrolled_in_trial  # DERIVED
-
-type cohort
-  relations
-    define assigned_researcher: [user with check_fine_grained_access]
-    define includes_trial: [clinical_trial]
-    define can_access: assigned_researcher or creator
 ```
 
-### Conditional Tuple Semantics
+#### Conditional Access
+Access is often gated by **Conditions (CEL)**, such as validity windows, approved regions, or specific query purposes. These are written as conditional tuples in OpenFGA and evaluated at runtime using request-specific attributes.
 
-The current implementation uses conditional tuples for both org-level ceilings
-and researcher-level delegations.
+---
 
-- `granted_org` stores Tier 1 governance constraints such as validity window,
-  region, therapeutic area, phase, purpose, clearance tier, and minimum cohort
-  size.
-- `assigned_researcher` stores a narrower Tier 2 delegation derived from the
-  organization's active ceiling.
-- Runtime request attributes are supplied at OpenFGA `/check` time; they are
-  not persisted on tuples.
+### 3. The Access Context Lifecycle
+The most critical security component is the **Access Context**—a secure, immutable payload that travels with every agent request. It transforms abstract permissions into concrete database filters.
 
-### Write Path and Drift Repair
+#### Phase A: Generation (Compute)
+At the start of every query, the API Gateway's `AuthorizationService` computes the user's **Access Profile**:
+1.  **OpenFGA Discovery**: The service calls OpenFGA's `ListObjects` to find all trials the user can access at either the **Aggregate** or **Individual** level.
+2.  **DB Enrichment**: It then fetches specific **Cohort Filters** (JSONB criteria) from PostgreSQL for those trials (e.g., `{"age_min": 18, "region": "EU"}`).
+3.  **Serialization**: These permissions are bundled into a serialized JSON object—the `access_context`.
 
-OpenFGA tuple persistence is mediated through a PostgreSQL transactional outbox.
+#### Phase B: Enforcement (Enforce)
+The Agent (LLM) cannot see or modify the `access_context`. When the Agent calls an MCP tool:
+1.  **Context Injection**: The API Gateway intercepts the tool call and **injects** the `access_context` into the tool arguments.
+2.  **Validation**: The MCP Server deserializes the context and verifies that the requested `trial_id` is actually in the `allowed_trial_ids` list.
+3.  **SQL Generation**: The `AccessContext` class translates the context into **parameterized SQL WHERE clauses** (e.g., `WHERE trial_id = '...' AND p.age >= 18`). This ensures the database driver physically cannot retrieve unauthorized rows.
 
-- Request approval, collection grants, manager assignments, and dynamic
-  collection refresh enqueue OpenFGA writes in `openfga_tuple_outbox`.
-- Outbox rows may carry `condition_name` and `condition_context`; the relay
-  writes them with `write_conditional_tuples` when present.
-- Tuple existence checks use OpenFGA `/read` semantics rather than `/check`
-  because conditional tuples may require runtime context to evaluate.
-- Reconciliation rebuilds missing tuples from PostgreSQL grant scope and expiry
-  so repair does not widen access by reintroducing plain tuples.
-
-### Dynamic Collection Propagation Rule
-
-When a dynamic collection gains a new trial:
-
-- each active organization grant on the collection is propagated to that trial
-  as a conditional `granted_org` tuple;
-- auto-assigned researcher tuples are generated only for researcher assignments
-  in the same organization as the propagated org grant;
-- delegated researcher conditions are capped by the organization's active ceiling
-  and the researcher's own assignment expiry.
-
-### How Access Is Evaluated
-
+#### Access Evaluation Flow
 ```mermaid
 flowchart TD
     A[User Request] --> B{Role = domain_owner?}
     B -->|Yes| C[Full Access - 1=1]
-  B -->|No| D[Layer 1: OpenFGA]
-  D --> E[ListObjects: can_view_aggregate]
-  D --> F[ListObjects: can_view_individual]
-  E --> G[Aggregate Trial IDs]
-  F --> H[Individual Trial IDs]
-  G --> I[Layer 2: PostgreSQL Assignments]
-  H --> I
-  I --> J[Join researcher_assignment + cohort + cohort_trial]
-  J --> K[Load cohort.filter_criteria JSONB]
-  K --> L[Build AccessProfile + patient_filters]
-  L --> M[Serialize access_context JSON]
-  M --> N[Inject into each MCP tool call]
-  N --> O[MCP AccessContext validates trial scope]
-  O --> P{Has cohort filters?}
-  P -->|Yes| Q[Parameterized SQL filters<br/>age/sex/ethnicity/country/conditions/disposition/arm]
-  P -->|No| R[Unrestricted per-trial individual scope]
-  Q --> S[Authorized rows only]
-  R --> S
-  S --> T[Apply ceiling principle on mixed access]
+    B -->|No| D[Layer 1: OpenFGA Discovery]
+    D --> E[ListObjects: can_view_aggregate]
+    D --> F[ListObjects: can_view_individual]
+    E & F --> G[Layer 2: PostgreSQL Assignment Enrichment]
+    G --> H[Build AccessProfile + Cohort Filters]
+    H --> I[Serialize access_context JSON]
+    I --> J[Inject into MCP Tool Call]
+    J --> K[MCP Server: build_authorized_patient_filter]
+    K --> L[Final SQL Generation with ABAC Guards]
 ```
+
+---
+
+### 4. Summary Table: Security Layers
+
+| Layer | Component | Mechanism | Security Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Authentication** | Keycloak | OIDC / JWT / PKCE | Verifies "Who are you?" using enterprise identity. |
+| **Authorization** | OpenFGA | ReBAC / ABAC / CEL | Verifies "What can you see?" based on relationships. |
+| **Orchestration** | API Gateway | Context Injection | Ensures the LLM is bounded by real-time permissions. |
+| **Data Serving** | MCP Server | Dynamic SQL Filtering | Prevents data leakage at the source (PostgreSQL). |
+
+---
 
 ### Where Cohort Filters Are Kept (And Enforced)
 

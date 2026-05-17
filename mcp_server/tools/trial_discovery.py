@@ -112,7 +112,7 @@ def register_tools(mcp: FastMCP) -> None:
                     vector_results = await qdrant_client.search_vectors(
                         query_text=query.strip(),
                         trial_ids=ctx.allowed_trial_ids,
-                        limit=max_results * 5,  # Increased to find more unique trials
+                        limit=max_results,
                         score_threshold=0.25,
                         extra_must_conditions=abac_qdrant,
                     )

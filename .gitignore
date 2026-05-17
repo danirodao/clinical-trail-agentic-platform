@@ -166,6 +166,7 @@ api/__pycache__/
 mcp_server/__pycache__/
 generator/__pycache__/
 processor/__pycache__/
+external-secrets/
 
 # Docker local volumes (if any are mapped to local folders)
 # (In this project they are mostly named volumes, but just in case)

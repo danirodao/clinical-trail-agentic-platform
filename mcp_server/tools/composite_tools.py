@@ -888,7 +888,7 @@ def register_tools(mcp: FastMCP) -> None:
             chunks = await qdrant_client.search_vectors(
                 query_text=concept,
                 trial_ids=ctx.allowed_trial_ids,
-                limit=100,  # Increased to capture more trials for multi-concept queries
+                limit=30,
                 section="summary",
                 score_threshold=0.25,
                 extra_must_conditions=qdrant_abac,

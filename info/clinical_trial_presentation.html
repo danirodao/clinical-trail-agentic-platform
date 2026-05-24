@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinical Trial Agentic Platform</title>
+    <style>
+        :root {
+            --bg: #0a0a0a;
+            --text: #ffffff;
+            --muted: #a0a0a0;
+            --card: #1a1a1a;
+            --border: #2a2a2a;
+            --accent: #3B82F6; /* Electric blue for AI/Tech */
+            --accent-glow: rgba(59, 130, 246, 0.2);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            overflow: hidden;
+        }
+
+        #presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            transition: opacity 0.4s ease-in-out;
+            pointer-events: none;
+            padding: 60px;
+        }
+
+        .slide.active {
+            opacity: 1;
+            pointer-events: auto;
+            z-index: 10;
+        }
+
+        .content {
+            width: 100%;
+            max-width: 1000px;
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+        }
+
+        h1 { font-size: 64px; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em; margin-bottom: 10px; }
+        h2 { font-size: 48px; font-weight: 700; line-height: 1.2; letter-spacing: -0.01em; color: var(--accent); margin-bottom: 20px;}
+        p { font-size: 28px; line-height: 1.5; color: var(--muted); }
+        
+        .title-slide h1 { font-size: 80px; background: linear-gradient(135deg, #fff 0%, #a0a0a0 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .title-slide p { font-size: 32px; color: var(--accent); margin-top: 20px;}
+
+        /* Visual Components */
+        
+        /* Card Grid */
+        .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; width: 100%; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 32px; display: flex; flex-direction: column; gap: 16px; transition: transform 0.2s; }
+        .card:hover { transform: translateY(-4px); border-color: var(--accent); box-shadow: 0 10px 30px var(--accent-glow); }
+        .card-icon { font-size: 40px; }
+        .card-title { font-size: 24px; font-weight: 600; color: #fff; }
+        .card-desc { font-size: 20px; color: var(--muted); }
+
+        /* Step Flow */
+        .step-flow { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; width: 100%; }
+        .step { flex: 1; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; position: relative; }
+        .step-num { width: 60px; height: 60px; border-radius: 50%; background: var(--card); border: 2px solid var(--accent); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; color: var(--accent); z-index: 2;}
+        .step::after { content: ''; position: absolute; top: 30px; left: 50%; width: 100%; height: 2px; background: var(--border); z-index: 1; }
+        .step:last-child::after { display: none; }
+        .step-title { font-size: 22px; font-weight: 600; color: #fff; }
+        .step-desc { font-size: 18px; color: var(--muted); }
+
+        /* Icon + Label List */
+        .icon-list { display: flex; flex-direction: column; gap: 24px; width: 100%; }
+        .icon-item { display: flex; align-items: center; gap: 24px; background: var(--card); padding: 24px 32px; border-radius: 12px; border-left: 4px solid var(--accent); }
+        .icon-item span { font-size: 32px; }
+        .icon-item div { font-size: 24px; font-weight: 500; color: #fff; }
+
+        /* Metric Dashboard */
+        .metric-dash { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; width: 100%; }
+        .metric { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 40px; text-align: center; }
+        .metric-val { font-size: 72px; font-weight: 800; color: var(--accent); line-height: 1; margin-bottom: 12px; }
+        .metric-label { font-size: 22px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 1px; }
+
+        /* Code Block */
+        .code-block { background: #111; border: 1px solid #333; border-radius: 12px; padding: 32px; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 20px; color: #e5e5e5; overflow-x: auto; white-space: pre; line-height: 1.6; width: 100%;}
+        .code-kw { color: #ff7b72; }
+        .code-str { color: #a5d6ff; }
+        .code-comment { color: #8b949e; }
+
+        /* Comparison Panel */
+        .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; width: 100%; }
+        .comp-col { background: var(--card); border-radius: 16px; padding: 40px; display: flex; flex-direction: column; gap: 20px;}
+        .comp-title { font-size: 28px; font-weight: 700; padding-bottom: 20px; border-bottom: 1px solid var(--border); text-align: center;}
+        .comp-col.bad .comp-title { color: #f87171; }
+        .comp-col.good .comp-title { color: #10b981; }
+        .comp-item { font-size: 22px; color: var(--muted); display: flex; align-items: flex-start; gap: 12px;}
+
+        /* Controls */
+        .controls { position: fixed; bottom: 30px; right: 40px; display: flex; align-items: center; gap: 20px; z-index: 100; }
+        .counter { font-size: 20px; color: var(--muted); font-variant-numeric: tabular-nums; }
+        .btn { background: var(--card); border: 1px solid var(--border); color: #fff; width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s; font-size: 20px; }
+        .btn:hover { background: var(--border); color: var(--accent); }
+    </style>
+</head>
+<body>
+
+<div id="presentation">
+
+    <!-- Slide 1: Title -->
+    <div class="slide active title-slide">
+        <div class="content" style="text-align: center; align-items: center;">
+            <h1>Clinical Trial Agentic Platform</h1>
+            <p>Secure, LLM-powered Data Mesh for Clinical Research</p>
+            <div style="margin-top: 60px; font-size: 24px; color: var(--muted);">Architecture & Systems Overview</div>
+        </div>
+    </div>
+
+    <!-- Slide 2: The Problem -->
+    <div class="slide">
+        <div class="content">
+            <h2>The Challenge</h2>
+            <p>Clinical trial data is highly sensitive, siloed, and trapped in unstructured protocols, making cross-trial insights difficult and risky.</p>
+            
+            <div class="comparison">
+                <div class="comp-col bad">
+                    <div class="comp-title">Traditional Approach</div>
+                    <div class="comp-item"><span>❌</span> Unstructured PDF protocols</div>
+                    <div class="comp-item"><span>❌</span> Siloed relational databases</div>
+                    <div class="comp-item"><span>❌</span> Broad, coarse access control</div>
+                    <div class="comp-item"><span>❌</span> Manual cohort filtering</div>
+                </div>
+                <div class="comp-col good">
+                    <div class="comp-title">Our Platform</div>
+                    <div class="comp-item"><span>✅</span> Extracted & embedded context</div>
+                    <div class="comp-item"><span>✅</span> Multi-modal Data Mesh</div>
+                    <div class="comp-item"><span>✅</span> Fine-grained ReBAC + ABAC</div>
+                    <div class="comp-item"><span>✅</span> Agent-driven exploration</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 3: High Level Overview -->
+    <div class="slide">
+        <div class="content">
+            <h2>What is it?</h2>
+            <p>A secure platform allowing researchers to ask natural language questions, autonomously querying authorized data across relational, graph, and vector stores.</p>
+            
+            <div class="card-grid">
+                <div class="card">
+                    <div class="card-icon">🧠</div>
+                    <div class="card-title">LLM Reasoning</div>
+                    <div class="card-desc">LangGraph ReAct loop translates questions to tool actions.</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">🗄️</div>
+                    <div class="card-title">Data Mesh</div>
+                    <div class="card-desc">PostgreSQL, Neo4j, and Qdrant working in harmony.</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">🛡️</div>
+                    <div class="card-title">Zero Trust</div>
+                    <div class="card-desc">Immutable Access Context applied at the database driver layer.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 4: Technologies -->
+    <div class="slide">
+        <div class="content">
+            <h2>Core Technologies</h2>
+            <p>Selected for scalability, strict security boundaries, and advanced AI orchestration.</p>
+            
+            <div class="icon-list">
+                <div class="icon-item">
+                    <span>⚡</span>
+                    <div><strong>FastAPI & React:</strong> High-performance async gateway and responsive SPA.</div>
+                </div>
+                <div class="icon-item">
+                    <span>🦜</span>
+                    <div><strong>LangGraph:</strong> Stateful, multi-actor LLM orchestration with bounded budgets.</div>
+                </div>
+                <div class="icon-item">
+                    <span>🔐</span>
+                    <div><strong>Keycloak & OpenFGA:</strong> Enterprise SSO paired with Zanzibar-style ReBAC.</div>
+                </div>
+                <div class="icon-item">
+                    <span>🔌</span>
+                    <div><strong>FastMCP:</strong> Standardized Model Context Protocol for tool exposure.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 5: Data Ingestion Pipeline -->
+    <div class="slide">
+        <div class="content">
+            <h2>How it works: Ingestion</h2>
+            <p>Event-driven architecture decoupling document generation from deep data extraction.</p>
+            
+            <div class="step-flow">
+                <div class="step">
+                    <div class="step-num">1</div>
+                    <div class="step-title">Generate</div>
+                    <div class="step-desc">Synthetic trials & PDFs uploaded to MinIO.</div>
+                </div>
+                <div class="step">
+                    <div class="step-num">2</div>
+                    <div class="step-title">Event</div>
+                    <div class="step-desc">Kafka Claim-Check payload published.</div>
+                </div>
+                <div class="step">
+                    <div class="step-num">3</div>
+                    <div class="step-title">Extract</div>
+                    <div class="step-desc">Regex, tables, & GPT-4o parsing.</div>
+                </div>
+                <div class="step">
+                    <div class="step-num">4</div>
+                    <div class="step-title">Mesh Load</div>
+                    <div class="step-desc">PG, Neo4j, Qdrant vectors upserted.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 6: Agentic Lakehouse & Prompts -->
+    <div class="slide">
+        <div class="content">
+            <h2>Agentic Lakehouse Strategy</h2>
+            <p>The LangGraph ReAct loop separates reasoning from execution, with explicit safety guardrails.</p>
+            
+            <div class="code-block">
+<span class="code-comment"># System Prompt Guardrail Example</span>
+<span class="code-kw">IF</span> query_spans_multiple_trials:
+  <span class="code-kw">ASSERT</span> access_level <span class="code-kw">==</span> <span class="code-str">"aggregate"</span>
+  <span class="code-kw">DO NOT</span> request individual patient rows.
+
+<span class="code-comment"># Tool Selection Strategy</span>
+Use <span class="code-str">`search_documents`</span> for protocols.
+Use <span class="code-str">`get_patient_demographics`</span> for cohorts.
+Use <span class="code-str">`compare_treatment_arms`</span> for efficacy.
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 7: Fine Grain Access Control -->
+    <div class="slide">
+        <div class="content">
+            <h2>Fine Grain Access Control</h2>
+            <p>Three composable layers evaluated per trial, enforcing the Access Level Ceiling.</p>
+            
+            <div class="card-grid">
+                <div class="card">
+                    <div class="card-icon">1️⃣</div>
+                    <div class="card-title">OpenFGA ReBAC</div>
+                    <div class="card-desc">Trial-level binary access (Aggregate vs Individual).</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">2️⃣</div>
+                    <div class="card-title">Governance Ceiling</div>
+                    <div class="card-desc">ABAC constraints (e.g., EU region only) applied per trial.</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">3️⃣</div>
+                    <div class="card-title">SQL Cohort Filters</div>
+                    <div class="card-desc">PostgreSQL JSONB criteria compiled into dynamic WHERE clauses.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 8: The Semantic Layer -->
+    <div class="slide">
+        <div class="content">
+            <h2>The Semantic Layer (Knowledge Graph)</h2>
+            <p>Neo4j bridges clinical concepts, enabling the agent to understand complex medical relationships.</p>
+            
+            <div class="icon-list">
+                <div class="icon-item">
+                    <span>🧬</span>
+                    <div><strong>Drug Relationships:</strong> (:Drug)-[:MAY_CAUSE]->(:AdverseEvent)</div>
+                </div>
+                <div class="icon-item">
+                    <span>🩺</span>
+                    <div><strong>Patient Context:</strong> (:Patient)-[:EXPERIENCED]->(:AdverseEvent)</div>
+                </div>
+                <div class="icon-item">
+                    <span>📚</span>
+                    <div><strong>Ontology Mapping:</strong> standardizes MedDRA, LOINC, and RxNorm queries.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 9: MCP Servers -->
+    <div class="slide">
+        <div class="content">
+            <h2>Model Context Protocol (MCP)</h2>
+            <p>Standardized tool exposure decoupled from the agent logic. FastMCP hosts 15 clinical tools.</p>
+            
+            <div class="metric-dash">
+                <div class="metric">
+                    <div class="metric-val">15</div>
+                    <div class="metric-label">Secure Tools</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-val">SSE</div>
+                    <div class="metric-label">Transport</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-val">100%</div>
+                    <div class="metric-label">Intercepted</div>
+                </div>
+            </div>
+            <p style="text-align: center; font-size: 20px; margin-top: 10px;">Tool execution is intercepted to inject the immutable AccessContext, preventing prompt injection bypasses.</p>
+        </div>
+    </div>
+
+    <!-- Slide 10: Architecture Principles -->
+    <div class="slide">
+        <div class="content">
+            <h2>Architecture Best Practices</h2>
+            <p>Built for resilience, scale, and uncompromising data security.</p>
+            
+            <div class="card-grid">
+                <div class="card">
+                    <div class="card-icon">🔒</div>
+                    <div class="card-title">Fail-Closed</div>
+                    <div class="card-desc">If auth services timeout, all access defaults to denied.</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">🎫</div>
+                    <div class="card-title">Claim-Check</div>
+                    <div class="card-desc">Kafka handles metadata; MinIO handles heavy PDF payloads.</div>
+                </div>
+                <div class="card">
+                    <div class="card-icon">👁️</div>
+                    <div class="card-title">Observable</div>
+                    <div class="card-desc">OTLP traces to Phoenix, Prometheus metrics, Argilla eval.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Slide 11: Takeaway -->
+    <div class="slide">
+        <div class="content" style="text-align: center; align-items: center;">
+            <h2>The Future of Clinical Data</h2>
+            <p style="max-width: 800px; text-align: center; margin-bottom: 40px;">Empowering researchers with natural language exploration without compromising strict, multi-layered data security.</p>
+            
+            <div style="font-size: 100px; margin-bottom: 20px;">🚀</div>
+            <h1 style="font-size: 48px; color: #fff;">Ready for Production</h1>
+        </div>
+    </div>
+
+</div>
+
+<div class="controls">
+    <div class="counter"><span id="current">1</span> / <span id="total">11</span></div>
+    <div class="btn" onclick="prev()">←</div>
+    <div class="btn" onclick="next()">→</div>
+</div>
+
+<script>
+    let currentSlide = 0;
+    const slides = document.querySelectorAll('.slide');
+    const totalEl = document.getElementById('total');
+    const currentEl = document.getElementById('current');
+    
+    totalEl.textContent = slides.length;
+
+    function update() {
+        slides.forEach((s, i) => {
+            if(i === currentSlide) {
+                s.classList.add('active');
+            } else {
+                s.classList.remove('active');
+            }
+        });
+        currentEl.textContent = currentSlide + 1;
+    }
+
+    function next() {
+        if(currentSlide < slides.length - 1) {
+            currentSlide++;
+            update();
+        }
+    }
+
+    function prev() {
+        if(currentSlide > 0) {
+            currentSlide--;
+            update();
+        }
+    }
+
+    document.addEventListener('keydown', (e) => {
+        if(e.key === 'ArrowRight' || e.key === 'Space') next();
+        if(e.key === 'ArrowLeft') prev();
+    });
+</script>
+
+</body>
+</html>

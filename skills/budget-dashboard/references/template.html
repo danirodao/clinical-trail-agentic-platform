@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Financial Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --white: #ffffff;
+    --text: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --text-tertiary: #aeaeb2;
+    --border: #d2d2d7;
+    --border-light: #e8e8ed;
+    --green: #34c759;
+    --green-bg: #f0faf2;
+    --blue: #007aff;
+    --blue-bg: #f0f5ff;
+    --orange: #ff9500;
+    --orange-bg: #fff8f0;
+    --pink: #ff2d55;
+    --pink-bg: #fff0f3;
+    --purple: #af52de;
+    --teal: #5ac8fa;
+    --radius: 20px;
+    --radius-sm: 14px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.04);
+    --shadow-hover: 0 2px 8px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.06);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+
+  .app {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 48px 32px 80px;
+  }
+
+  /* ---- HEADER ---- */
+  .header {
+    margin-bottom: 40px;
+  }
+  .header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .header h1 {
+    font-family: 'Newsreader', Georgia, serif;
+    font-size: 48px;
+    font-weight: 600;
+    letter-spacing: -1.5px;
+    line-height: 1.1;
+    color: var(--text);
+  }
+  .header p {
+    color: var(--text-secondary);
+    font-size: 17px;
+    font-weight: 400;
+    margin-top: 8px;
+    letter-spacing: -0.2px;
+  }
+  .date-pill {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--white);
+    border: 1px solid var(--border-light);
+    border-radius: 100px;
+    padding: 8px 16px;
+    white-space: nowrap;
+  }
+
+  /* ---- STAT CARDS ---- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat {
+    background: var(--white);
+    border-radius: var(--radius);
+    padding: 24px 24px 20px;
+    box-shadow: var(--shadow);
+    transition: box-shadow 0.3s, transform 0.3s;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat:hover {
+    box-shadow: var(--shadow-hover);
+    transform: translateY(-1px);
+  }
+  .stat-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    margin-bottom: 14px;
+  }
+  .stat-icon.green { background: var(--green-bg); color: var(--green); }
+  .stat-icon.pink { background: var(--pink-bg); color: var(--pink); }
+  .stat-icon.blue { background: var(--blue-bg); color: var(--blue); }
+  .stat-icon.orange { background: var(--orange-bg); color: var(--orange); }
+  .stat-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: 'Newsreader', Georgia, serif;
+    font-size: 34px;
+    font-weight: 600;
+    letter-spacing: -1px;
+    line-height: 1.1;
+  }
+  .stat-value.green { color: var(--green); }
+  .stat-value.pink { color: var(--pink); }
+  .stat-value.blue { color: var(--blue); }
+  .stat-value.orange { color: var(--orange); }
+  .stat-sub {
+    font-size: 13px;
+    color: var(--text-tertiary);
+    margin-top: 4px;
+  }
+
+  /* ---- GRID ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .grid-full { grid-column: 1 / -1; }
+
+  /* ---- CARD ---- */
+  .card {
+    background: var(--white);
+    border-radius: var(--radius);
+    padding: 28px;
+    box-shadow: var(--shadow);
+    transition: box-shadow 0.3s;
+  }
+  .card:hover { box-shadow: var(--shadow-hover); }
+  .card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 24px;
+  }
+
+  /* ---- SLIDERS ---- */
+  .slider-group { margin-bottom: 22px; }
+  .slider-group:last-of-type { margin-bottom: 0; }
+  .slider-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }
+  .slider-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.1px;
+  }
+  .slider-val {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--blue);
+    font-variant-numeric: tabular-nums;
+    min-width: 72px;
+    text-align: right;
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border-light);
+    outline: none;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  input[type="range"]:hover { background: var(--border); }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--white);
+    border: 2px solid var(--blue);
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,122,255,0.3);
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  input[type="range"]::-webkit-slider-thumb:hover {
+    transform: scale(1.12);
+    box-shadow: 0 2px 8px rgba(0,122,255,0.4);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--white);
+    border: 2px solid var(--blue);
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,122,255,0.3);
+  }
+  .slider-range {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    margin-top: 4px;
+  }
+
+  /* ---- INSIGHT ---- */
+  .insight {
+    margin-top: 24px;
+    padding: 18px 20px;
+    background: var(--blue-bg);
+    border-radius: var(--radius-sm);
+    border-left: 3px solid var(--blue);
+  }
+  .insight-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--blue);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+  .insight p {
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.55;
+  }
+  .insight strong { color: var(--text); }
+
+  /* ---- DONUT ---- */
+  .donut-layout {
+    display: flex;
+    align-items: center;
+    gap: 36px;
+  }
+  .donut-wrap {
+    width: 200px;
+    height: 200px;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .donut-center {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    pointer-events: none;
+  }
+  .donut-center-value {
+    font-family: 'Newsreader', Georgia, serif;
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.5px;
+  }
+  .donut-center-label {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .legend { flex: 1; }
+  .legend-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-light);
+  }
+  .legend-row:last-child { border-bottom: none; }
+  .legend-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .legend-name { font-size: 14px; color: var(--text); font-weight: 400; }
+  .legend-right {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .legend-amount { font-size: 14px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+  .legend-pct { font-size: 12px; color: var(--text-tertiary); }
+
+  /* ---- PROJECTION ---- */
+  .scenarios {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+  .scenario-btn {
+    padding: 7px 16px;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    background: var(--white);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: -0.1px;
+  }
+  .scenario-btn:hover {
+    border-color: var(--blue);
+    color: var(--blue);
+  }
+  .scenario-btn.active {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: white;
+  }
+  .chart-wrap { height: 280px; }
+
+  /* ---- MILESTONES ---- */
+  .milestones { display: flex; flex-direction: column; gap: 16px; }
+  .milestone {
+    padding: 16px 18px;
+    background: var(--bg);
+    border-radius: var(--radius-sm);
+  }
+  .ms-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .ms-name { font-size: 14px; font-weight: 600; color: var(--text); }
+  .ms-eta {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--white);
+    padding: 3px 10px;
+    border-radius: 100px;
+    border: 1px solid var(--border-light);
+  }
+  .ms-bar-bg {
+    height: 5px;
+    background: var(--border-light);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .ms-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .ms-bar.green { background: var(--green); }
+  .ms-bar.blue { background: var(--blue); }
+  .ms-bar.orange { background: var(--orange); }
+  .ms-bar.purple { background: var(--purple); }
+  .ms-amounts {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin-top: 6px;
+  }
+
+  /* ---- BENCHMARKS ---- */
+  .benchmark { margin-bottom: 20px; }
+  .benchmark:last-child { margin-bottom: 0; }
+  .bm-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }
+  .bm-name { font-size: 14px; font-weight: 500; color: var(--text); }
+  .bm-vals { font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+  .bm-track {
+    height: 6px;
+    background: var(--border-light);
+    border-radius: 3px;
+    position: relative;
+    overflow: visible;
+  }
+  .bm-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .bm-guide {
+    position: absolute;
+    top: -5px;
+    width: 2px;
+    height: 16px;
+    background: var(--text-tertiary);
+    border-radius: 1px;
+    opacity: 0.5;
+  }
+  .bm-guide-label {
+    position: absolute;
+    top: 14px;
+    font-size: 10px;
+    color: var(--text-tertiary);
+    transform: translateX(-50%);
+    white-space: nowrap;
+  }
+  .bm-status {
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 100px;
+  }
+  .bm-status.good { color: var(--green); background: var(--green-bg); }
+  .bm-status.warn { color: var(--orange); background: var(--orange-bg); }
+  .bm-status.over { color: var(--pink); background: var(--pink-bg); }
+
+  /* ---- RESPONSIVE ---- */
+  @media (max-width: 900px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .grid { grid-template-columns: 1fr; }
+    .donut-layout { flex-direction: column; }
+  }
+  @media (max-width: 600px) {
+    .stats { grid-template-columns: 1fr; }
+    .header h1 { font-size: 36px; }
+    .app { padding: 24px 16px 60px; }
+  }
+
+  /* ---- ANIMATIONS ---- */
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .anim { animation: fadeIn 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards; opacity: 0; }
+  .d1 { animation-delay: 0.04s; }
+  .d2 { animation-delay: 0.08s; }
+  .d3 { animation-delay: 0.12s; }
+  .d4 { animation-delay: 0.16s; }
+  .d5 { animation-delay: 0.2s; }
+  .d6 { animation-delay: 0.24s; }
+  .d7 { animation-delay: 0.28s; }
+  .d8 { animation-delay: 0.32s; }
+
+  /* ---- FOOTER ---- */
+  .footer {
+    text-align: center;
+    margin-top: 32px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    letter-spacing: -0.1px;
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <div class="header anim d1">
+    <div class="header-row">
+      <div>
+        <h1>Finances</h1>
+        <p>Drag the sliders to explore what's possible.</p>
+      </div>
+      <span class="date-pill" id="date-pill">March 2026</span>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat anim d1">
+      <div class="stat-icon green">↑</div>
+      <div class="stat-label">Income</div>
+      <div class="stat-value green" id="s-income">$10,000</div>
+      <div class="stat-sub">monthly, after tax</div>
+    </div>
+    <div class="stat anim d2">
+      <div class="stat-icon pink">↓</div>
+      <div class="stat-label">Expenses</div>
+      <div class="stat-value pink" id="s-expenses">$3,300</div>
+      <div class="stat-sub" id="s-expenses-sub">33% of income</div>
+    </div>
+    <div class="stat anim d3">
+      <div class="stat-icon blue">◎</div>
+      <div class="stat-label">Saved</div>
+      <div class="stat-value blue" id="s-savings">$6,700</div>
+      <div class="stat-sub" id="s-savings-sub">67% of income</div>
+    </div>
+    <div class="stat anim d4">
+      <div class="stat-icon orange">%</div>
+      <div class="stat-label">Savings Rate</div>
+      <div class="stat-value orange" id="s-rate">67%</div>
+      <div class="stat-sub">target: 20%+</div>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- Sliders -->
+    <div class="card anim d5">
+      <div class="card-title">Adjust Your Budget</div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <span class="slider-name">Monthly Income</span>
+          <span class="slider-val" id="v-income">$10,000</span>
+        </div>
+        <input type="range" id="r-income" min="2000" max="30000" step="250" value="10000">
+        <div class="slider-range"><span>$2,000</span><span>$30,000</span></div>
+      </div>
+      <div class="slider-group">
+        <div class="slider-header">
+          <span class="slider-name">Rent</span>
+          <span class="slider-val" id="v-rent">$2,500</span>
+        </div>
+        <input type="range" id="r-rent" min="0" max="5000" step="50" value="2500">
+        <div class="slider-range"><span>$0</span><span>$5,000</span></div>
+      </div>
+      <div class="slider-group">
+        <div class="slider-header">
+          <span class="slider-name">Groceries</span>
+          <span class="slider-val" id="v-groceries">$500</span>
+        </div>
+        <input type="range" id="r-groceries" min="100" max="1500" step="25" value="500">
+        <div class="slider-range"><span>$100</span><span>$1,500</span></div>
+      </div>
+      <div class="slider-group">
+        <div class="slider-header">
+          <span class="slider-name">Gas</span>
+          <span class="slider-val" id="v-gas">$150</span>
+        </div>
+        <input type="range" id="r-gas" min="0" max="500" step="10" value="150">
+        <div class="slider-range"><span>$0</span><span>$500</span></div>
+      </div>
+      <div class="slider-group">
+        <div class="slider-header">
+          <span class="slider-name">Extra / Misc</span>
+          <span class="slider-val" id="v-extra">$150</span>
+        </div>
+        <input type="range" id="r-extra" min="0" max="1000" step="25" value="150">
+        <div class="slider-range"><span>$0</span><span>$1,000</span></div>
+      </div>
+
+      <div class="insight" id="insight">
+        <div class="insight-label">Insight</div>
+        <p id="insight-text"></p>
+      </div>
+    </div>
+
+    <!-- Donut -->
+    <div class="card anim d6">
+      <div class="card-title">Where Your Money Goes</div>
+      <div class="donut-layout">
+        <div class="donut-wrap">
+          <canvas id="donutChart"></canvas>
+          <div class="donut-center">
+            <div class="donut-center-value" id="donut-center-val">67%</div>
+            <div class="donut-center-label">saved</div>
+          </div>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+    </div>
+
+    <!-- Projection -->
+    <div class="card grid-full anim d7">
+      <div class="card-title">12-Month Projection</div>
+      <div class="scenarios">
+        <button class="scenario-btn active" data-s="current" onclick="setScenario('current')">Just Saving</button>
+        <button class="scenario-btn" data-s="hys" onclick="setScenario('hys')">High-Yield Savings (4.5%)</button>
+        <button class="scenario-btn" data-s="invest" onclick="setScenario('invest')">Invested (7%)</button>
+      </div>
+      <div class="chart-wrap"><canvas id="projChart"></canvas></div>
+    </div>
+
+    <!-- Milestones -->
+    <div class="card anim d7">
+      <div class="card-title">Milestones</div>
+      <div class="milestones" id="milestones"></div>
+    </div>
+
+    <!-- Benchmarks -->
+    <div class="card anim d8">
+      <div class="card-title">How You Compare</div>
+      <div id="benchmarks"></div>
+    </div>
+  </div>
+
+  <div class="footer">This is a planning tool, not financial advice. Consult a professional for investment decisions.</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => '$' + n.toLocaleString('en-US');
+const pct = (n,d) => d > 0 ? Math.round(n/d*100) : 0;
+
+let S = { income:10000, rent:2500, groceries:500, gas:150, extra:150, scenario:'current' };
+
+// Colors — Apple-esque palette
+const colors = {
+  rent: '#ff2d55',
+  groceries: '#ff9500',
+  gas: '#5ac8fa',
+  extra: '#af52de',
+  savings: '#34c759'
+};
+
+let donut, proj;
+
+function initCharts() {
+  donut = new Chart($('donutChart').getContext('2d'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Rent','Groceries','Gas','Extra','Savings'],
+      datasets: [{ data: [2500,500,150,150,6700], backgroundColor: Object.values(colors), borderWidth: 0, hoverOffset: 6 }]
+    },
+    options: {
+      cutout: '72%',
+      responsive: true,
+      maintainAspectRatio: true,
+      animation: { duration: 500, easing: 'easeOutQuart' },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1d1d1f',
+          titleFont: { family: 'Instrument Sans', weight: 500 },
+          bodyFont: { family: 'Instrument Sans' },
+          cornerRadius: 10,
+          padding: 12,
+          callbacks: { label: c => ` ${fmt(c.raw)} (${pct(c.raw,S.income)}%)` }
+        }
+      }
+    }
+  });
+
+  proj = new Chart($('projChart').getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: ['Now','Mo 1','Mo 2','Mo 3','Mo 4','Mo 5','Mo 6','Mo 7','Mo 8','Mo 9','Mo 10','Mo 11','Mo 12'],
+      datasets: [{
+        label: 'Total Saved',
+        data: [],
+        borderColor: '#007aff',
+        backgroundColor: 'rgba(0,122,255,0.06)',
+        borderWidth: 2.5,
+        fill: true,
+        tension: 0.35,
+        pointRadius: 3,
+        pointHoverRadius: 6,
+        pointBackgroundColor: '#007aff',
+        pointBorderColor: '#fff',
+        pointBorderWidth: 2
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 500, easing: 'easeOutQuart' },
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: {
+          grid: { color: '#f0f0f5', drawBorder: false },
+          ticks: { color: '#aeaeb2', font: { family: 'Instrument Sans', size: 11 } }
+        },
+        y: {
+          grid: { color: '#f0f0f5', drawBorder: false },
+          ticks: {
+            color: '#aeaeb2',
+            font: { family: 'Instrument Sans', size: 11 },
+            callback: v => v >= 1000 ? '$' + (v/1000).toFixed(0) + 'k' : '$' + v
+          }
+        }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1d1d1f',
+          titleFont: { family: 'Instrument Sans', weight: 500 },
+          bodyFont: { family: 'Instrument Sans' },
+          cornerRadius: 10,
+          padding: 12,
+          callbacks: { label: c => ` ${fmt(Math.round(c.raw))}` }
+        }
+      }
+    }
+  });
+}
+
+function update() {
+  const { income, rent, groceries, gas, extra, scenario } = S;
+  const exp = rent + groceries + gas + extra;
+  const sav = Math.max(0, income - exp);
+  const rate = pct(sav, income);
+
+  // Stats
+  $('s-income').textContent = fmt(income);
+  $('s-expenses').textContent = fmt(exp);
+  $('s-expenses-sub').textContent = pct(exp,income) + '% of income';
+  $('s-savings').textContent = fmt(sav);
+  $('s-savings-sub').textContent = rate + '% of income';
+  $('s-rate').textContent = rate + '%';
+
+  // Slider displays
+  $('v-income').textContent = fmt(income);
+  $('v-rent').textContent = fmt(rent);
+  $('v-groceries').textContent = fmt(groceries);
+  $('v-gas').textContent = fmt(gas);
+  $('v-extra').textContent = fmt(extra);
+
+  // Donut
+  donut.data.datasets[0].data = [rent, groceries, gas, extra, sav];
+  donut.update('none');
+  $('donut-center-val').textContent = rate + '%';
+
+  // Legend
+  const items = [
+    { name:'Rent', val:rent, c:colors.rent },
+    { name:'Groceries', val:groceries, c:colors.groceries },
+    { name:'Gas', val:gas, c:colors.gas },
+    { name:'Extra', val:extra, c:colors.extra },
+    { name:'Savings', val:sav, c:colors.savings },
+  ];
+  $('legend').innerHTML = items.map(i => `
+    <div class="legend-row">
+      <div class="legend-left"><div class="legend-dot" style="background:${i.c}"></div><span class="legend-name">${i.name}</span></div>
+      <div class="legend-right"><span class="legend-amount">${fmt(i.val)}</span><span class="legend-pct">${pct(i.val,income)}%</span></div>
+    </div>
+  `).join('');
+
+  // Projection
+  const r = scenario === 'invest' ? 0.07/12 : scenario === 'hys' ? 0.045/12 : 0;
+  const d = [0];
+  for(let i=1;i<=12;i++) d.push(d[i-1]*(1+r)+sav);
+  proj.data.datasets[0].data = d;
+
+  const clr = scenario === 'invest' ? '#34c759' : scenario === 'hys' ? '#ff9500' : '#007aff';
+  const bg = scenario === 'invest' ? 'rgba(52,199,89,0.06)' : scenario === 'hys' ? 'rgba(255,149,0,0.06)' : 'rgba(0,122,255,0.06)';
+  proj.data.datasets[0].borderColor = clr;
+  proj.data.datasets[0].backgroundColor = bg;
+  proj.data.datasets[0].pointBackgroundColor = clr;
+  proj.update();
+
+  // Milestones
+  const ms = [
+    { name:'Emergency Fund (3 mo)', target: exp*3, c:'green' },
+    { name:'Emergency Fund (6 mo)', target: exp*6, c:'blue' },
+    { name:'$100K Saved', target: 100000, c:'orange' },
+    { name:'$250K Saved', target: 250000, c:'purple' },
+  ];
+  $('milestones').innerHTML = ms.map(m => {
+    const mo = sav > 0 ? Math.ceil(m.target / sav) : Infinity;
+    const eta = mo < Infinity ? (mo >= 12 ? Math.floor(mo/12)+'y '+(mo%12)+'m' : mo+'m') : '—';
+    const pctDone = sav > 0 ? Math.min(100, (sav/m.target)*100) : 0;
+    return `
+      <div class="milestone">
+        <div class="ms-top">
+          <span class="ms-name">${m.name}</span>
+          <span class="ms-eta">${mo < Infinity ? eta : 'Not reachable'}</span>
+        </div>
+        <div class="ms-bar-bg"><div class="ms-bar ${m.c}" style="width:${pctDone}%"></div></div>
+        <div class="ms-amounts"><span>${fmt(Math.min(sav, m.target))} / mo</span><span>${fmt(m.target)} goal</span></div>
+      </div>
+    `;
+  }).join('');
+
+  // Benchmarks
+  const bms = [
+    { name:'Housing', yours: pct(rent,income), guide:30, label:'30%' },
+    { name:'Food', yours: pct(groceries,income), guide:15, label:'15%' },
+    { name:'Savings', yours: rate, guide:20, label:'20%', invert:true },
+    { name:'Wants', yours: pct(extra,income), guide:30, label:'30%' },
+  ];
+  $('benchmarks').innerHTML = bms.map(b => {
+    const mx = Math.max(b.yours, b.guide, 40);
+    const bw = (b.yours/mx)*100;
+    const gp = (b.guide/mx)*100;
+    let cls, txt;
+    if(b.invert) {
+      cls = b.yours >= b.guide ? 'good' : b.yours >= b.guide*0.5 ? 'warn' : 'over';
+      txt = b.yours >= b.guide ? 'Excellent' : b.yours >= b.guide*0.5 ? 'Okay' : 'Low';
+    } else {
+      cls = b.yours <= b.guide ? 'good' : b.yours <= b.guide*1.2 ? 'warn' : 'over';
+      txt = b.yours <= b.guide ? 'On track' : b.yours <= b.guide*1.2 ? 'Slightly over' : 'Over';
+    }
+    const fc = cls==='good' ? 'var(--green)' : cls==='warn' ? 'var(--orange)' : 'var(--pink)';
+    return `
+      <div class="benchmark">
+        <div class="bm-header"><span class="bm-name">${b.name}</span><span class="bm-vals">${b.yours}% · guideline ${b.label}</span></div>
+        <div class="bm-track">
+          <div class="bm-fill" style="width:${bw}%;background:${fc}"></div>
+          <div class="bm-guide" style="left:${gp}%"><span class="bm-guide-label">${b.label}</span></div>
+        </div>
+        <span class="bm-status ${cls}">${txt}</span>
+      </div>
+    `;
+  }).join('');
+
+  // Insight
+  const yr = sav * 12;
+  let msg;
+  if(sav <= 0) {
+    msg = `You're spending <strong>${fmt(Math.abs(sav))}</strong> more than you earn each month. Reduce rent or extras to get back on track.`;
+  } else if(rate >= 50) {
+    msg = `You're putting away <strong>${fmt(sav)}/month</strong> — that's <strong>${fmt(yr)}</strong> in a year from saving alone. A ${rate}% savings rate is exceptional.`;
+  } else if(rate >= 20) {
+    msg = `<strong>${fmt(sav)}/month</strong> saved (${rate}%). That's <strong>${fmt(yr)}</strong> a year. You're above the 20% guideline — well done.`;
+  } else {
+    msg = `You're saving <strong>${fmt(sav)}/month</strong> (${rate}%). The 20% guideline would be <strong>${fmt(Math.round(income*0.2))}</strong>. Small cuts add up fast.`;
+  }
+  $('insight-text').innerHTML = msg;
+}
+
+function setScenario(s) {
+  S.scenario = s;
+  document.querySelectorAll('.scenario-btn').forEach(b => b.classList.toggle('active', b.dataset.s === s));
+  update();
+}
+
+function wire() {
+  const map = { 'r-income':'income', 'r-rent':'rent', 'r-groceries':'groceries', 'r-gas':'gas', 'r-extra':'extra' };
+  Object.entries(map).forEach(([id,key]) => {
+    $(id).addEventListener('input', () => { S[key] = parseInt($(id).value); update(); });
+  });
+}
+
+document.addEventListener('DOMContentLoaded', () => { initCharts(); wire(); update(); });
+</script>
+
+</body>
+</html>

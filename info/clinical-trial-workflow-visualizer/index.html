@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinical Trial Agentic Platform — System Workflow Visualizer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-color: #080913;
+            --container-bg: rgba(13, 15, 30, 0.6);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --text-color: #f3f4f6;
+            --text-muted: #9ca3af;
+            
+            --trigger-bg: #1e293b;
+            --trigger-border: #3b82f6;
+            --processing-bg: #064e3b;
+            --processing-border: #10b981;
+            --tool-bg: #78350f;
+            --tool-border: #f59e0b;
+            --output-bg: #7f1d1d;
+            --output-border: #ef4444;
+            --datastore-bg: #1e1b4b;
+            --datastore-border: #6366f1;
+            --decision-bg: #581c87;
+            --decision-border: #a855f7;
+            
+            --panel-width: 420px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(59, 130, 246, 0.05) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(99, 102, 241, 0.05) 0%, transparent 40%);
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            padding: 24px 40px;
+            border-bottom: 1px solid var(--border-color);
+            background: rgba(8, 9, 19, 0.8);
+            backdrop-filter: blur(12px);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+
+        .header-title h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, #60a5fa 0%, #c084fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header-title p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+
+        .tab-container {
+            display: flex;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 4px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: 500;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+        }
+
+        .tab-btn:hover { color: #ffffff; background: rgba(255, 255, 255, 0.05); }
+        .tab-btn.active {
+            color: #ffffff;
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .main-layout {
+            display: flex;
+            flex: 1;
+            position: relative;
+            height: calc(100vh - 82px);
+        }
+
+        .canvas-area {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .diagram-container {
+            flex: 1;
+            position: relative;
+            background-size: 30px 30px;
+            background-image: 
+                linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            cursor: grab;
+            user-select: none;
+            overflow: auto;
+        }
+
+        .diagram-container:active { cursor: grabbing; }
+
+        .svg-connections {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 1500px;
+            height: 1000px;
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .node-card {
+            position: absolute;
+            width: 200px;
+            min-height: 90px;
+            background: var(--container-bg);
+            border-radius: 12px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            z-index: 2;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s, opacity 0.3s;
+            backdrop-filter: blur(8px);
+            transform-origin: center;
+        }
+
+        .node-card::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 12px;
+            padding: 1.5px;
+            background: linear-gradient(to bottom, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.02));
+            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+        }
+
+        .node-card:hover { transform: scale(1.05); z-index: 5; }
+        .node-card.selected { transform: scale(1.05); z-index: 4; }
+        .node-card.dimmed { opacity: 0.25; filter: blur(1px); }
+
+        .node-header { display: flex; align-items: center; gap: 8px; }
+        .node-icon { font-size: 18px; }
+        .node-label { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .node-subtitle { font-size: 11px; color: var(--text-muted); line-height: 1.3; }
+
+        .node-trigger { border-left: 3.5px solid var(--trigger-border); }
+        .node-trigger.selected, .node-trigger:hover { box-shadow: 0 0 20px rgba(59, 130, 246, 0.25); }
+        
+        .node-processing { border-left: 3.5px solid var(--processing-border); }
+        .node-processing.selected, .node-processing:hover { box-shadow: 0 0 20px rgba(16, 185, 129, 0.25); }
+        
+        .node-tool { border-left: 3.5px solid var(--tool-border); }
+        .node-tool.selected, .node-tool:hover { box-shadow: 0 0 20px rgba(245, 158, 11, 0.25); }
+        
+        .node-output { border-left: 3.5px solid var(--output-border); }
+        .node-output.selected, .node-output:hover { box-shadow: 0 0 20px rgba(239, 68, 68, 0.25); }
+        
+        .node-datastore { border-left: 3.5px solid var(--datastore-border); }
+        .node-datastore.selected, .node-datastore:hover { box-shadow: 0 0 20px rgba(99, 102, 241, 0.25); }
+        
+        .node-decision { border-left: 3.5px solid var(--decision-border); }
+        .node-decision.selected, .node-decision:hover { box-shadow: 0 0 20px rgba(168, 85, 247, 0.25); }
+
+        .connection-path {
+            stroke: rgba(255, 255, 255, 0.15);
+            stroke-width: 2px;
+            fill: none;
+            transition: stroke 0.25s, stroke-width 0.25s;
+        }
+
+        .connection-hit-area {
+            stroke: transparent;
+            stroke-width: 15px;
+            fill: none;
+            cursor: pointer;
+            pointer-events: stroke;
+        }
+
+        .connection-path.highlighted { stroke-width: 4px; }
+        .connection-path.dimmed { stroke: rgba(255, 255, 255, 0.03) !important; }
+
+        .connection-label {
+            font-size: 10px;
+            fill: #d1d5db;
+            font-weight: 500;
+            background: #000;
+            pointer-events: none;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+        }
+
+        .connection-label-bg {
+            fill: rgba(10, 12, 26, 0.8);
+            stroke: var(--border-color);
+            stroke-width: 1px;
+            rx: 4px;
+        }
+
+        @keyframes flowPulse {
+            0% { stroke-dashoffset: 24; }
+            100% { stroke-dashoffset: 0; }
+        }
+
+        .connection-path.pulse {
+            stroke-dasharray: 6, 6;
+            animation: flowPulse 1.5s linear infinite;
+        }
+
+        .legend {
+            background: rgba(8, 9, 19, 0.9);
+            border-top: 1px solid var(--border-color);
+            padding: 12px 30px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+        .legend-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); }
+        .legend-items { display: flex; gap: 16px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 500; }
+        .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+        .inspector-panel {
+            width: var(--panel-width);
+            background: rgba(10, 12, 26, 0.85);
+            border-left: 1px solid var(--border-color);
+            backdrop-filter: blur(16px);
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+            box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+            overflow-y: auto;
+        }
+
+        .panel-header { padding: 24px; border-bottom: 1px solid var(--border-color); }
+        .panel-header .category-badge {
+            display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 9px; font-weight: 600; text-transform: uppercase; margin-bottom: 12px;
+        }
+        .panel-header h2 { font-family: 'Space Grotesk', sans-serif; font-size: 20px; font-weight: 700; }
+        .panel-header p { font-size: 13px; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }
+
+        .panel-body { padding: 24px; display: flex; flex-direction: column; gap: 20px; flex: 1; }
+        .panel-section { display: flex; flex-direction: column; gap: 8px; }
+        .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); }
+        
+        .code-path {
+            background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 12px; font-family: monospace; font-size: 11px; color: #60a5fa; word-break: break-all;
+        }
+        
+        .data-specs {
+            background: rgba(0, 0, 0, 0.3); border-radius: 8px; border: 1px solid var(--border-color); padding: 12px; font-family: monospace; font-size: 11px; line-height: 1.4; color: #a78bfa; white-space: pre-wrap; overflow-x: auto;
+        }
+
+        .details-text { font-size: 13px; line-height: 1.5; color: #d1d5db; }
+        .security-badge { background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.3); color: #c084fc; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.4; display: flex; gap: 8px; }
+
+        .empty-inspector {
+            display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 40px 24px; margin: auto; color: var(--text-muted); gap: 12px; height: 100%;
+        }
+
+        marker { fill: rgba(255, 255, 255, 0.15); }
+        
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="header-title">
+            <h1>🧬 Clinical Trial Agentic Platform</h1>
+            <p>System Data Flow and Component Interactivity Map</p>
+        </div>
+        <div class="tab-container">
+            <button class="tab-btn active" onclick="switchTab('runtime_consumption')">Runtime Consumption (Agent Loop)</button>
+            <button class="tab-btn" onclick="switchTab('async_ingestion')">Ingestion & Processing (Async)</button>
+            <button class="tab-btn" onclick="switchTab('observability')">Observability & Eval Stack</button>
+        </div>
+    </header>
+
+    <div class="main-layout">
+        <div class="canvas-area">
+            <div class="diagram-container" id="diagramContainer">
+                <svg class="svg-connections" id="connectionsSvg">
+                    <defs>
+                        <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                            <path d="M 0 1 L 10 5 L 0 9 z" fill="#888" id="markerPath"/>
+                        </marker>
+                        <marker id="arrow-highlighted" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                            <path d="M 0 1 L 10 5 L 0 9 z" fill="#fff" />
+                        </marker>
+                    </defs>
+                </svg>
+                <div id="nodesLayer"></div>
+            </div>
+            
+            <div class="legend">
+                <span class="legend-title">Legend</span>
+                <div class="legend-items">
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--trigger-border);"></span>Trigger</div>
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--processing-border);"></span>Processing</div>
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--tool-border);"></span>Tool / Service</div>
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--output-border);"></span>Output</div>
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--datastore-border);"></span>Data Store</div>
+                    <div class="legend-item"><span class="legend-dot" style="background: var(--decision-border);"></span>Decision</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="inspector-panel" id="inspectorPanel">
+            <div class="empty-inspector" id="emptyInspector">
+                <svg viewBox="0 0 24 24" stroke-width="1.5" style="width: 48px; height: 48px; stroke: rgba(255,255,255,0.2); fill: none;">
+                    <circle cx="12" cy="12" r="9"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <div>
+                    <h3 style="font-family: 'Space Grotesk', sans-serif; font-size: 15px; margin-bottom: 4px; color: #ffffff;">Component & Connection Inspector</h3>
+                    <p style="font-size: 12px; line-height: 1.4;">Click any <strong>node</strong> or <strong>connection line</strong> to inspect its code paths, dynamic properties, data payloads, and operational parameters.</p>
+                </div>
+            </div>
+            <div id="inspectorContent" style="display: none;">
+                <div class="panel-header">
+                    <span class="category-badge" id="inspCategory">Trigger</span>
+                    <h2 id="inspTitle">Title</h2>
+                    <p id="inspSubtitle">Subtitle</p>
+                </div>
+                <div class="panel-body">
+                    <div class="panel-section" id="secFile">
+                        <span class="section-title" id="inspFileLabel">Backing Code File</span>
+                        <a href="#" class="code-path" id="inspFile" target="_blank">path/to/file</a>
+                    </div>
+                    <div class="panel-section" id="secData">
+                        <span class="section-title">Data Signature / Protocol / Payload</span>
+                        <div class="data-specs" id="inspData">{}</div>
+                    </div>
+                    <div class="panel-section" id="secDetails">
+                        <span class="section-title">Functional Mechanics</span>
+                        <p class="details-text" id="inspDetails">Details go here.</p>
+                    </div>
+                    <div class="panel-section" id="secSecurity" style="display: none;">
+                        <span class="section-title">Security & Safety Invariant</span>
+                        <div class="security-badge" id="inspSecurity">
+                            <span>🛡️</span>
+                            <span id="inspSecurityText"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const workflowData = {
+            runtime_consumption: {
+                name: "Secure Runtime Consumption & Agent Loop",
+                nodes: [
+                    { id: "frontend", label: "React SPA", subtitle: "User Interface (Port 3001)", type: "trigger", icon: "💻", x: 50, y: 150, description: "Interactive chat dashboard for researchers.", file: "frontend/src/", data: "User input prompt", security: "Protects API access tokens from client-side script inspection using secure Keycloak cookies.", connections: [
+                        { target: "keycloak", label: "1. OIDC Login", description: "Frontend initiates OAuth 2.0 PKCE flow with Keycloak.", protocol: "OAuth 2.0 PKCE", payload: "Authorization Code Exchange -> JWT Access Token", file: "frontend/src/auth/AuthProvider.tsx" },
+                        { target: "api_gw", label: "3. API Request", description: "Sends natural language query to FastAPI Gateway along with the JWT Bearer token.", protocol: "HTTP/REST", payload: "Headers: { Authorization: Bearer <JWT> }\nBody: { query: \"Compare adverse events in oncology trials\" }", file: "frontend/src/api/client.ts" }
+                    ]},
+                    { id: "keycloak", label: "Keycloak SSO", subtitle: "IAM Service (Port 8180)", type: "tool", icon: "🔑", x: 50, y: 350, description: "Enterprise Identity Provider.", file: "auth/keycloak_config.json", data: "Signed JWTs", security: "Digitally signs JWT tokens using the RS256 cryptosystem.", connections: [
+                        { target: "frontend", label: "2. Issue JWT", description: "Returns signed JWT to the frontend after successful authentication.", protocol: "OIDC", payload: "{\n  \"sub\": \"usr-123\",\n  \"preferred_username\": \"dr_smith\",\n  \"realm_access\": {\"roles\": [\"researcher\"]},\n  \"clearance_level\": \"L2\",\n  \"organization_id\": \"org-1\"\n}", file: "N/A" }
+                    ]},
+                    { id: "api_gw", label: "FastAPI Gateway", subtitle: "Secure API (Port 8000)", type: "processing", icon: "🚀", x: 350, y: 150, description: "Authenticates requests and starts the agent orchestration.", file: "api/main.py", data: "Session tracking", security: "Blocks unsigned requests.", connections: [
+                        { target: "keycloak", label: "4. Fetch JWKS", description: "API Gateway fetches JSON Web Key Sets to verify JWT signature.", protocol: "HTTP GET", payload: "GET /realms/clinical/protocol/openid-connect/certs", file: "api/middleware/auth.py" },
+                        { target: "policy_engine", label: "5. Auth Z Checks", description: "Requests ReBAC and ABAC context for the authenticated user.", protocol: "Internal Function Call", payload: "User UUID: usr-123\nRoles: [\"researcher\"]", file: "api/routers/researcher.py" }
+                    ]},
+                    { id: "policy_engine", label: "Authorization Engine", subtitle: "OpenFGA ReBAC + Postgres ABAC", type: "decision", icon: "🛡️", x: 350, y: 350, description: "Compiles access constraints from OpenFGA and PostgreSQL.", file: "api/routers/researcher.py", data: "AccessContext Object", security: "Fail-Closed default.", connections: [
+                        { target: "openfga", label: "6. Check Relations", description: "Calls OpenFGA ListObjects to find accessible trials.", protocol: "gRPC / HTTP", payload: "Request:\nuser: usr-123, relation: can_view_individual, type: clinical_trial", file: "api/agent/auth_client.py" },
+                        { target: "postgres", label: "8. Fetch Cohorts", description: "Queries PostgreSQL for specific patient cohort filters assigned to the researcher.", protocol: "PostgreSQL Wire Protocol", payload: "SELECT filter_criteria FROM cohort WHERE researcher_id = 'usr-123'", file: "api/database.py" },
+                        { target: "agent_graph", label: "10. Access Context", description: "Passes the fully assembled Access Context to the LangGraph Agent.", protocol: "Python Object", payload: "{\n  \"allowed_trial_ids\": [\"uuid-1\", \"uuid-2\"],\n  \"per_trial_allowed_regions\": {\"uuid-1\": [\"EU\"]},\n  \"patient_filters\": {\"uuid-1\": [{\"age_min\": 18, \"sex\": \"F\"}]}\n}", file: "api/agent/service.py" }
+                    ]},
+                    { id: "openfga", label: "OpenFGA Server", subtitle: "ReBAC Engine (Port 8082)", type: "tool", icon: "🔐", x: 150, y: 480, description: "Evaluates Zanzibar-style relationship tuples.", file: "N/A", data: "Tuple store", connections: [
+                        { target: "policy_engine", label: "7. Authorized Trials", description: "Returns list of trial IDs the user can view, along with access level (aggregate vs individual).", protocol: "HTTP JSON", payload: "{\"object_ids\": [\"trial:uuid-1\", \"trial:uuid-2\"]}", file: "N/A" }
+                    ]},
+                    { id: "postgres", label: "PostgreSQL", subtitle: "Relational DB (Port 5432)", type: "datastore", icon: "🐘", x: 550, y: 480, description: "Stores relational data and cohort metadata.", file: "N/A", data: "Relational tables", connections: [
+                        { target: "policy_engine", label: "9. Cohort Filters", description: "Returns JSONB cohort filter constraints.", protocol: "PostgreSQL Result", payload: "[{\"age_min\": 18, \"sex\": \"F\"}]", file: "N/A" }
+                    ]},
+                    { id: "agent_graph", label: "LangGraph Agent", subtitle: "ReAct Loop", type: "processing", icon: "🧠", x: 650, y: 150, description: "Coordinates tool actions and reasoning loops.", file: "api/agent/graph.py", data: "Graph State", security: "Bounded execution steps.", connections: [
+                        { target: "ceiling_interceptor", label: "11. Tool Call Intent", description: "Agent decides to call a tool to answer the query.", protocol: "LangChain Tool Invocation", payload: "Tool: get_patient_demographics\nArgs: {\"trial_ids\": [\"uuid-1\", \"uuid-2\"]}", file: "api/agent/nodes/tool_node.py" },
+                        { target: "frontend", label: "15. Final Response", description: "Synthesizer node sends the final formatted response back to the user.", protocol: "SSE / HTTP", payload: "{\n  \"answer\": \"...\",\n  \"response_sources\": [\"database\"],\n  \"filters_applied\": [\"trial-1: region: EU; age >= 18\"]\n}", file: "api/agent/nodes/synthesizer.py" }
+                    ]},
+                    { id: "ceiling_interceptor", label: "Ceiling Interceptor", subtitle: "Safety Hook", type: "decision", icon: "⚠️", x: 950, y: 150, description: "Intercepts tool queries to enforce Access Level Ceiling.", file: "mcp_server/access_control.py", data: "Access rules", security: "Downgrades mixed access queries to aggregate-only.", connections: [
+                        { target: "mcp_server", label: "12. Injected Call", description: "Forwards the tool call to the MCP server with the AccessContext silently injected.", protocol: "JSON-RPC / SSE", payload: "{\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_patient_demographics\",\n    \"arguments\": {...},\n    \"_access_context\": {...}\n  }\n}", file: "api/agent/tool_wrappers.py" }
+                    ]},
+                    { id: "mcp_server", label: "FastMCP Hub", subtitle: "Clinical Tools (Port 8001)", type: "tool", icon: "🛠️", x: 950, y: 350, description: "Exposes 15 advanced query tools.", file: "mcp_server/server.py", data: "Tool schemas", security: "Requires local network authentication.", connections: [
+                        { target: "postgres", label: "13. Secured SQL Query", description: "Generates parameterized SQL combining user parameters with strict ABAC/Cohort WHERE clauses.", protocol: "asyncpg", payload: "SELECT sex, count(*) FROM patient \nWHERE trial_id = $1 \n  AND age >= $2 \n  AND region = ANY($3)\nGROUP BY sex;", file: "mcp_server/access_control.py" },
+                        { target: "agent_graph", label: "14. Tool Result", description: "Returns the authorized data payload back to the agent for synthesis.", protocol: "JSON-RPC Result", payload: "{\n  \"content\": [{\"type\": \"text\", \"text\": \"[{'sex': 'F', 'count': 45}]\"}]\n}", file: "api/agent/nodes/tool_node.py" }
+                    ]}
+                ]
+            },
+            async_ingestion: {
+                name: "Asynchronous Ingestion & Processing Pipeline",
+                nodes: [
+                    { id: "generator", label: "Synthetic Generator", subtitle: "Clinical Emulator", type: "trigger", icon: "🎲", x: 50, y: 150, description: "Generates synthetic trials, arms, patients, labs.", file: "generator/synthetic_data.py", data: "Config: seed, num_trials", connections: [
+                        { target: "pdf_builder", label: "1. Raw Trial JSON", description: "Passes generated structured data to the PDF builder.", protocol: "Internal Function Call", payload: "{\n  \"nct_id\": \"NCT01234567\",\n  \"title\": \"A Phase 3 Study...\",\n  \"patients\": [...]\n}", file: "generator/main.py" }
+                    ]},
+                    { id: "pdf_builder", label: "PDF Builder", subtitle: "ReportLab Engine", type: "processing", icon: "📄", x: 250, y: 150, description: "Creates multi-page clinical protocol PDFs.", file: "generator/pdf_builder.py", data: "PDF Binary", connections: [
+                        { target: "minio", label: "2. Upload PDF", description: "Uploads the compiled PDF document to object storage.", protocol: "S3 API (boto3)", payload: "PUT /clinical-protocols/protocols/NCT01234567.pdf", file: "generator/publisher.py" },
+                        { target: "kafka_gen", label: "3. Publish Event", description: "Publishes the Claim-Check event to the message broker.", protocol: "Kafka Producer (TCP)", payload: "Topic: pdf-generated\nKey: NCT01234567\nValue: {\"bucket\": \"clinical-protocols\", \"object_key\": \"protocols/NCT01234567.pdf\"}", file: "generator/publisher.py" }
+                    ]},
+                    { id: "minio", label: "MinIO S3", subtitle: "Object Store (Port 9000)", type: "datastore", icon: "📦", x: 250, y: 350, description: "Vault for clinical protocol PDFs.", file: "docker-compose.yml", data: "Bucket: clinical-protocols", connections: [
+                        { target: "processor", label: "5. Download PDF", description: "Processor streams the PDF file down for parsing.", protocol: "S3 API (GET)", payload: "GET /clinical-protocols/protocols/NCT01234567.pdf", file: "processor/orchestrator.py" }
+                    ]},
+                    { id: "kafka_gen", label: "Kafka Broker", subtitle: "Event Bus (Port 9092)", type: "tool", icon: "⚡", x: 500, y: 150, description: "Distributes ingestion events.", file: "docker-compose.yml", data: "Topics: pdf-generated", connections: [
+                        { target: "processor", label: "4. Consume Event", description: "Processor receives the event indicating a new PDF is ready.", protocol: "Kafka Consumer (TCP)", payload: "Message from pdf-generated topic", file: "processor/consumer.py" }
+                    ]},
+                    { id: "processor", label: "Ingestion Processor", subtitle: "Parser & Extractor", type: "processing", icon: "⚙️", x: 750, y: 150, description: "Parses PDF, extracts entities via Regex/GPT-4o.", file: "processor/entity_extractor.py", data: "Parsed chapters", connections: [
+                        { target: "embedding_gen", label: "6. Text Chunks", description: "Sends extracted text sections to the embedding generator.", protocol: "Internal Function Call", payload: "[\"Trial focuses on advanced NSCLC...\", \"Inclusion: Age >= 18...\"]", file: "processor/orchestrator.py" },
+                        { target: "postgres_loader", label: "8. Relational Data", description: "Sends structured data (patients, labs, etc) for relational insertion.", protocol: "Internal Function Call", payload: "List of Patient Dictionary objects", file: "processor/loaders/postgres_loader.py" }
+                    ]},
+                    { id: "embedding_gen", label: "Embedding Gen", subtitle: "text-embedding-3-large", type: "processing", icon: "✨", x: 1000, y: 150, description: "Generates 3072-dim embeddings.", file: "processor/embedding_generator.py", data: "Vector arrays", connections: [
+                        { target: "qdrant", label: "7. Upsert Vectors", description: "Uploads vector embeddings and metadata to Qdrant.", protocol: "gRPC", payload: "Points: [{id: \"...\", vector: [0.12, -0.05, ...], payload: {nct_id: \"...\", chunk_type: \"...\"}}]", file: "processor/loaders/qdrant_loader.py" }
+                    ]},
+                    { id: "postgres_loader", label: "Data Mesh Loaders", subtitle: "PG / Neo4j", type: "datastore", icon: "🗄️", x: 750, y: 350, description: "Inserts structured records and graph nodes.", file: "processor/loaders/", data: "SQL / Cypher", connections: [
+                        { target: "kafka_ack", label: "9. Publish Ack", description: "Publishes confirmation that all databases have been updated.", protocol: "Kafka Producer (TCP)", payload: "Topic: trial-ingested\nValue: {\"nct_id\": \"NCT01234567\", \"status\": \"SUCCESS\"}", file: "processor/orchestrator.py" }
+                    ]},
+                    { id: "qdrant", label: "Qdrant", subtitle: "Vector DB (Port 6333)", type: "datastore", icon: "🎯", x: 1000, y: 350, description: "Stores document embeddings.", file: "docker-compose.yml", data: "Collections: trials", connections: []},
+                    { id: "kafka_ack", label: "Kafka Broker", subtitle: "trial-ingested", type: "tool", icon: "📤", x: 500, y: 350, description: "Signals successful ingestion.", file: "docker-compose.yml", data: "Topics: trial-ingested", connections: []}
+                ]
+            },
+            observability: {
+                name: "Continuous Observability & Evaluation Stack",
+                nodes: [
+                    { id: "api_gw", label: "FastAPI Gateway", subtitle: "Application Code", type: "trigger", icon: "🚀", x: 50, y: 150, description: "Host of LangGraph agent executing user queries.", file: "api/agent/observability.py", data: "Application state", connections: [
+                        { target: "phoenix", label: "1. OTLP Spans", description: "Emits OpenTelemetry traces detailing LLM calls, tool usage, and latencies.", protocol: "gRPC (OTLP)", payload: "Span Data:\nName: tool_node\nDuration: 450ms\nAttributes: { tool_name: \"search_trials\" }", file: "api/agent/observability.py" },
+                        { target: "argilla", label: "6. Eval Records", description: "Sends query/response pairs for human evaluation.", protocol: "HTTP API", payload: "POST /api/v1/datasets/feedback\n{ \"prompt\": \"...\", \"response\": \"...\" }", file: "api/evaluation/argilla_client.py" }
+                    ]},
+                    { id: "mcp_server", label: "FastMCP Server", subtitle: "Tool Execution", type: "trigger", icon: "🛠️", x: 50, y: 300, description: "Executes data queries.", file: "mcp_server/observability.py", data: "Tool telemetry", connections: [
+                        { target: "prom_scraper", label: "2. Scrape Metrics", description: "Prometheus pulls metrics from the /metrics endpoint.", protocol: "HTTP GET", payload: "mcp_tool_latency_seconds_sum{tool=\"get_patient_demographics\"} 1.25", file: "mcp_server/observability.py" }
+                    ]},
+                    { id: "phoenix", label: "Arize Phoenix", subtitle: "Trace Collector (Port 6006)", type: "datastore", icon: "🔥", x: 350, y: 100, description: "Visualizes LLM spans and execution tracks.", file: "docker-compose.yml", data: "OTLP Data", connections: []},
+                    { id: "prom_scraper", label: "Prometheus", subtitle: "Metrics Scraper (Port 9090)", type: "processing", icon: "📈", x: 350, y: 300, description: "Pulls metrics from applications.", file: "observability/prometheus/prometheus.yml", data: "Time-series data", connections: [
+                        { target: "alertmanager", label: "3. Evaluate Rules", description: "Prometheus sends alerts when thresholds are crossed.", protocol: "HTTP POST", payload: "[\n  {\n    \"labels\": {\"alertname\": \"ABACFallbackDetected\", \"severity\": \"warning\"}\n  }\n]", file: "observability/prometheus/alerts/agent-alerts.yml" },
+                        { target: "grafana", label: "5. Query Data", description: "Grafana queries Prometheus for dashboard visualizations.", protocol: "PromQL / HTTP", payload: "Query: rate(agent_query_total[5m])", file: "observability/grafana/dashboards/" }
+                    ]},
+                    { id: "alertmanager", label: "Alertmanager", subtitle: "Alert Router (Port 9093)", type: "decision", icon: "🚨", x: 650, y: 300, description: "Routes alerts to notification channels.", file: "docker-compose.yml", data: "Alert definitions", connections: [
+                        { target: "grafana", label: "4. Display Alerts", description: "Alert states are visible in Grafana.", protocol: "Prometheus API", payload: "Active Alerts status", file: "N/A" }
+                    ]},
+                    { id: "grafana", label: "Grafana", subtitle: "Dashboards (Port 3010)", type: "output", icon: "📊", x: 950, y: 300, description: "Visualizes metrics and alerts.", file: "docker-compose.yml", data: "Dashboard panels", connections: []},
+                    { id: "argilla", label: "Argilla", subtitle: "Annotation Hub (Port 6900)", type: "tool", icon: "🏷️", x: 350, y: 480, description: "Human-in-the-loop review.", file: "docker-compose.yml", data: "Feedback datasets", connections: [
+                        { target: "es", label: "7. Store Annotations", description: "Stores records and human feedback in Elasticsearch.", protocol: "REST API", payload: "PUT /argilla-dataset/_doc/...\n{\"rating\": 4, \"notes\": \"Accurate\"}", file: "N/A" }
+                    ]},
+                    { id: "es", label: "Elasticsearch", subtitle: "Search Backend (Port 9200)", type: "datastore", icon: "⚡", x: 650, y: 480, description: "Persistent storage for Argilla.", file: "docker-compose.yml", data: "JSON Documents", connections: []}
+                ]
+            }
+        };
+
+        let activeTab = 'runtime_consumption';
+        let selectedElement = { type: null, id: null };
+
+        const container = document.getElementById('diagramContainer');
+        const nodesLayer = document.getElementById('nodesLayer');
+        const svg = document.getElementById('connectionsSvg');
+        const emptyInspector = document.getElementById('emptyInspector');
+        const inspectorContent = document.getElementById('inspectorContent');
+
+        function drawConnections() {
+            const paths = svg.querySelectorAll('.connection-group');
+            paths.forEach(p => p.remove());
+
+            const activeSet = workflowData[activeTab];
+            const activeNodes = activeSet.nodes;
+
+            activeNodes.forEach(node => {
+                const sourceRect = { x: node.x + 100, y: node.y + 45 };
+
+                (node.connections || []).forEach(conn => {
+                    const targetNode = activeNodes.find(n => n.id === conn.target);
+                    if (!targetNode) return;
+                    const targetRect = { x: targetNode.x + 100, y: targetNode.y + 45 };
+
+                    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                    group.setAttribute('class', 'connection-group');
+                    group.setAttribute('id', `group-${node.id}-${conn.target}`);
+
+                    let d = '';
+                    if (Math.abs(sourceRect.y - targetRect.y) < 20) {
+                        const midX = (sourceRect.x + targetRect.x) / 2;
+                        d = `M ${sourceRect.x} ${sourceRect.y} Q ${midX} ${sourceRect.y - 20} ${targetRect.x} ${targetRect.y}`;
+                    } else if (Math.abs(sourceRect.x - targetRect.x) < 20) {
+                        const midY = (sourceRect.y + targetRect.y) / 2;
+                        d = `M ${sourceRect.x} ${sourceRect.y} Q ${sourceRect.x + 30} ${midY} ${targetRect.x} ${targetRect.y}`;
+                    } else {
+                        const controlX1 = sourceRect.x + (targetRect.x - sourceRect.x) * 0.5;
+                        const controlX2 = sourceRect.x + (targetRect.x - sourceRect.x) * 0.5;
+                        d = `M ${sourceRect.x} ${sourceRect.y} C ${controlX1} ${sourceRect.y}, ${controlX2} ${targetRect.y}, ${targetRect.x} ${targetRect.y}`;
+                    }
+
+                    // Visible Path
+                    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    path.setAttribute('d', d);
+                    path.setAttribute('class', 'connection-path');
+                    path.setAttribute('id', `conn-${node.id}-${conn.target}`);
+                    path.setAttribute('marker-end', 'url(#arrow)');
+                    const colors = { trigger: 'var(--trigger-border)', processing: 'var(--processing-border)', tool: 'var(--tool-border)', output: 'var(--output-border)', datastore: 'var(--datastore-border)', decision: 'var(--decision-border)' };
+                    path.style.stroke = colors[node.type] || '#444444';
+                    group.appendChild(path);
+
+                    // Invisible Hit Area Path
+                    const hitPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    hitPath.setAttribute('d', d);
+                    hitPath.setAttribute('class', 'connection-hit-area');
+                    hitPath.addEventListener('click', (e) => { e.stopPropagation(); selectConnection(node, conn, path); });
+                    hitPath.addEventListener('mouseenter', () => { if(selectedElement.type !== 'connection') path.classList.add('highlighted', 'pulse'); });
+                    hitPath.addEventListener('mouseleave', () => { if(selectedElement.id !== `conn-${node.id}-${conn.target}`) { path.classList.remove('highlighted', 'pulse'); } });
+                    group.appendChild(hitPath);
+
+                    // Label
+                    if (conn.label) {
+                        const labelText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                        labelText.setAttribute('class', 'connection-label');
+                        const isCurve = d.includes('C');
+                        const midX = isCurve ? (sourceRect.x + targetRect.x)/2 : (sourceRect.x + targetRect.x)/2;
+                        let midY = isCurve ? (sourceRect.y + targetRect.y)/2 : (sourceRect.y + targetRect.y)/2;
+                        if(Math.abs(sourceRect.y - targetRect.y) < 20) midY -= 15;
+                        
+                        // Background Rect for Label
+                        const bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                        bgRect.setAttribute('class', 'connection-label-bg');
+                        const textWidth = conn.label.length * 6;
+                        bgRect.setAttribute('x', midX - textWidth/2 - 4);
+                        bgRect.setAttribute('y', midY - 10);
+                        bgRect.setAttribute('width', textWidth + 8);
+                        bgRect.setAttribute('height', 16);
+                        group.appendChild(bgRect);
+
+                        labelText.setAttribute('x', midX);
+                        labelText.setAttribute('y', midY + 2);
+                        labelText.setAttribute('text-anchor', 'middle');
+                        labelText.textContent = conn.label;
+                        group.appendChild(labelText);
+                    }
+                    svg.appendChild(group);
+                });
+            });
+        }
+
+        function renderNodes() {
+            nodesLayer.innerHTML = '';
+            const activeNodes = workflowData[activeTab].nodes;
+            activeNodes.forEach(node => {
+                const card = document.createElement('div');
+                card.className = `node-card node-${node.type}`;
+                card.id = `node-${node.id}`;
+                card.style.left = `${node.x}px`;
+                card.style.top = `${node.y}px`;
+                card.innerHTML = `<div class="node-header"><div class="node-icon">${node.icon}</div><div class="node-label" title="${node.label}">${node.label}</div></div><div class="node-subtitle">${node.subtitle}</div>`;
+
+                card.addEventListener('click', (e) => { e.stopPropagation(); selectNode(node); });
+                card.addEventListener('mouseenter', () => { if(selectedElement.type === null) highlightNodeConnections(node.id, true); });
+                card.addEventListener('mouseleave', () => { if(selectedElement.type === null) highlightNodeConnections(node.id, false); });
+                nodesLayer.appendChild(card);
+            });
+            setTimeout(drawConnections, 50);
+        }
+
+        function updateInspector(type, data) {
+            emptyInspector.style.display = 'none';
+            inspectorContent.style.display = 'block';
+
+            const catBadge = document.getElementById('inspCategory');
+            catBadge.textContent = type;
+            
+            if (data.badgeColor) {
+                catBadge.style.background = `rgba(255,255,255,0.1)`;
+                catBadge.style.color = data.badgeColor;
+                catBadge.style.border = `1px solid ${data.badgeColor}`;
+            }
+
+            document.getElementById('inspTitle').textContent = data.title;
+            document.getElementById('inspSubtitle').textContent = data.subtitle;
+            document.getElementById('inspDetails').textContent = data.description;
+            
+            const fileEl = document.getElementById('inspFile');
+            document.getElementById('inspFileLabel').textContent = data.fileLabel || "Backing Code File";
+            fileEl.textContent = data.file;
+            fileEl.setAttribute('href', "file:///Users/danirodao/Documents/hands-on/mygenai/semanticLLM/datameshDockerV5/clinicalTrail/" + data.file);
+            
+            document.getElementById('inspData').textContent = data.payload;
+            
+            const secContainer = document.getElementById('secSecurity');
+            if (data.security) {
+                secContainer.style.display = 'flex';
+                document.getElementById('inspSecurityText').textContent = data.security;
+            } else {
+                secContainer.style.display = 'none';
+            }
+        }
+
+        function selectNode(node) {
+            selectedElement = { type: 'node', id: node.id };
+            
+            document.querySelectorAll('.node-card').forEach(c => {
+                c.classList.toggle('selected', c.id === `node-${node.id}`);
+                c.classList.toggle('dimmed', c.id !== `node-${node.id}`);
+            });
+
+            document.querySelectorAll('.connection-path').forEach(p => {
+                const isConn = p.id.startsWith(`conn-${node.id}-`) || p.id.endsWith(`-${node.id}`);
+                p.classList.toggle('highlighted', isConn);
+                p.classList.toggle('pulse', isConn);
+                p.classList.toggle('dimmed', !isConn);
+                p.setAttribute('marker-end', isConn ? 'url(#arrow-highlighted)' : 'url(#arrow)');
+            });
+
+            updateInspector(node.type.toUpperCase(), {
+                title: node.label,
+                subtitle: node.subtitle,
+                description: node.description,
+                file: node.file,
+                payload: node.data,
+                security: node.security,
+                badgeColor: `var(--${node.type}-border)`
+            });
+        }
+
+        function selectConnection(sourceNode, conn, pathEl) {
+            const connId = `conn-${sourceNode.id}-${conn.target}`;
+            selectedElement = { type: 'connection', id: connId };
+
+            document.querySelectorAll('.node-card').forEach(c => c.classList.add('dimmed'));
+            document.getElementById(`node-${sourceNode.id}`).classList.remove('dimmed');
+            document.getElementById(`node-${conn.target}`).classList.remove('dimmed');
+
+            document.querySelectorAll('.connection-path').forEach(p => {
+                if(p.id === connId) {
+                    p.classList.add('highlighted', 'pulse');
+                    p.classList.remove('dimmed');
+                    p.setAttribute('marker-end', 'url(#arrow-highlighted)');
+                } else {
+                    p.classList.remove('highlighted', 'pulse');
+                    p.classList.add('dimmed');
+                    p.setAttribute('marker-end', 'url(#arrow)');
+                }
+            });
+
+            updateInspector("CONNECTION", {
+                title: conn.label,
+                subtitle: `${sourceNode.label} ➔ ${workflowData[activeTab].nodes.find(n=>n.id===conn.target).label}`,
+                description: conn.description,
+                fileLabel: "Protocol",
+                file: conn.protocol,
+                payload: conn.payload,
+                security: null,
+                badgeColor: "#a78bfa"
+            });
+        }
+
+        function highlightNodeConnections(nodeId, highlight) {
+            document.querySelectorAll('.connection-path').forEach(p => {
+                const isConn = p.id.startsWith(`conn-${nodeId}-`) || p.id.endsWith(`-${nodeId}`);
+                if (isConn) {
+                    p.classList.toggle('highlighted', highlight);
+                    p.classList.toggle('pulse', highlight);
+                    p.setAttribute('marker-end', highlight ? 'url(#arrow-highlighted)' : 'url(#arrow)');
+                }
+            });
+        }
+
+        function resetHighlight() {
+            selectedElement = { type: null, id: null };
+            document.querySelectorAll('.node-card').forEach(c => c.classList.remove('selected', 'dimmed'));
+            document.querySelectorAll('.connection-path').forEach(p => {
+                p.classList.remove('highlighted', 'dimmed', 'pulse');
+                p.setAttribute('marker-end', 'url(#arrow)');
+            });
+            emptyInspector.style.display = 'flex';
+            inspectorContent.style.display = 'none';
+        }
+
+        function switchTab(tabId) {
+            activeTab = tabId;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.getAttribute('onclick').includes(tabId)));
+            resetHighlight();
+            renderNodes();
+        }
+
+        document.getElementById('diagramContainer').addEventListener('click', (e) => {
+            if (e.target.id === 'diagramContainer' || e.target.id === 'connectionsSvg' || e.target.id === 'nodesLayer') resetHighlight();
+        });
+
+        window.addEventListener('resize', drawConnections);
+        renderNodes();
+    </script>
+</body>
+</html>

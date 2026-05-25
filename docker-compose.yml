@@ -429,6 +429,7 @@ services:
       - ENABLE_EVAL_SCHEDULER=${ENABLE_EVAL_SCHEDULER:-true}
       - EVAL_MODEL=${EVAL_MODEL:-gpt-4o-mini}
       - PROD_SAMPLING_RATE=${PROD_SAMPLING_RATE:-10.0}
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -439,6 +440,8 @@ services:
       openfga-init:
         condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       semantic-mcp-server:
         condition: service_healthy

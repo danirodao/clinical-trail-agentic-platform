@@ -8,10 +8,12 @@ KEY SECURITY DESIGN:
   - Injects `access_context` invisibly when the tool is actually called.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 import time
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -95,6 +97,118 @@ class _ToolCache:
 _tool_cache = _ToolCache()
 
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Async Circuit Breaker
+# ───────────────────────────────────────────────────────────────────────────────
+
+class _CBState(Enum):
+    CLOSED    = 0  # normal operation
+    OPEN      = 1  # fast-fail all calls
+    HALF_OPEN = 2  # one probe allowed; success → CLOSED, failure → OPEN
+
+
+class _CircuitOpenError(Exception):
+    """Raised when a call is rejected because the circuit breaker is OPEN."""
+
+
+class _AsyncCircuitBreaker:
+    """
+    Lightweight async circuit breaker — no external dependencies.
+
+    CLOSED  → fail_max consecutive failures  → OPEN
+    OPEN    → reset_timeout elapsed           → HALF_OPEN (one probe)
+    HALF_OPEN → probe success                 → CLOSED
+    HALF_OPEN → probe failure                 → OPEN
+    """
+
+    def __init__(
+        self,
+        name: str,
+        fail_max: int = 5,
+        reset_timeout: float = 30.0,
+    ) -> None:
+        self.name = name
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self._state = _CBState.CLOSED
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def state(self) -> _CBState:
+        return self._state
+
+    async def call(self, coro):
+        """Await *coro* under circuit-breaker control."""
+        async with self._lock:
+            if self._state == _CBState.OPEN:
+                elapsed = time.monotonic() - (self._opened_at or 0.0)
+                if elapsed >= self.reset_timeout:
+                    self._state = _CBState.HALF_OPEN
+                    logger.info("circuit_breaker_half_open", extra={"server": self.name})
+                    self._update_metrics()
+                else:
+                    self._update_metrics()
+                    raise _CircuitOpenError(self.name)
+
+        try:
+            result = await coro
+        except _CircuitOpenError:
+            raise
+        except Exception:
+            async with self._lock:
+                self._failures += 1
+                if self._state in (_CBState.CLOSED, _CBState.HALF_OPEN):
+                    if (
+                        self._failures >= self.fail_max
+                        or self._state == _CBState.HALF_OPEN
+                    ):
+                        self._state = _CBState.OPEN
+                        self._opened_at = time.monotonic()
+                        logger.warning(
+                            "circuit_breaker_opened",
+                            extra={"server": self.name, "failures": self._failures},
+                        )
+                        self._update_metrics()
+            raise
+        else:
+            async with self._lock:
+                if self._state == _CBState.HALF_OPEN:
+                    self._state = _CBState.CLOSED
+                    self._failures = 0
+                    logger.info("circuit_breaker_closed", extra={"server": self.name})
+                    self._update_metrics()
+                elif self._state == _CBState.CLOSED:
+                    # Reset consecutive failure count on any success.
+                    self._failures = 0
+            return result
+
+    def _update_metrics(self) -> None:
+        """Sync Prometheus gauges / counters to current state (best-effort)."""
+        try:
+            from .observability import (
+                AGENT_MCP_CIRCUIT_BREAKER_OPEN_TOTAL,
+                AGENT_MCP_CIRCUIT_BREAKER_STATE,
+            )
+            AGENT_MCP_CIRCUIT_BREAKER_STATE.labels(server=self.name).set(
+                self._state.value
+            )
+            if self._state == _CBState.OPEN:
+                AGENT_MCP_CIRCUIT_BREAKER_OPEN_TOTAL.labels(server=self.name).inc()
+        except Exception:
+            pass  # Never fail because of metrics
+
+
+# One breaker per MCP server — module-level singletons shared across all sessions.
+_DATA_MCP_BREAKER     = _AsyncCircuitBreaker("data",     fail_max=5, reset_timeout=30.0)
+_SEMANTIC_MCP_BREAKER = _AsyncCircuitBreaker("semantic", fail_max=5, reset_timeout=30.0)
+_BREAKERS: dict[str, _AsyncCircuitBreaker] = {
+    "data":     _DATA_MCP_BREAKER,
+    "semantic": _SEMANTIC_MCP_BREAKER,
+}
+
+
 def _preview_text(value: Any, max_chars: int) -> str:
     """Render a bounded string representation suitable for logs."""
     text = str(value)
@@ -176,10 +290,13 @@ def _map_json_schema_to_python_type(prop_info: dict[str, Any]) -> Any:
 async def create_secure_tools(
     session: ClientSession,
     access_context_json: str,
+    server_name: str = "data",
 ) -> list[StructuredTool]:
     """
     Dynamically discover tools from the MCP server, hide the access_context parameter,
     and build LangChain StructuredTools.
+
+    server_name: "data" | "semantic" — selects the circuit breaker instance.
     """
     logger.debug("Fetching tool list from MCP server...")
 
@@ -229,7 +346,7 @@ async def create_secure_tools(
         DynamicSchema = create_model(f"{tool_name}Input", **fields)
 
         # 3. Create the execution closure
-        def make_caller(t_name: str):
+        def make_caller(t_name: str, s_name: str):
             async def _caller(**kwargs) -> dict:
                 # Secretly inject the authorization context
                 kwargs["access_context"] = access_context_json
@@ -257,7 +374,10 @@ async def create_secure_tools(
                 )
 
                 try:
-                    result = await session.call_tool(t_name, arguments=clean_kwargs)
+                    breaker = _BREAKERS.get(s_name, _DATA_MCP_BREAKER)
+                    result = await breaker.call(
+                        session.call_tool(t_name, arguments=clean_kwargs)
+                    )
                     parsed = _parse_tool_result(result)
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     logger.info(
@@ -281,6 +401,25 @@ async def create_secure_tools(
                         )
 
                     return parsed
+                except _CircuitOpenError:
+                    duration_ms = int((time.perf_counter() - started) * 1000)
+                    logger.warning(
+                        "circuit_breaker_rejected",
+                        extra={"tool": t_name, "server": s_name},
+                    )
+                    try:
+                        from .observability import AGENT_MCP_CIRCUIT_BREAKER_REJECTED_TOTAL
+                        AGENT_MCP_CIRCUIT_BREAKER_REJECTED_TOTAL.labels(server=s_name).inc()
+                    except Exception:
+                        pass
+                    return {
+                        "error": "service_unavailable",
+                        "tool": t_name,
+                        "message": (
+                            "The clinical data service is temporarily unavailable. "
+                            "Please try again in a moment."
+                        ),
+                    }
                 except Exception as e:
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     logger.error(
@@ -298,7 +437,7 @@ async def create_secure_tools(
 
         # 4. Wrap it in a LangChain StructuredTool
         structured_tool = StructuredTool.from_function(
-            coroutine=make_caller(tool_name),
+            coroutine=make_caller(tool_name, server_name),
             name=tool_name,
             description=description,
             args_schema=DynamicSchema,

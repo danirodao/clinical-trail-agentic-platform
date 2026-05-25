@@ -138,6 +138,40 @@ AGENT_MAX_ITERATIONS_REACHED_TOTAL = Counter(
     ["model"],
 )
 
+# ── Tool timeouts ─────────────────────────────────────────────────────────────
+
+AGENT_TOOL_TIMEOUT_TOTAL = Counter(
+    "agent_tool_timeout_total",
+    "Tool calls that exceeded their per-tool timeout budget",
+    ["tool_name"],
+)
+
+# ── MCP circuit breaker ───────────────────────────────────────────────────────
+
+AGENT_MCP_CIRCUIT_BREAKER_OPEN_TOTAL = Counter(
+    "agent_mcp_circuit_breaker_open_total",
+    "Number of times an MCP circuit breaker transitioned to OPEN state",
+    ["server"],  # server: data | semantic
+)
+
+AGENT_MCP_CIRCUIT_BREAKER_REJECTED_TOTAL = Counter(
+    "agent_mcp_circuit_breaker_rejected_total",
+    "Requests rejected because an MCP circuit breaker is OPEN",
+    ["server"],
+)
+
+AGENT_MCP_CIRCUIT_BREAKER_STATE = Gauge(
+    "agent_mcp_circuit_breaker_state",
+    "Current MCP circuit breaker state (0=closed, 1=open, 2=half_open)",
+    ["server"],
+)
+
+# Initialise labels so both servers appear in Grafana immediately on startup.
+for _srv in ("data", "semantic"):
+    AGENT_MCP_CIRCUIT_BREAKER_STATE.labels(server=_srv).set(0)
+    AGENT_MCP_CIRCUIT_BREAKER_OPEN_TOTAL.labels(server=_srv).inc(0)
+    AGENT_MCP_CIRCUIT_BREAKER_REJECTED_TOTAL.labels(server=_srv).inc(0)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenTelemetry + Phoenix Tracing Setup

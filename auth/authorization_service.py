@@ -15,6 +15,7 @@ performs per-trial /check calls to filter down the allowed list post-hoc.
 
 import json
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -221,6 +222,22 @@ class AuthorizationService:
         self.db = db_pool
         self.fga = fga_client or get_openfga_client()
 
+    @staticmethod
+    def _list_objects_context(user: UserContext) -> dict[str, Any]:
+        """
+        Minimal runtime context for OpenFGA list-objects when model conditions
+        require dynamic parameters. Uses conservative defaults.
+        """
+        return {
+            "current_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "requested_region": "",
+            "requested_area": "",
+            "requested_phase": "",
+            "stated_purpose": "",
+            "user_clearance_level": int(getattr(user, "clearance_level", 1) or 1),
+            "actual_cohort_size": 0,
+        }
+
     async def compute_access_profile(self, user: UserContext) -> AccessProfile:
         """
         Compute the full two-layer access profile.
@@ -243,11 +260,12 @@ class AuthorizationService:
             return profile
 
         # ── Layer 1: OpenFGA — which trials? ──────────────────
+        list_ctx = self._list_objects_context(user)
         aggregate_ids = await self.fga.get_accessible_trial_ids(
-            profile.user_id, access_level="aggregate"
+            profile.user_id, access_level="aggregate", context=list_ctx
         )
         individual_ids = await self.fga.get_accessible_trial_ids(
-            profile.user_id, access_level="individual"
+            profile.user_id, access_level="individual", context=list_ctx
         )
 
         # Resilience fallback: some OpenFGA versions evaluate tuple conditions
@@ -759,6 +777,7 @@ class AuthorizationService:
                 user=f"user:{profile.user_id}",
                 relation="can_access",
                 object_type="cohort",
+                context=self._list_objects_context(user),
             )
         )
 

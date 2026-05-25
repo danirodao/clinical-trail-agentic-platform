@@ -166,6 +166,13 @@ async def agent_node(state: AgentState, tools: list) -> dict:
             current_iteration=iteration,
         )
 
+        # ── Defensive: strip orphaned assistant-tool groups ───────────────
+        # OpenAI 400s if any AIMessage with tool_calls is not immediately
+        # followed by ToolMessages for ALL of its tool_call_ids.  This can
+        # happen when the sliding window or compression drops some TMs while
+        # keeping the AIMessage that referenced them.
+        messages = _sanitize_for_openai(messages)
+
         # ── LLM invocation ────────────────────────────────────────────────
         response: AIMessage = await llm_with_tools.ainvoke(messages)
 
@@ -246,6 +253,66 @@ async def agent_node(state: AgentState, tools: list) -> dict:
     }
 
 
+def _sanitize_for_openai(messages: list) -> list:
+    """
+    OpenAI rejects any message sequence where an AIMessage with tool_calls
+    is not immediately followed by ToolMessages covering every tool_call_id.
+    This can arise after sliding-window pruning or mid-run compression evicts
+    some ToolMessages while the referencing AIMessage survives.
+
+    For each AIMessage with tool_calls this function checks that all
+    tool_call_ids are covered by the immediately-following ToolMessages.  If
+    any are missing the entire assistant-tool group (AIMessage + partial TMs)
+    is removed so the remaining history stays valid.
+    """
+    out: list = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        # Non-AI messages: keep System/Human; silently drop orphaned ToolMessages
+        # (a ToolMessage here means its AIMessage was already dropped).
+        if not isinstance(msg, AIMessage):
+            if not isinstance(msg, ToolMessage):
+                out.append(msg)
+            i += 1
+            continue
+
+        # AIMessage without tool_calls — pass through unchanged.
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            out.append(msg)
+            i += 1
+            continue
+
+        # AIMessage WITH tool_calls — collect the immediately-following TMs.
+        expected_ids = {tc["id"] for tc in tool_calls}
+        j = i + 1
+        tool_msgs: list = []
+        covered_ids: set[str] = set()
+        while j < len(messages) and isinstance(messages[j], ToolMessage):
+            tool_msgs.append(messages[j])
+            covered_ids.add(messages[j].tool_call_id)
+            j += 1
+
+        if expected_ids.issubset(covered_ids):
+            # All tool_calls have responses — keep AIMessage and its TMs.
+            out.append(msg)
+            out.extend(tool_msgs)
+        else:
+            # Orphaned tool_calls: drop the AIMessage and any partial TMs.
+            missing = expected_ids - covered_ids
+            logger.warning(
+                "sanitize_openai: dropping orphaned assistant+tool group",
+                missing_tool_call_ids=sorted(missing),
+                tool_names=[tc.get("name") for tc in tool_calls],
+            )
+
+        i = j  # advance past AIMessage + all immediately-following ToolMessages
+
+    return out
+
+
 def _prune_context(
     messages: list,
     max_turns: int,
@@ -255,7 +322,7 @@ def _prune_context(
     """
     Sliding window for history + aggressive pruning of old tool outputs.
 
-    1. Keeps SystemMessage at index 0.
+    1. Keeps all leading SystemMessages (index 0 … first HumanMessage).
     2. Groups remaining messages into Turns (starting with HumanMessage).
     3. Keeps only the last `max_turns` turns.
     4. For turns *before* the current turn, truncates ToolMessage content.
@@ -263,17 +330,21 @@ def _prune_context(
     if not messages:
         return []
 
-    sys_msg = None
-    other_messages = messages
-    if isinstance(messages[0], SystemMessage):
-        sys_msg = messages[0]
-        other_messages = messages[1:]
+    # ── Strip ALL leading SystemMessages so they don't consume window slots ──
+    # agent_node prepends two SystemMessages (static + dynamic).  Only the
+    # first was stripped before, making the dynamic one a phantom "turn 0"
+    # that wasted a max_turns slot and could push real turns out of the window.
+    leading_sys: list = []
+    rest = messages
+    while rest and isinstance(rest[0], SystemMessage):
+        leading_sys.append(rest[0])
+        rest = rest[1:]
 
     # ── Group into turns ──────────────────────────────────────────────────
     turns: list[list] = []
     current_turn_msgs: list = []
 
-    for m in other_messages:
+    for m in rest:
         if isinstance(m, HumanMessage) and current_turn_msgs:
             turns.append(current_turn_msgs)
             current_turn_msgs = []
@@ -307,7 +378,7 @@ def _prune_context(
         pruned_turns.append(pruned_turn)
 
     # ── Reassemble ────────────────────────────────────────────────────────
-    result = [sys_msg] if sys_msg else []
+    result = list(leading_sys)
     for turn_msgs in pruned_turns:
         result.extend(turn_msgs)
 

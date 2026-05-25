@@ -40,6 +40,7 @@ setup_observability()
 collection_consumer: CollectionRefreshConsumer = None
 outbox_relay_task: asyncio.Task | None = None
 outbox_relay_stop_event: asyncio.Event | None = None
+_redis_client = None  # module-level so shutdown can close it
 
 log = get_logger(__name__)
 
@@ -56,7 +57,7 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle manager."""
-    global collection_consumer, outbox_relay_task, outbox_relay_stop_event
+    global collection_consumer, outbox_relay_task, outbox_relay_stop_event, _redis_client
     pool = await init_db_pool()
     await ensure_outbox_schema(pool)
     db_url= f"postgresql://{os.environ.get('POSTGRES_USER', 'ctuser')}:{os.environ.get('POSTGRES_PASSWORD', 'ctpassword')}@{os.environ.get('POSTGRES_HOST', 'postgres')}:{os.environ.get('POSTGRES_PORT', 5432)}/{os.environ.get('POSTGRES_DB', 'clinical_trials')}"
@@ -64,8 +65,26 @@ async def lifespan(app: FastAPI):
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
     async with AsyncPostgresSaver.from_conn_string(app.state.checkpointer_url) as saver:
         await saver.setup()  # Creates tables if they don't exist
-    
-     
+
+    # ── Redis — distributed rate-limiter backend ────────────────────────────────
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    try:
+        import redis.asyncio as aioredis
+        from api.middleware.rate_limiter import configure_rate_limiter
+        _redis_client = aioredis.from_url(
+            redis_url, decode_responses=False, socket_timeout=2.0
+        )
+        await _redis_client.ping()
+        configure_rate_limiter(_redis_client)
+        app.state.redis = _redis_client
+        log.info("rate_limiter_redis_backend_active", url=redis_url)
+    except Exception as exc:
+        log.warning(
+            "redis_unavailable_using_in_memory_rate_limiter",
+            error=str(exc),
+        )
+
+    # ── Collection consumer + outbox relay ──────────────────────────────────────
     collection_consumer = CollectionRefreshConsumer(
         db_pool_factory=lambda: pool,
         fga_client_factory=get_openfga_client,
@@ -134,6 +153,8 @@ async def lifespan(app: FastAPI):
         await outbox_relay_task
     if collection_consumer:
         collection_consumer.stop()
+    if _redis_client:
+        await _redis_client.aclose()
     await close_db_pool()
 
 

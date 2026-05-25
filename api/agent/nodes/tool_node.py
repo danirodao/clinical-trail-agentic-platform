@@ -18,6 +18,7 @@ Phase 5 fixes applied:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -31,6 +32,7 @@ from ..observability import (
     AGENT_CEILING_APPLIED_TOTAL,
     AGENT_TOOL_CALL_DURATION,
     AGENT_TOOL_CALL_TOTAL,
+    AGENT_TOOL_TIMEOUT_TOTAL,
     get_tracer,
 )
 from ..models import AgentState, Timer, ToolCallRecord
@@ -53,6 +55,62 @@ SEMANTIC_TOOL_NAMES = {
     "semantic_compatibility_check",
     "explain_metric_semantics",
 }
+
+# ── Per-tool timeout budgets (seconds) ─────────────────────────────────────────────────
+# Semantic/ontology tools hit Neo4j read-only paths and should return quickly.
+# Heavy analytical tools join Postgres + Qdrant and get a larger budget.
+TOOL_TIMEOUTS: dict[str, float] = {
+    # Semantic / ontology (Neo4j read-only)
+    "resolve_semantic_term":              5.0,
+    "get_semantic_cognitive_frame":       5.0,
+    "get_concept_definition":             5.0,
+    "list_ontology_concepts":             5.0,
+    "get_field_concept_map":              5.0,
+    "map_code_to_concept":                5.0,
+    "map_concept_to_codes":               5.0,
+    "semantic_compatibility_check":       5.0,
+    "explain_metric_semantics":           5.0,
+    # Light Postgres reads
+    "get_trial_metadata":                10.0,
+    "search_trials":                     10.0,
+    "medication_interaction_check":      15.0,
+    # Moderate analytics
+    "get_patient_demographics":          15.0,
+    "get_adverse_events":                20.0,
+    "lab_result_trends":                 20.0,
+    "data_quality_overview":             20.0,
+    "cohort_outcome_snapshot":           20.0,
+    # Heavy cross-trial analytics (Postgres + Qdrant)
+    "cross_trial_safety_summary":        25.0,
+    "comparative_effectiveness_analysis": 30.0,
+    # Default for any unregistered tool
+    "__default__":                       15.0,
+}
+
+# ── Per-category concurrency semaphores ────────────────────────────────────────────
+# Caps the number of in-flight heavy DB calls per process to protect the
+# asyncpg connection pool.  Lightweight semantic tools share a higher limit.
+TOOL_SEMAPHORE_CLASS: dict[str, str] = {
+    "cross_trial_safety_summary":           "analytical",
+    "comparative_effectiveness_analysis":   "analytical",
+    "lab_result_trends":                    "analytical",
+    "get_adverse_events":                   "analytical",
+    "cohort_outcome_snapshot":              "analytical",
+    "data_quality_overview":                "analytical",
+    # everything else → "semantic" (lighter, higher concurrency allowed)
+}
+_SEMAPHORE_LIMITS: dict[str, int] = {"analytical": 4, "semantic": 8}
+# Lazily initialised inside the running event loop (safe for Python 3.10+).
+_SEMAPHORES: dict[str, asyncio.Semaphore | None] = {"analytical": None, "semantic": None}
+
+
+def _get_semaphore(class_name: str) -> asyncio.Semaphore:
+    """Return (lazily creating) the semaphore for the given tool class."""
+    if _SEMAPHORES.get(class_name) is None:
+        _SEMAPHORES[class_name] = asyncio.Semaphore(
+            _SEMAPHORE_LIMITS.get(class_name, 8)
+        )
+    return _SEMAPHORES[class_name]
 
 
 async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> dict:
@@ -150,6 +208,11 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
             if "trial_ids" in tool_args:
                 tool_args = _coerce_trial_ids(tool, tool_args)
 
+            sem_class = TOOL_SEMAPHORE_CLASS.get(tool_name, "semantic")
+            timeout   = TOOL_TIMEOUTS.get(tool_name, TOOL_TIMEOUTS["__default__"])
+            span.set_attribute("tool.timeout_budget_s", timeout)
+            span.set_attribute("tool.semaphore_class", sem_class)
+
             timer = Timer().start()
             status = "success"
             result_content = ""
@@ -162,8 +225,12 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
                     f"args_keys={list(tool_args.keys())}"
                 )
 
-                # NOTE: Sequential — do NOT use asyncio.gather() here
-                raw_result = await tool.ainvoke(tool_args)
+                # Sequential (asyncpg constraint) — semaphore caps heavy-DB
+                # calls per process; wait_for enforces a hard time budget.
+                async with _get_semaphore(sem_class):
+                    raw_result = await asyncio.wait_for(
+                        tool.ainvoke(tool_args), timeout=timeout
+                    )
 
                 # ── Distill result to save tokens before sending to LLM ────────
                 distilled_result = _distill_result(raw_result, tool_name)
@@ -189,6 +256,27 @@ async def tool_node(state: AgentState, tools_by_name: dict[str, BaseTool]) -> di
                 logger.info(
                     f"Tool {tool_name} completed in {duration_ms}ms "
                     f"— {result_summary}"
+                )
+
+            except asyncio.TimeoutError:
+                duration_ms = timer.elapsed_ms()
+                status = "error"
+                error_msg = f"Tool '{tool_name}' timed out after {timeout:.0f}s"
+                result_content = json.dumps({
+                    "error": "tool_timeout",
+                    "tool": tool_name,
+                    "timeout_s": timeout,
+                    "message": (
+                        f"'{tool_name}' did not respond within {timeout:.0f}s. "
+                        "The data service may be under load — please try again."
+                    ),
+                })
+                result_summary = f"Timeout after {timeout:.0f}s"
+                AGENT_TOOL_TIMEOUT_TOTAL.labels(tool_name=tool_name).inc()
+                span.set_status(trace.StatusCode.ERROR, f"Timeout: {tool_name}")
+                logger.warning(
+                    f"Tool {tool_name} timed out after {timeout}s "
+                    f"(budget={timeout}s, elapsed={duration_ms}ms)"
                 )
 
             except Exception as exc:

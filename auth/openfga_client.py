@@ -8,6 +8,7 @@ import os
 import logging
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import Optional
 from dataclasses import dataclass
 
@@ -265,6 +266,34 @@ class OpenFGAClient:
         )
         return result.allowed
 
+    def _minimal_runtime_context(self, user_clearance_level: int = 1) -> dict:
+        """
+        Build a conservative runtime context that satisfies required CEL params.
+
+        This is used for list-objects compatibility when the OpenFGA model
+        requires runtime context parameters for conditional tuples.
+        """
+        return {
+            "current_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "requested_region": "",
+            "requested_area": "",
+            "requested_phase": "",
+            "stated_purpose": "",
+            "user_clearance_level": int(user_clearance_level),
+            "actual_cohort_size": 0,
+        }
+
+    @staticmethod
+    def _looks_like_missing_context_error(status: int, body: str) -> bool:
+        if status != 400:
+            return False
+        text = (body or "").lower()
+        return (
+            "missing context parameters" in text
+            or "failed to evaluate relationship condition" in text
+            or "validation_error" in text
+        )
+
     # ─── List Objects (for access profiles) ───────────────────
 
     async def list_objects(
@@ -272,13 +301,21 @@ class OpenFGAClient:
         user: str,
         relation: str,
         object_type: str,
+        context: Optional[dict] = None,
         use_cache: bool = True,
     ) -> list[str]:
         """
         List all objects of a type that a user has a relation to.
         Used to compute access profiles (e.g., all trials a user can view).
         """
-        cache_key = f"list:{user}|{relation}|{object_type}"
+        context_key = ""
+        if context:
+            try:
+                context_key = f"|ctx:{repr(sorted(context.items()))}"
+            except Exception:
+                context_key = "|ctx:present"
+
+        cache_key = f"list:{user}|{relation}|{object_type}{context_key}"
         if use_cache:
             cached = await self._cache_get(cache_key)
             if isinstance(cached, list):
@@ -286,13 +323,17 @@ class OpenFGAClient:
 
         try:
             client = await self._get_client()
+            payload = {
+                "user": user,
+                "relation": relation,
+                "type": object_type,
+            }
+            if context:
+                payload["context"] = context
+
             resp = await client.post(
                 "/list-objects",
-                json={
-                    "user": user,
-                    "relation": relation,
-                    "type": object_type,
-                }
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -314,6 +355,25 @@ class OpenFGAClient:
             # enough detail to diagnose malformed tuple keys or model mismatch.
             status = e.response.status_code if e.response is not None else "unknown"
             body = e.response.text if e.response is not None else ""
+
+            # Compatibility retry: newer OpenFGA setups may require runtime
+            # context for conditional tuples during list-objects evaluation.
+            if not context and isinstance(status, int) and self._looks_like_missing_context_error(status, body):
+                retry_context = self._minimal_runtime_context()
+                logger.warning(
+                    "OpenFGA list-objects missing context for %s|%s|%s; retrying with minimal runtime context",
+                    user,
+                    relation,
+                    object_type,
+                )
+                return await self.list_objects(
+                    user=user,
+                    relation=relation,
+                    object_type=object_type,
+                    context=retry_context,
+                    use_cache=use_cache,
+                )
+
             logger.error(
                 "OpenFGA list-objects returned HTTP error: user=%s relation=%s type=%s status=%s body=%s",
                 user,
@@ -327,7 +387,10 @@ class OpenFGAClient:
             raise
 
     async def get_accessible_trial_ids(
-        self, user_id: str, access_level: str = "aggregate"
+        self,
+        user_id: str,
+        access_level: str = "aggregate",
+        context: Optional[dict] = None,
     ) -> list[str]:
         """Get all trial IDs a user can access at the specified level."""
         relation = "can_view_individual" if access_level == "individual" else "can_view_aggregate"
@@ -335,6 +398,7 @@ class OpenFGAClient:
             user=f"user:{user_id}",
             relation=relation,
             object_type="clinical_trial",
+            context=context,
         )
 
     # ─── Tuple Management ─────────────────────────────────────

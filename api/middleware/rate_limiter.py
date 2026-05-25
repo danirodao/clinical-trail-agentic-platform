@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections import defaultdict, deque
 from typing import Callable
 
@@ -95,6 +96,78 @@ class SlidingWindowCounter:
 
 _user_counter = SlidingWindowCounter()
 _org_counter  = SlidingWindowCounter()
+
+
+# ---------------------------------------------------------------------------
+# Redis-backed sliding window (preferred in production)
+# ---------------------------------------------------------------------------
+
+class _RedisSlidingWindowCounter:
+    """
+    Redis sorted-set sliding window — fully atomic via a Lua script.
+    Each member is a unique UUID so simultaneous requests never collide.
+    Falls back to the in-memory counter on any Redis error so the API
+    stays up even during a Redis restart.
+    """
+
+    # One Lua script handles check-and-record atomically.
+    # KEYS[1] = rate-limit bucket key
+    # ARGV[1] = now_ms, ARGV[2] = window_ms, ARGV[3] = limit, ARGV[4] = unique member
+    _LUA = b"""
+local key     = KEYS[1]
+local now_ms  = tonumber(ARGV[1])
+local win_ms  = tonumber(ARGV[2])
+local lim     = tonumber(ARGV[3])
+local uid     = ARGV[4]
+local cutoff  = now_ms - win_ms
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local count = tonumber(redis.call('ZCARD', key))
+if count >= lim then return {0, 0} end
+redis.call('ZADD', key, now_ms, uid)
+redis.call('PEXPIRE', key, win_ms + 1000)
+return {1, lim - count - 1}
+"""
+
+    def __init__(self, redis_client, fallback: SlidingWindowCounter) -> None:
+        self._r = redis_client
+        self._fallback = fallback
+        self._script = None  # registered lazily on first call
+
+    async def is_allowed(
+        self, key: str, limit: int, window_seconds: float
+    ) -> tuple[bool, int]:
+        try:
+            if self._script is None:
+                self._script = self._r.register_script(self._LUA)
+            now_ms = int(time.time() * 1000)
+            win_ms = int(window_seconds * 1000)
+            result = await self._script(
+                keys=[f"rl:{key}"],
+                args=[now_ms, win_ms, limit, uuid.uuid4().hex],
+            )
+            return bool(result[0]), int(result[1])
+        except Exception as exc:
+            logger.warning(
+                "redis_rate_limiter_fallback",
+                extra={"error": str(exc)},
+            )
+            return await self._fallback.is_allowed(key, limit, window_seconds)
+
+    async def cleanup(self, max_keys: int = 10_000) -> None:
+        pass  # Redis TTL-based expiry handles cleanup automatically
+
+
+def configure_rate_limiter(redis_client) -> None:
+    """
+    Switch rate-limiting to a Redis backend.  Call once from main.py lifespan
+    after the Redis connection is verified.  The per-counter fallback to the
+    in-memory implementation means the API degrades gracefully if Redis
+    becomes temporarily unavailable at request time.
+    """
+    global _user_counter, _org_counter
+    _user_counter = _RedisSlidingWindowCounter(redis_client, SlidingWindowCounter())
+    _org_counter  = _RedisSlidingWindowCounter(redis_client, SlidingWindowCounter())
+    logger.info("rate_limiter_redis_backend_active")
 
 
 # ---------------------------------------------------------------------------

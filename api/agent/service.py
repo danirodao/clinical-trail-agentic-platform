@@ -516,6 +516,7 @@ class AgentService:
             data_tools = await create_secure_tools(
                 session=data_session,
                 access_context_json=access_context_json,
+                server_name="data",
             )
             logger.info(
                 "mcp_tools_loaded",
@@ -544,6 +545,7 @@ class AgentService:
                     semantic_tools = await create_secure_tools(
                         session=sem_session,
                         access_context_json=access_context_json,
+                        server_name="semantic",
                     )
                     logger.info(
                         "mcp_tools_loaded",

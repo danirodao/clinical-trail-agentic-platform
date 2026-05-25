@@ -148,6 +148,7 @@ cython_debug/
 # IDEs
 .vscode/
 .idea/
+.agents/
 
 # Node.js (frontend)
 frontend/node_modules/
